@@ -58,6 +58,7 @@
                 "config": {
                     "paths": [
                         "src",
+                        "tests/Fixtures/Support",
                         "workbench"
                     ]
                 }

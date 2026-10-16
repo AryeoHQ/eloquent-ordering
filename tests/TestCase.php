@@ -28,6 +28,11 @@ abstract class TestCase extends Testbench\TestCase
         ];
     }
 
+    protected function defineDatabaseMigrations(): void
+    {
+        $this->loadMigrationsFrom(__DIR__.'/Fixtures/Support/Migrations');
+    }
+
     /**
      * Select the database driver from the environment.
      *
