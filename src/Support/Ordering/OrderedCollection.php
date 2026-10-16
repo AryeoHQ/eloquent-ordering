@@ -237,6 +237,7 @@ final class OrderedCollection
     {
         $column = self::versionColumn($this->name);
 
+        // Compare again: SQLite takes no row lock, so this statement is its only guard.
         $claimed = $this->parentRow()->where($column, $expectedVersion)->increment($column);
 
         throw_if($claimed === 0, StaleOrder::version($this, $expectedVersion));

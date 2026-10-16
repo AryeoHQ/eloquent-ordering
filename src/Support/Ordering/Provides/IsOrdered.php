@@ -110,6 +110,7 @@ trait IsOrdered
      */
     private function commitUnlessHalted(Closure $write): bool|null
     {
+        // Halt through transaction(): a manual commit() that fails leaves the transaction level at 1.
         $halted = new RuntimeException;
 
         try {
