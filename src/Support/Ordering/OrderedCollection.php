@@ -5,11 +5,15 @@ declare(strict_types=1);
 namespace Support\Ordering;
 
 use Closure;
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
+use LogicException;
+use ReflectionMethod;
+use ReflectionNamedType;
 use Support\Ordering\Contracts\Ordered;
 use Support\Ordering\Contracts\OrdersCollection;
 use Support\Ordering\Exceptions\InvalidAnchor;
@@ -21,7 +25,7 @@ final class OrderedCollection
 {
     public const int MAX_KEY_LENGTH = 64;
 
-    private const string PARKED_KEY_PREFIX = '~';
+    private const string PREFIX_OUTSIDE_KEY_ALPHABET = '~';
 
     /** @var HasMany<Model, Model> */
     private readonly HasMany $relation;
@@ -32,13 +36,13 @@ final class OrderedCollection
         public readonly Model&OrdersCollection $parent,
         public readonly string $name,
     ) {
+        $message = sprintf('[%s::%s()] must return a HasMany relation to an Ordered model.', $parent::class, $name);
+
+        throw_unless(self::declaresHasMany($parent, $name), InvalidArgumentException::class, $message);
+
         $relation = $parent->{$name}();
 
-        throw_unless(
-            $relation instanceof HasMany && $relation->getRelated() instanceof Ordered,
-            InvalidArgumentException::class,
-            sprintf('[%s::%s()] must return a HasMany relation to an Ordered model.', $parent::class, $name),
-        );
+        throw_unless($relation instanceof HasMany && $relation->getRelated() instanceof Ordered, InvalidArgumentException::class, $message);
 
         $this->relation = $relation;
         $this->related = $relation->getRelated();
@@ -47,6 +51,32 @@ final class OrderedCollection
     public static function versionColumn(string $collection): string
     {
         return Str::snake($collection).'_order_version';
+    }
+
+    /**
+     * @internal
+     */
+    public static function place(Model&Ordered $item, Placement $placement): void
+    {
+        $collection = self::of($item, $item->getAttribute($item->orderedParent()->getForeignKeyName()))
+            ?? throw new LogicException(sprintf('[%s:%s] has no parent that orders it.', $item::class, $item->getKey()));
+
+        $collection->claimCurrent();
+
+        $item->setAttribute($collection->rankKey(), $collection->keyAt($placement, null));
+    }
+
+    /**
+     * @internal
+     */
+    public static function remove(Model&Ordered $item): void
+    {
+        $parentKey = self::storedParentKey($item);
+        $collection = self::of($item, $parentKey) ?? throw StaleOrder::member($item);
+
+        $collection->claimCurrent();
+
+        throw_unless(self::sameKey(self::storedParentKey($item), $parentKey), StaleOrder::member($item));
     }
 
     public function version(): int
@@ -61,16 +91,32 @@ final class OrderedCollection
 
     public function move(Model&Ordered $item, Placement $placement, int $expectedVersion): OrderChange
     {
+        throw_unless($item instanceof $this->related, InvalidArgumentException::class, sprintf('The [%s] order cannot hold [%s].', $this->name, $item::class));
+
         return $this->transaction(function () use ($item, $placement, $expectedVersion): OrderChange {
-            $version = $this->claim($expectedVersion);
             $id = $this->keyOf($item);
+            $parentKey = $item->getAttribute($item->orderedParent()->getForeignKeyName());
+            $source = self::sameKey($parentKey, $this->relation->getParentKey()) ? $this : (self::of($item, $parentKey) ?? throw StaleOrder::member($item));
+
+            $this->lockWith($source);
+
+            throw_unless(self::sameKey(self::storedParentKey($item), $parentKey), StaleOrder::member($item));
+
+            $this->lockAt($expectedVersion);
+
+            if ($source !== $this) {
+                return $this->join($item, $source, $placement, $expectedVersion);
+            }
+
             $previous = $this->positionOf($id);
 
-            if ($previous === null) {
-                return $this->join($item, $placement, $version);
+            if ($this->holdsPlace($id, $placement)) {
+                return $this->change($expectedVersion, []);
             }
 
             $key = $this->keyAt($placement, $id);
+            $version = $this->claim($expectedVersion);
+
             $this->member($id)->update([$this->rankKey() => $key]);
             $item->setAttribute($this->rankKey(), $key)->syncOriginalAttribute($this->rankKey());
 
@@ -84,13 +130,21 @@ final class OrderedCollection
     public function reorder(array $ids, int $expectedVersion): OrderChange
     {
         return $this->transaction(function () use ($ids, $expectedVersion): OrderChange {
-            $version = $this->claim($expectedVersion);
+            $this->lockAt($expectedVersion);
+
             $keys = $this->keys();
-            $order = $this->match(array_keys($keys), $ids);
+            $members = array_keys($keys);
+            $order = $this->match($members, $ids);
+
+            if ($order === $members) {
+                return $this->change($expectedVersion, []);
+            }
+
+            $version = $this->claim($expectedVersion);
 
             $this->rewrite($keys, array_combine($order, FractionalIndex::keysBetween(null, null, count($order))));
 
-            $before = array_flip(array_keys($keys));
+            $before = array_flip($members);
             $moved = [];
 
             foreach ($order as $index => $id) {
@@ -103,40 +157,53 @@ final class OrderedCollection
         });
     }
 
-    /**
-     * @internal
-     */
-    public function place(Model&Ordered $item, Placement $placement): void
+    private static function declaresHasMany(Model $parent, string $name): bool
     {
-        $this->claim($this->lockVersion());
+        if (! method_exists($parent, $name)) {
+            return false;
+        }
 
-        $item->setAttribute($this->rankKey(), $this->keyAt($placement, null));
+        $method = new ReflectionMethod($parent, $name);
+        $type = $method->getReturnType();
+
+        return $method->isPublic()
+            && ! $method->isStatic()
+            && $type instanceof ReflectionNamedType
+            && is_a($type->getName(), HasMany::class, true);
     }
 
-    /**
-     * @internal
-     */
-    public function remove(): void
+    private static function of(Model&Ordered $item, mixed $parentKey): self|null
     {
-        $this->claim($this->lockVersion());
+        $relation = $item->orderedParent();
+        $parent = $parentKey === null ? null : $relation->getRelated()->newQueryWithoutScopes()->where($relation->getOwnerKeyName(), $parentKey)->first();
+
+        return $parent instanceof OrdersCollection ? $parent->orderedCollection($item->orderedCollectionName()) : null;
     }
 
-    private function join(Model&Ordered $item, Placement $placement, int $version): OrderChange
+    private static function storedParentKey(Model&Ordered $item): mixed
+    {
+        return $item->newQueryWithoutScopes()->whereKey($item->getKey())->toBase()->value($item->orderedParent()->getForeignKeyName());
+    }
+
+    private static function sameKey(mixed $first, mixed $second): bool
+    {
+        return (is_int($first) || is_string($first))
+            && (is_int($second) || is_string($second))
+            && (string) $first === (string) $second;
+    }
+
+    private function join(Model&Ordered $item, self $source, Placement $placement, int $expectedVersion): OrderChange
     {
         $id = $this->keyOf($item);
-        $source = $item->orderedIn();
-
-        throw_if($source->is($this), InvalidArgumentException::class, sprintf('[%s] is not a member of its own collection.', $id));
-
-        $sourceVersion = $source->claim($source->lockVersion());
         $previous = $source->positionOf($id);
-
-        throw_if($previous === null, InvalidArgumentException::class, sprintf('[%s] is not a member of its own collection.', $id));
 
         $attributes = [
             $this->relation->getForeignKeyName() => $this->relation->getParentKey(),
             $this->rankKey() => $this->keyAt($placement, null),
         ];
+
+        $version = $this->claim($expectedVersion);
+        $sourceVersion = $source->claim($source->version());
 
         $item->newQueryWithoutScopes()->whereKey($id)->toBase()->update($attributes);
         $item->forceFill($attributes)->syncOriginalAttributes(array_keys($attributes));
@@ -145,13 +212,34 @@ final class OrderedCollection
         return $this->change($version, [$id => null], $source->change($sourceVersion, [$id => $previous]));
     }
 
+    private function lockWith(self $source): void
+    {
+        $this->parent->newQueryWithoutScopes()
+            ->whereKey(array_values(array_unique([$this->parent->getKey(), $source->parent->getKey()])))
+            ->orderBy($this->parent->getKeyName())
+            ->lockForUpdate()
+            ->toBase()
+            ->pluck($this->parent->getKeyName());
+    }
+
+    private function lockAt(int $expectedVersion): void
+    {
+        throw_unless($this->lockVersion() === $expectedVersion, StaleOrder::version($this, $expectedVersion));
+    }
+
+    private function claimCurrent(): void
+    {
+        // A create or delete has no expected version, so wait for the row rather than fail as stale.
+        $this->claim($this->lockVersion());
+    }
+
     private function claim(int $expectedVersion): int
     {
         $column = self::versionColumn($this->name);
 
         $claimed = $this->parentRow()->where($column, $expectedVersion)->increment($column);
 
-        throw_if($claimed === 0, new StaleOrder($this, $expectedVersion));
+        throw_if($claimed === 0, StaleOrder::version($this, $expectedVersion));
 
         return $expectedVersion + 1;
     }
@@ -159,6 +247,16 @@ final class OrderedCollection
     private function lockVersion(): int
     {
         return (int) $this->parentRow()->lockForUpdate()->value(self::versionColumn($this->name));
+    }
+
+    private function holdsPlace(int|string $id, Placement $placement): bool
+    {
+        $key = $this->member($id)->value($this->rankKey());
+        [$lower, $upper] = $this->bounds($placement, $id);
+
+        return is_string($key)
+            && ($lower === null || strcmp($key, $lower) > 0)
+            && ($upper === null || strcmp($key, $upper) < 0);
     }
 
     private function keyAt(Placement $placement, int|string|null $exclude): string
@@ -206,11 +304,25 @@ final class OrderedCollection
 
     private function anchor(Builder $members, int|string $anchor): string
     {
-        $key = $members->where($this->related->getKeyName(), $anchor)->value($this->rankKey());
+        $id = $this->anchorId($anchor);
+        $key = $id === null ? null : $members->where($this->related->getKeyName(), $id)->value($this->rankKey());
 
         throw_unless(is_string($key), new InvalidAnchor($this, $anchor));
 
         return $key;
+    }
+
+    private function anchorId(int|string $anchor): int|string|null
+    {
+        if (in_array($this->related->getKeyType(), ['int', 'integer'], true)) {
+            return is_int($anchor) || (string) (int) $anchor === $anchor ? (int) $anchor : null;
+        }
+
+        if (in_array(HasUuids::class, class_uses_recursive($this->related), true)) {
+            return Str::isUuid((string) $anchor) ? (string) $anchor : null;
+        }
+
+        return (string) $anchor;
     }
 
     private function rebalance(): void
@@ -229,7 +341,7 @@ final class OrderedCollection
         $changed = array_filter($next, fn (string $key, int|string $id): bool => $current[$id] !== $key, ARRAY_FILTER_USE_BOTH);
 
         foreach ($changed as $id => $key) {
-            $this->member($id)->update([$this->rankKey() => self::PARKED_KEY_PREFIX.$key]);
+            $this->member($id)->update([$this->rankKey() => self::PREFIX_OUTSIDE_KEY_ALPHABET.$key]);
         }
 
         foreach ($changed as $id => $key) {
@@ -355,11 +467,6 @@ final class OrderedCollection
         throw_unless(is_int($key) || is_string($key), InvalidArgumentException::class, sprintf('[%s] has no key.', $item::class));
 
         return $key;
-    }
-
-    private function is(self $other): bool
-    {
-        return $this->name === $other->name && $this->parent->is($other->parent);
     }
 
     private function tagAt(int $version): string

@@ -11,6 +11,7 @@ use Support\Ordering\Exceptions\InvalidAnchor;
 use Support\Ordering\Placement;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Assets\OrdersAssets;
+use Tests\Fixtures\Support\Assets\TrashableAsset;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\TestCase;
 
@@ -123,6 +124,73 @@ class IsOrderedTest extends TestCase
 
         $asset->delete();
         $this->assertSame(2, $collection->version());
+    }
+
+    #[Test]
+    public function it_places_a_new_member_in_the_collection_that_its_foreign_key_names(): void
+    {
+        $cached = Section::factory()->create();
+        $named = Section::factory()->create();
+        $asset = Asset::factory()->make(['section_id' => $named->id])->setRelation('section', $cached);
+
+        $asset->save();
+
+        $this->assertSame(0, $cached->orderedCollection('assets')->version());
+        $this->assertSame(1, $named->orderedCollection('assets')->version());
+        $this->assertOrder([$asset->id], $named);
+    }
+
+    #[Test]
+    public function it_versions_the_collection_that_holds_a_member_when_a_stale_instance_deletes_it(): void
+    {
+        $source = Section::factory()->create();
+        $destination = Section::factory()->create();
+        $stale = $this->addAsset($source)->load('section');
+        $member = $this->addAsset($destination);
+
+        $destination->orderedCollection('assets')->move(Asset::query()->findOrFail($stale->id), Placement::first(), 1);
+
+        $this->assertTrue($stale->delete());
+        $this->assertSame(2, $source->orderedCollection('assets')->version());
+        $this->assertSame(3, $destination->orderedCollection('assets')->version());
+        $this->assertOrder([$member->id], $destination);
+    }
+
+    #[Test]
+    public function it_versions_nothing_when_a_later_listener_halts_a_create(): void
+    {
+        $section = Section::factory()->create();
+        $member = $this->addAsset($section);
+
+        Asset::creating(fn (): bool => false);
+
+        $asset = Asset::factory()->for($section)->make();
+
+        $this->assertFalse($asset->save());
+        $this->assertFalse($asset->exists);
+        $this->assertSame(1, $section->orderedCollection('assets')->version());
+        $this->assertOrder([$member->id], $section);
+    }
+
+    #[Test]
+    public function it_versions_nothing_when_a_later_listener_halts_a_delete(): void
+    {
+        $section = Section::factory()->create();
+        $asset = $this->addAsset($section);
+
+        Asset::deleting(fn (): bool => false);
+
+        $this->assertFalse($asset->delete());
+        $this->assertSame(1, $section->orderedCollection('assets')->version());
+        $this->assertOrder([$asset->id], $section);
+    }
+
+    #[Test]
+    public function it_refuses_a_model_that_soft_deletes(): void
+    {
+        $this->expectException(LogicException::class);
+
+        new TrashableAsset;
     }
 
     #[Test]

@@ -10,6 +10,7 @@ services:
       - composer-cache:/tmp/composer
     environment:
       COMPOSER_HOME: /tmp/composer
+      DB_CONNECTION: ${DB_CONNECTION:-sqlite}
     depends_on:
       postgres:
         condition: service_healthy

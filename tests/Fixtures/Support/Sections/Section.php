@@ -11,11 +11,13 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 use Support\Ordering\Contracts\OrdersCollection;
 use Support\Ordering\Provides\HasOrderedCollections;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Videos\Video;
 
 /**
  * @property int $id
  * @property string|null $name
  * @property int $assets_order_version
+ * @property int $videos_order_version
  */
 #[UseFactory(SectionFactory::class)]
 class Section extends Model implements OrdersCollection
@@ -33,5 +35,13 @@ class Section extends Model implements OrdersCollection
     public function assets(): HasMany
     {
         return $this->hasMany(Asset::class);
+    }
+
+    /**
+     * @return HasMany<Video, $this>
+     */
+    public function videos(): HasMany
+    {
+        return $this->hasMany(Video::class);
     }
 }

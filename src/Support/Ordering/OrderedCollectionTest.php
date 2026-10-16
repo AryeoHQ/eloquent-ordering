@@ -8,15 +8,20 @@ use Closure;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
+use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Ordering\Exceptions\InvalidAnchor;
 use Support\Ordering\Exceptions\MembershipMismatch;
 use Support\Ordering\Exceptions\StaleOrder;
+use Support\Ordering\Keys\FractionalIndex;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Assets\OrdersAssets;
+use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
+use Tests\Fixtures\Support\Tours\Tour;
+use Tests\Fixtures\Support\Videos\Video;
 use Tests\TestCase;
 use Throwable;
 
@@ -34,7 +39,31 @@ class OrderedCollectionTest extends TestCase
         yield 'to the back' => [0, 'last', null, [1, 2, 3, 0]];
         yield 'before an anchor' => [3, 'before', 1, [0, 3, 1, 2]];
         yield 'after an anchor' => [0, 'after', 2, [1, 2, 0, 3]];
-        yield 'to where it is' => [1, 'after', 0, [0, 1, 2, 3]];
+    }
+
+    /**
+     * @return iterable<string, array{int, Closure(OrderedCollection, list<Asset>, int): OrderChange}>
+     */
+    public static function unchangedOrders(): iterable
+    {
+        yield 'a move to where it is' => [3, fn (OrderedCollection $assets, array $members, int $version): OrderChange => $assets->move($members[1], Placement::after($members[0]->id), $version)];
+        yield 'a move before its successor' => [3, fn (OrderedCollection $assets, array $members, int $version): OrderChange => $assets->move($members[1], Placement::before($members[2]->id), $version)];
+        yield 'a move of the first member to the front' => [3, fn (OrderedCollection $assets, array $members, int $version): OrderChange => $assets->move($members[0], Placement::first(), $version)];
+        yield 'a move of the last member to the back' => [3, fn (OrderedCollection $assets, array $members, int $version): OrderChange => $assets->move($members[2], Placement::last(), $version)];
+        yield 'a move of the only member' => [1, fn (OrderedCollection $assets, array $members, int $version): OrderChange => $assets->move($members[0], Placement::first(), $version)];
+        yield 'a reorder in the current order' => [3, fn (OrderedCollection $assets, array $members, int $version): OrderChange => $assets->reorder([$members[0]->id, $members[1]->id, $members[2]->id], $version)];
+        yield 'a reorder of the only member' => [1, fn (OrderedCollection $assets, array $members, int $version): OrderChange => $assets->reorder([$members[0]->id], $version)];
+        yield 'a reorder of an empty collection' => [0, fn (OrderedCollection $assets, array $members, int $version): OrderChange => $assets->reorder([], $version)];
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function malformedAnchors(): iterable
+    {
+        yield 'a word' => ['abc'];
+        yield 'a fraction' => ['1.5'];
+        yield 'a number beyond a bigint' => ['99999999999999999999'];
     }
 
     /**
@@ -210,6 +239,95 @@ class OrderedCollectionTest extends TestCase
         $this->assertOrder([$first->id, $second->id], $section);
     }
 
+    /**
+     * @param  Closure(OrderedCollection, list<Asset>, int): OrderChange  $change
+     */
+    #[DataProvider('unchangedOrders')]
+    #[Test]
+    public function it_keeps_the_version_and_writes_nothing_when_the_order_stays_the_same(int $count, Closure $change): void
+    {
+        [$section, $assets] = $this->sectionWith($count);
+        $collection = $section->orderedCollection('assets');
+        $tag = $collection->tag();
+        $keys = $this->rankKeys($section);
+        $ids = array_map(fn (Asset $asset): int => $asset->id, $assets);
+
+        DB::enableQueryLog();
+
+        $result = $change($collection, $assets, $count);
+
+        $writes = array_filter(DB::getQueryLog(), fn (array $query): bool => preg_match('/^\s*(insert|update|delete)\b/i', $query['query']) === 1);
+
+        $this->assertSame([], array_values($writes));
+        $this->assertSame([], $result->changed);
+        $this->assertSame($count, $result->version);
+        $this->assertSame($tag, $result->tag);
+        $this->assertSame(array_map(fn (int $id, int $index): array => ['id' => $id, 'position' => $index + 1], $ids, array_keys($ids)), $result->order);
+        $this->assertSame($count, $collection->version());
+        $this->assertSame($tag, $collection->tag());
+        $this->assertSame($keys, $this->rankKeys($section));
+    }
+
+    #[Test]
+    public function it_rejects_a_stale_change_that_keeps_the_order(): void
+    {
+        [$section, [$first, $second]] = $this->sectionWith(2);
+        $collection = $section->orderedCollection('assets');
+
+        $this->assertRejected(StaleOrder::class, $section, fn () => $collection->move($first, Placement::first(), 1));
+        $this->assertRejected(StaleOrder::class, $section, fn () => $collection->reorder([$first->id, $second->id], 1));
+    }
+
+    #[Test]
+    public function it_rejects_a_move_of_an_item_that_the_collection_cannot_hold(): void
+    {
+        [$section, [$first, $second]] = $this->sectionWith(2);
+        $video = Video::factory()->for($section)->create(['id' => $second->id]);
+
+        $this->assertRejected(InvalidArgumentException::class, $section, fn () => $section->orderedCollection('assets')->move($video, Placement::first(), 2));
+        $this->assertOrder([$first->id, $second->id], $section);
+        $this->assertSame(1, $section->orderedCollection('videos')->version());
+    }
+
+    #[DataProvider('malformedAnchors')]
+    #[Test]
+    public function it_rejects_a_malformed_anchor(string $anchor): void
+    {
+        [$section, [$first, $second]] = $this->sectionWith(2);
+
+        $this->assertRejected(InvalidAnchor::class, $section, fn () => $section->orderedCollection('assets')->move($second, Placement::before($anchor), 2));
+        $this->assertRejected(InvalidAnchor::class, $section, fn () => $this->addAsset($section, Placement::after($anchor)));
+        $this->assertOrder([$first->id, $second->id], $section);
+    }
+
+    #[Test]
+    public function it_rejects_a_move_of_a_member_deleted_since_it_was_read(): void
+    {
+        [$section, [$first, $deleted]] = $this->sectionWith(2);
+        [$destination] = $this->sectionWith(0);
+
+        Asset::query()->findOrFail($deleted->id)->delete();
+
+        $this->assertRejected(StaleOrder::class, $section, fn () => $section->orderedCollection('assets')->move($deleted, Placement::first(), 3));
+        $this->assertRejected(StaleOrder::class, $destination, fn () => $destination->orderedCollection('assets')->move($deleted, Placement::first(), 0));
+        $this->assertOrder([$first->id], $section);
+    }
+
+    #[Test]
+    public function it_rejects_a_move_of_a_member_moved_since_it_was_read(): void
+    {
+        [$source, [$first, $moved]] = $this->sectionWith(2);
+        [$elsewhere, [$member]] = $this->sectionWith(1);
+        [$destination] = $this->sectionWith(0);
+
+        $elsewhere->orderedCollection('assets')->move(Asset::query()->findOrFail($moved->id), Placement::last(), 1);
+
+        $this->assertRejected(StaleOrder::class, $source, fn () => $source->orderedCollection('assets')->move($moved, Placement::first(), 3));
+        $this->assertRejected(StaleOrder::class, $destination, fn () => $destination->orderedCollection('assets')->move($moved, Placement::first(), 0));
+        $this->assertOrder([$first->id], $source);
+        $this->assertOrder([$member->id, $moved->id], $elsewhere);
+    }
+
     #[Test]
     public function it_moves_a_member_between_two_collections_in_one_transaction(): void
     {
@@ -271,6 +389,73 @@ class OrderedCollectionTest extends TestCase
     }
 
     #[Test]
+    public function it_rebalances_the_destination_of_a_move_between_two_collections(): void
+    {
+        [$source, [$staying, $moved]] = $this->sectionWith(2);
+        [$destination, [$first, $last]] = $this->sectionWith(2);
+        $collection = $destination->orderedCollection('assets');
+        $next = $last;
+        $inserted = [];
+
+        while (strlen(FractionalIndex::keyBetween($first->rank_key, $next->rank_key)) <= OrderedCollection::MAX_KEY_LENGTH) {
+            $next = $this->addAsset($destination, Placement::after($first->id));
+            array_unshift($inserted, $next->id);
+        }
+
+        $version = $collection->version();
+        $longest = max(array_map(strlen(...), $this->rankKeys($destination)));
+
+        $change = $collection->move($moved, Placement::after($first->id), $version);
+
+        $this->assertSame($version + 1, $change->version);
+        $this->assertLessThan($longest, max(array_map(strlen(...), $this->rankKeys($destination))));
+        $this->assertLessThanOrEqual(OrderedCollection::MAX_KEY_LENGTH, strlen($moved->rank_key));
+        $this->assertOrder([$first->id, $moved->id, ...$inserted, $last->id], $destination);
+        $this->assertOrder([$staying->id], $source);
+    }
+
+    #[Test]
+    public function it_orders_members_with_uuid_keys(): void
+    {
+        $tour = Tour::factory()->create();
+        $collection = $tour->orderedCollection('scenes');
+
+        $second = $this->addScene($tour);
+        $fourth = $this->addScene($tour);
+        $first = $this->addScene($tour, Placement::first());
+        $third = $this->addScene($tour, Placement::after($second->id));
+
+        $this->assertSceneOrder([$first, $second, $third, $fourth], $tour);
+
+        $collection->move($fourth, Placement::before($second->id), 4);
+        $this->assertSceneOrder([$first, $fourth, $second, $third], $tour);
+
+        $change = $collection->reorder([$third->id, $second->id, $fourth->id, $first->id], 5);
+        $this->assertSame([$third->id, $second->id, $fourth->id, $first->id], array_column($change->order, 'id'));
+        $this->assertSceneOrder([$third, $second, $fourth, $first], $tour);
+
+        $other = Tour::factory()->create();
+        $member = $this->addScene($other);
+
+        $change = $other->orderedCollection('scenes')->move($third, Placement::before($member->id), 1);
+        $this->assertSame(2, $change->version);
+        $this->assertSame(7, $change->source?->version);
+        $this->assertSceneOrder([$third, $member], $other);
+        $this->assertSceneOrder([$second, $fourth, $first], $tour);
+
+        foreach (['abc', 42] as $anchor) {
+            try {
+                $collection->move($first, Placement::before($anchor), 7);
+                $this->fail('A malformed anchor moved a member.');
+            } catch (InvalidAnchor) {
+                $this->assertSame(7, $collection->version());
+            }
+        }
+
+        $this->assertSceneOrder([$second, $fourth, $first], $tour);
+    }
+
+    #[Test]
     public function it_lets_one_of_two_concurrent_moves_with_one_expected_version_succeed(): void
     {
         if (DB::connection()->getDriverName() !== 'pgsql') {
@@ -298,7 +483,7 @@ class OrderedCollectionTest extends TestCase
                 '3',
             ]);
 
-            $this->awaitLockWait($rival);
+            $this->awaitLockWait(1, $rival);
 
             $racer->commit();
 
@@ -317,6 +502,109 @@ class OrderedCollectionTest extends TestCase
 
             $racer->table('assets')->where('section_id', $section->id)->delete();
             $racer->table('sections')->where('id', $section->id)->delete();
+        }
+    }
+
+    #[Test]
+    public function it_finishes_opposite_moves_between_two_collections_without_a_deadlock(): void
+    {
+        if (DB::connection()->getDriverName() !== 'pgsql') {
+            $this->markTestSkipped('The race needs PostgreSQL row locks across three connections.');
+        }
+
+        config()->set('database.connections.racer', config('database.connections.pgsql'));
+        config()->set('database.connections.observer', config('database.connections.pgsql'));
+
+        $racer = DB::connection('racer');
+        $first = Section::factory()->connection('racer')->create();
+        $second = Section::factory()->connection('racer')->create();
+        [$leaving, $stayingFirst] = Asset::factory()->connection('racer')->for($first)->count(2)->create()->all();
+        [$arriving, $stayingSecond] = Asset::factory()->connection('racer')->for($second)->count(2)->create()->all();
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('sections')->where('id', $first->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startMove($first, $arriving, 2);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startMove($second, $leaving, 2);
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): string => $rival->wait()->output(), $rivals);
+
+            foreach ($rivals as $index => $rival) {
+                $this->assertContains($outputs[$index], ['moved', 'stale'], $rival->errorOutput());
+            }
+
+            $this->assertSame(['moved', 'stale'], $outputs);
+            $this->assertOrder([$arriving->id, $leaving->id, $stayingFirst->id], $first);
+            $this->assertOrder([$stayingSecond->id], $second);
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            foreach ($rivals as $rival) {
+                $rival->wait();
+            }
+
+            $racer->table('assets')->whereIn('section_id', [$first->id, $second->id])->delete();
+            $racer->table('sections')->whereIn('id', [$first->id, $second->id])->delete();
+        }
+    }
+
+    #[Test]
+    public function it_rejects_a_delete_whose_member_moves_while_it_waits(): void
+    {
+        if (DB::connection()->getDriverName() !== 'pgsql') {
+            $this->markTestSkipped('The race needs PostgreSQL row locks across two connections.');
+        }
+
+        config()->set('database.connections.racer', config('database.connections.pgsql'));
+        config()->set('database.connections.observer', config('database.connections.pgsql'));
+
+        $racer = DB::connection('racer');
+        $source = Section::factory()->connection('racer')->create();
+        $destination = Section::factory()->connection('racer')->create();
+        [$moved, $staying] = Asset::factory()->connection('racer')->for($source)->count(2)->create()->all();
+        $rival = null;
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('sections')->where('id', $source->id)->lockForUpdate()->first();
+
+            $rival = Process::env($this->databaseEnvironment())->start([
+                PHP_BINARY,
+                dirname(__DIR__, 3).'/tests/Fixtures/Support/Concurrency/delete.php',
+                (string) $moved->id,
+            ]);
+
+            $this->awaitLockWait(1, $rival);
+
+            $destination->orderedCollection('assets')->move($moved, Placement::first(), 0);
+
+            $racer->commit();
+
+            $result = $rival->wait();
+
+            $this->assertSame('stale', $result->output(), $result->errorOutput());
+            $this->assertSame(3, $source->orderedCollection('assets')->version());
+            $this->assertSame(1, $destination->orderedCollection('assets')->version());
+            $this->assertOrder([$staying->id], $source);
+            $this->assertOrder([$moved->id], $destination);
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            $rival?->wait();
+
+            $racer->table('assets')->whereIn('section_id', [$source->id, $destination->id])->delete();
+            $racer->table('sections')->whereIn('id', [$source->id, $destination->id])->delete();
         }
     }
 
@@ -356,23 +644,64 @@ class OrderedCollectionTest extends TestCase
         $this->assertSame($keys, $this->rankKeys($section));
     }
 
-    private function awaitLockWait(InvokedProcess $rival): void
+    private function awaitLockWait(int $waiters, InvokedProcess ...$rivals): void
     {
         $deadline = microtime(true) + 10;
 
         while (microtime(true) < $deadline) {
-            $this->assertTrue($rival->running(), $rival->errorOutput());
+            foreach ($rivals as $rival) {
+                $this->assertTrue($rival->running(), $rival->errorOutput());
+            }
 
             $waiting = DB::connection('observer')->scalar("select count(*) from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'");
 
-            if ($waiting > 0) {
+            if ($waiting >= $waiters) {
                 return;
             }
 
             usleep(10_000);
         }
 
-        $this->fail('The rival move never waited on the row lock.');
+        $this->fail('The rivals never waited on the row locks.');
+    }
+
+    private function startMove(Section $section, Asset $asset, int $expectedVersion): InvokedProcess
+    {
+        return Process::env($this->databaseEnvironment())->start([
+            PHP_BINARY,
+            dirname(__DIR__, 3).'/tests/Fixtures/Support/Concurrency/move.php',
+            (string) $section->id,
+            (string) $asset->id,
+            (string) $expectedVersion,
+        ]);
+    }
+
+    private function addScene(Tour $tour, Placement|null $placement = null): Scene
+    {
+        $scene = Scene::factory()->for($tour)->make();
+
+        if ($placement !== null) {
+            $scene->placeAt($placement);
+        }
+
+        $scene->save();
+
+        return $scene;
+    }
+
+    /**
+     * @param  list<Scene>  $expected
+     */
+    private function assertSceneOrder(array $expected, Tour $tour): void
+    {
+        $positions = Scene::query()
+            ->whereBelongsTo($tour)
+            ->get()
+            ->mapWithKeys(fn (Scene $scene): array => [$scene->id => $scene->position])
+            ->sort();
+
+        $this->assertSame(array_map(fn (Scene $scene): string => $scene->id, $expected), $positions->keys()->all());
+        $this->assertSame(range(1, count($expected)), $positions->values()->all());
     }
 
     /**

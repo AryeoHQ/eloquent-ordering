@@ -49,6 +49,15 @@ class FractionalIndexTest extends TestCase
         yield 'no keys' => ['a0', 'a1', 0, []];
     }
 
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function keysOutsideTheAlphabet(): iterable
+    {
+        yield 'in the integer part' => ['a!'];
+        yield 'in the fraction' => ['a0!'];
+    }
+
     #[DataProvider('upstreamKeys')]
     #[Test]
     public function it_reproduces_the_upstream_key(string|null $a, string|null $b, string $key): void
@@ -118,6 +127,13 @@ class FractionalIndexTest extends TestCase
         FractionalIndex::validate('a0V');
 
         $this->assertInvalidKey('invalid order key: a0V0', fn () => FractionalIndex::validate('a0V0'));
+    }
+
+    #[DataProvider('keysOutsideTheAlphabet')]
+    #[Test]
+    public function it_rejects_a_character_outside_base_62(string $key): void
+    {
+        $this->assertInvalidKey('invalid order key: '.$key, fn () => FractionalIndex::validate($key));
     }
 
     private function assertInvalidKey(string $message, callable $call): void

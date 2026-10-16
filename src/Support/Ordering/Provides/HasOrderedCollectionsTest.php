@@ -32,4 +32,17 @@ class HasOrderedCollectionsTest extends TestCase
 
         Section::factory()->create()->orderedCollection('getTable');
     }
+
+    #[Test]
+    public function it_calls_no_method_that_does_not_declare_a_has_many_relation(): void
+    {
+        $section = Section::factory()->create();
+
+        try {
+            $section->orderedCollection('delete');
+            $this->fail('A method that declares no HasMany relation was accepted.');
+        } catch (InvalidArgumentException) {
+            $this->assertTrue(Section::query()->whereKey($section->id)->exists());
+        }
+    }
 }

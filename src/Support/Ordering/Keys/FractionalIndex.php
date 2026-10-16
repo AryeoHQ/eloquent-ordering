@@ -133,7 +133,7 @@ final class FractionalIndex
 
         $integer = self::integerPart($key);
 
-        if (str_ends_with(substr($key, strlen($integer)), self::DIGITS[0])) {
+        if (strspn($key, self::DIGITS) !== strlen($key) || str_ends_with(substr($key, strlen($integer)), self::DIGITS[0])) {
             throw new InvalidKey('invalid order key: '.$key);
         }
     }

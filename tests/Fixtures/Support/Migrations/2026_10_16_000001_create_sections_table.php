@@ -14,6 +14,7 @@ return new class extends Migration
             $table->id();
             $table->string('name')->nullable();
             $table->orderVersion('assets');
+            $table->orderVersion('videos');
             $table->timestamps();
         });
     }

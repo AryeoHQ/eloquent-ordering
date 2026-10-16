@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 namespace Support\Ordering\Provides;
 
+use Closure;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use LogicException;
+use RuntimeException;
 use Support\Ordering\Contracts\OrdersCollection;
 use Support\Ordering\OrderedCollection;
 use Support\Ordering\Placement;
@@ -16,13 +19,19 @@ trait IsOrdered
 
     public static function bootIsOrdered(): void
     {
+        throw_if(
+            in_array(SoftDeletes::class, class_uses_recursive(static::class), true),
+            LogicException::class,
+            sprintf('[%s] cannot use soft deletes, because a trashed item keeps its place in the order.', static::class),
+        );
+
         static::creating(function (self $item): void {
-            $item->orderedIn()->place($item, $item->placement ?? Placement::last());
+            OrderedCollection::place($item, $item->placement ?? Placement::last());
             $item->placement = null;
         });
 
         static::deleting(function (self $item): void {
-            $item->orderedIn()->remove();
+            OrderedCollection::remove($item);
         });
     }
 
@@ -40,12 +49,13 @@ trait IsOrdered
             return parent::save($options);
         }
 
-        return $this->getConnection()->transaction(fn (): bool => parent::save($options));
+        // The creating hook locks the parent row; the transaction holds that lock through the insert.
+        return $this->commitUnlessHalted(fn (): bool => parent::save($options));
     }
 
     public function delete(): bool|null
     {
-        return $this->getConnection()->transaction(fn (): bool|null => parent::delete());
+        return $this->commitUnlessHalted(fn (): bool|null => parent::delete());
     }
 
     public function getRankKeyName(): string
@@ -90,5 +100,30 @@ trait IsOrdered
                 ->where($rankKey, '<', (clone $self)->select($rankKey))
                 ->count() + 1;
         });
+    }
+
+    /**
+     * @template TResult of bool|null
+     *
+     * @param  Closure(): TResult  $write
+     * @return TResult|false
+     */
+    private function commitUnlessHalted(Closure $write): bool|null
+    {
+        $halted = new RuntimeException;
+
+        try {
+            return $this->getConnection()->transaction(function () use ($write, $halted): bool|null {
+                $result = $write();
+
+                throw_if($result === false, $halted);
+
+                return $result;
+            });
+        } catch (RuntimeException $exception) {
+            throw_unless($exception === $halted, $exception);
+
+            return false;
+        }
     }
 }

@@ -1,14 +1,14 @@
 # eloquent-ordering
 Manually ordered Eloquent collections stored as fractional rank keys
 
-A parent model owns an ordered collection of items. Each item stores a private rank key, and the package derives a read-only, 1-based `position` from it. A counter on the parent holds the version of the order. Every change of order compares and increments that counter in one statement:
+A parent model owns an ordered collection of items. Each item stores a private rank key, and the package derives a read-only, 1-based `position` from it. A counter on the parent holds the version of the order. Every change first locks the parent row, so two writers never generate rank keys at the same time. A change of order then compares and increments that counter in one statement:
 
 ```sql
 update "asset_subsections" set "assets_order_version" = "assets_order_version" + 1
 where "id" = ? and "assets_order_version" = ?
 ```
 
-No affected row means another write changed the order first. That statement also locks the parent row, so two writers never generate rank keys at the same time. The package has no HTTP dependency. It exposes the version and the order tag as plain values.
+No affected row means another write changed the order first. The package has no HTTP dependency. It exposes the version and the order tag as plain values.
 
 ## Declare the parent and its items
 
@@ -114,11 +114,14 @@ $change = $assets->reorder([$thirdId, $firstId, $secondId], $expectedVersion);
 ```
 
 - `move()` throws `InvalidAnchor` for an anchor that is the moved item or not a current member (ORD-23).
+- `move()` throws `InvalidArgumentException` for an item of a model that the collection does not hold.
 - `move()` also accepts an item of another parent's collection. It removes the item from that collection and changes both versions in one transaction (ORD-24).
 - `reorder()` takes the id of every member once, in the new order. It throws `MembershipMismatch` for a missing, repeated, or foreign id (ORD-19).
-- Both throw `StaleOrder` when the order is no longer at `$expectedVersion`.
+- Both throw `StaleOrder` when the order is no longer at `$expectedVersion`. `move()` also throws it for an item that left its collection after you loaded it.
 
-A rejected move or reorder changes nothing.
+A rejected move or reorder changes nothing. A move or reorder that keeps the order writes nothing, and returns an `OrderChange` at the current version with an empty `changed`.
+
+A move action must authorize the item's current parent before it calls `move()`, because `move()` takes the item from that parent's collection without its version (ORD-24). Validate `<item>_id` against the items that the caller may move, not against every row of the table (ORD-38).
 
 A rank key never exceeds 64 characters. A write that would exceed that limit first rebalances every key of the collection evenly, in the same transaction. A rebalance changes no position, no version, and no tag.
 
@@ -150,8 +153,8 @@ The counter and the rank keys stay correct only while every order write goes thr
 - Create and delete items through Eloquent models, and move them with `OrderedCollection`. A query builder insert, update, or delete skips the counter and the rank key.
 - `deleteQuietly()` skips the event that increments the version, so the tag goes stale. `saveQuietly()` on a new item fails, because it assigns no rank key.
 - Change an item's parent only with `move()` (ORD-08).
-- `IsOrdered` runs `save()` for a new item and `delete()` in a transaction. A model that defines its own `save()` or `delete()` replaces that transaction.
-- An ordered item does not support soft deletes. A trashed item keeps its rank key and still counts as a member.
+- `IsOrdered` runs `save()` for a new item and `delete()` in a transaction, and rolls it back when a listener halts the write. A model that defines its own `save()` or `delete()` replaces that transaction.
+- An ordered item does not support soft deletes, because a trashed item keeps its rank key and still counts as a member. `IsOrdered` throws `LogicException` for a model that uses `SoftDeletes`.
 
 ## Connect the order to tags and preconditions
 
@@ -184,7 +187,7 @@ use Support\Ordering\OrderedCollection;
 
 class OrderTarget implements Target
 {
-    public function __construct(private OrderedCollection $collection) {}
+    public function __construct(private OrderedCollection $collection, private Asset|null $moved = null) {}
 
     public function tag(): Tag
     {
@@ -193,23 +196,32 @@ class OrderTarget implements Target
 
     public function lock(): void
     {
-        $this->collection->parent->newQuery()->whereKey($this->collection->parent->getKey())->lockForUpdate()->first();
+        $parent = $this->collection->parent;
+        $keys = array_unique(array_filter([$parent->getKey(), $this->moved?->asset_subsection_id]));
+
+        $parent->newQuery()->whereKey($keys)->orderBy($parent->getKeyName())->lockForUpdate()->get();
     }
 }
 ```
 
-Run the change inside the precondition's `guard()`, and pass `$assets->version()` as the expected version. `lock()` holds the parent row, so that version is the one the recheck compared.
+Run the change inside the precondition's `guard()`, and pass `$assets->version()` as the expected version. `lock()` holds the parent row, so that version is the one the recheck compared. A move action passes the moved item, so `lock()` also holds the item's current parent. It locks both rows in one statement, in order of key, as `move()` does. Two opposite moves between two parents then wait for each other rather than deadlock.
 
 **Response tags (OCC-09, OCC-21).** The nested index returns the order tag:
 
 ```php
-$tag = new Tag($assets->tag());
-$members = $subsection->assets()->orderBy('rank_key')->get();
+use Illuminate\Support\Facades\DB;
 
-return $members->toSchemaCollection(ApiVersion::V2)->withETag($tag);
+return DB::transaction(function () use ($assets, $subsection) {
+    DB::statement('set transaction isolation level repeatable read');
+
+    $tag = new Tag($assets->tag());
+    $members = $subsection->assets()->orderBy('rank_key')->get();
+
+    return $members->toSchemaCollection(ApiVersion::V2)->withETag($tag)->toResponse(request());
+});
 ```
 
-Read the tag before the members. A write between the two reads then fails the client's next `If-Match`, rather than matching an order the client never saw. A collection action passes `new Tag($change->tag)` to `withETag()`, because that tag matches the `order` it returns.
+Read the tag and the members in one transaction at `REPEATABLE READ`. Every read in it sees one snapshot, so the tag matches the order the response returns, and no two members share a position. Build the response inside the transaction, because each `position` runs its own query. PostgreSQL requires `set transaction` as the first statement of the transaction. A collection action passes `new Tag($change->tag)` to `withETag()`, because that tag matches the `order` it returns.
 
 ## Rank keys
 
