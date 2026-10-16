@@ -1,0 +1,143 @@
+{
+    "source": "https://github.com/rocicorp/fractional-indexing/blob/v4.0.0/src/test.js",
+    "license": "CC0-1.0",
+    "keyBetween": [
+        {
+            "a": null,
+            "b": null,
+            "key": "a0"
+        },
+        {
+            "a": null,
+            "b": "a0",
+            "key": "Zz"
+        },
+        {
+            "a": null,
+            "b": "Zz",
+            "key": "Zy"
+        },
+        {
+            "a": "a0",
+            "b": null,
+            "key": "a1"
+        },
+        {
+            "a": "a1",
+            "b": null,
+            "key": "a2"
+        },
+        {
+            "a": "a0",
+            "b": "a1",
+            "key": "a0V"
+        },
+        {
+            "a": "a1",
+            "b": "a2",
+            "key": "a1V"
+        },
+        {
+            "a": "a0V",
+            "b": "a1",
+            "key": "a0l"
+        },
+        {
+            "a": "Zz",
+            "b": "a0",
+            "key": "ZzV"
+        },
+        {
+            "a": "Zz",
+            "b": "a1",
+            "key": "a0"
+        },
+        {
+            "a": null,
+            "b": "Y00",
+            "key": "Xzzz"
+        },
+        {
+            "a": "bzz",
+            "b": null,
+            "key": "c000"
+        },
+        {
+            "a": "a0",
+            "b": "a0V",
+            "key": "a0G"
+        },
+        {
+            "a": "a0",
+            "b": "a0G",
+            "key": "a08"
+        },
+        {
+            "a": "b125",
+            "b": "b129",
+            "key": "b127"
+        },
+        {
+            "a": "a0",
+            "b": "a1V",
+            "key": "a1"
+        },
+        {
+            "a": "Zz",
+            "b": "a01",
+            "key": "a0"
+        },
+        {
+            "a": null,
+            "b": "a0V",
+            "key": "a0"
+        },
+        {
+            "a": null,
+            "b": "b999",
+            "key": "b99"
+        },
+        {
+            "a": null,
+            "b": "A000000000000000000000000001",
+            "key": "A000000000000000000000000000V"
+        },
+        {
+            "a": "zzzzzzzzzzzzzzzzzzzzzzzzzzy",
+            "b": null,
+            "key": "zzzzzzzzzzzzzzzzzzzzzzzzzzz"
+        },
+        {
+            "a": "zzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "b": null,
+            "key": "zzzzzzzzzzzzzzzzzzzzzzzzzzzV"
+        },
+        {
+            "a": "a1",
+            "b": "a0",
+            "key": "a0V"
+        }
+    ],
+    "invalid": [
+        {
+            "a": null,
+            "b": "A00000000000000000000000000",
+            "message": "invalid order key: A00000000000000000000000000"
+        },
+        {
+            "a": "a00",
+            "b": null,
+            "message": "invalid order key: a00"
+        },
+        {
+            "a": "a00",
+            "b": "a1",
+            "message": "invalid order key: a00"
+        },
+        {
+            "a": "0",
+            "b": "1",
+            "message": "invalid order key head: 0"
+        }
+    ]
+}
