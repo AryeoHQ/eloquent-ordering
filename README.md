@@ -181,6 +181,7 @@ Declare it with `#[ContributesTag(AssetOrderVersion::class)]` on the `Asset` sch
 **Collection actions (OCC-07, OCC-10).** A reorder or move action requires `If-Match` and compares it with the order tag. Give its `Precondition` a `Target` over `tag()`, and set `$required = true`:
 
 ```php
+use Illuminate\Database\ConnectionInterface;
 use Support\Http\Api\Preconditions\Contracts\Target;
 use Support\Http\Resources\Schemas\Tags\Tag;
 use Support\Ordering\OrderedCollection;
@@ -194,6 +195,11 @@ class OrderTarget implements Target
         return new Tag($this->collection->tag());
     }
 
+    public function connection(): ConnectionInterface
+    {
+        return $this->collection->parent->getConnection();
+    }
+
     public function lock(): void
     {
         $parent = $this->collection->parent;
@@ -205,6 +211,8 @@ class OrderTarget implements Target
 ```
 
 Run the change inside the precondition's `guard()`, and pass `$assets->version()` as the expected version. `lock()` holds the parent row, so that version is the one the recheck compared. A move action passes the moved item, so `lock()` also holds the item's current parent. It locks both rows in one statement, in order of key, as `move()` does. Two opposite moves between two parents then wait for each other rather than deadlock.
+
+**Item writes.** A precondition on an item's update, delete, or action must lock the parent row before the item row. `api-first`'s `EntityTarget` locks the item row alone. A delete then holds the item and waits for the parent. A reorder holds the parent and waits for the item, and PostgreSQL aborts one of them. Give such a `Precondition` a `Target` whose `lock()` locks the parent row first, then the item row.
 
 **Response tags (OCC-09, OCC-21).** The nested index returns the order tag:
 
