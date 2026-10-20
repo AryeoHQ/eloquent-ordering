@@ -205,14 +205,14 @@ class OrderTarget implements Target
         $parent = $this->collection->parent;
         $keys = array_unique(array_filter([$parent->getKey(), $this->moved?->asset_subsection_id]));
 
-        $parent->newQuery()->whereKey($keys)->orderBy($parent->getKeyName())->lockForUpdate()->get();
+        $parent->newQueryWithoutScopes()->whereKey($keys)->orderBy($parent->getKeyName())->lockForUpdate()->get();
     }
 }
 ```
 
 Run the change inside the precondition's `guard()`, and pass `$assets->version()` as the expected version. `lock()` holds the parent row, so that version is the one the recheck compared. A move action passes the moved item, so `lock()` also holds the item's current parent. It locks both rows in one statement, in order of key, as `move()` does. Two opposite moves between two parents then wait for each other rather than deadlock.
 
-**Item writes.** A precondition on an item's update, delete, or action must lock the parent row before the item row. `api-first`'s `EntityTarget` locks the item row alone. A delete then holds the item and waits for the parent. A reorder holds the parent and waits for the item, and PostgreSQL aborts one of them. Give such a `Precondition` a `Target` whose `lock()` locks the parent row first, then the item row.
+**Item writes.** A precondition on an item's delete, or on an action that deletes or moves the item, must lock the parent row before the item row. `api-first`'s `EntityTarget` locks the item row alone. A delete then holds the item and waits for the parent. A reorder holds the parent and waits for the item, and PostgreSQL aborts one of them. Give such a `Precondition` a `Target` whose `lock()` locks the parent row first, then the item row. Its `tag()` must hash the item that `lock()` read, as `EntityTarget::tag()` does, so the recheck compares the locked state.
 
 **Response tags (OCC-09, OCC-21).** The nested index returns the order tag:
 
