@@ -1,0 +1,77 @@
+{
+    "name": "aryeo/eloquent-ordering",
+    "description": "Manually ordered Eloquent collections stored as fractional rank keys",
+    "type": "library",
+    "repositories": {
+        "tooling-laravel": {
+            "type": "vcs",
+            "url": "https://github.com/AryeoHQ/tooling-laravel"
+        }
+    },
+    "require": {
+        "php": "^8.4",
+        "laravel/framework": "^12.37 || ^13",
+        "aryeo/tooling-laravel": "0.0.40"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^10.6 || ^11",
+        "orchestra/testbench-core": "^10.7 || ^11",
+        "phpunit/phpunit": "^12.4.1 || ^13"
+    },
+    "autoload": {
+        "psr-4": {
+            "Support\\Ordering\\": "src/Support/Ordering"
+        },
+        "exclude-from-classmap": [
+            "*Test.php",
+            "*TestCases.php",
+            "/tests/"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Workbench\\App\\": "workbench/app/",
+            "Tests\\": "tests/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Justin Seliga",
+            "email": "justinsel@zillowgroup.com"
+        }
+    ],
+    "minimum-stability": "stable",
+    "config": {
+        "allow-plugins": {
+            "aryeo/tooling-laravel": true
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Support\\Ordering\\Providers\\Provider"
+            ]
+        },
+        "tooling": {
+            "phpstan": {
+                "rules": "tooling/phpstan/rules.neon",
+                "config": {
+                    "paths": [
+                        "src",
+                        "tests/Fixtures/Support",
+                        "workbench"
+                    ]
+                }
+            },
+            "pint": {
+                "config": {
+                    "paths": [
+                        "src",
+                        "tests",
+                        "workbench"
+                    ]
+                }
+            }
+        }
+    }
+}
