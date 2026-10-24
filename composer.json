@@ -1,0 +1,96 @@
+{
+    "name": "aryeo/eloquent-ordering",
+    "description": "Manually ordered Eloquent collections stored as fractional rank keys",
+    "type": "library",
+    "license": "MIT",
+    "repositories": {
+        "eloquent-concurrency": {
+            "type": "vcs",
+            "url": "https://github.com/AryeoHQ/eloquent-concurrency"
+        },
+        "artifactory": {
+            "type": "composer",
+            "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/",
+            "only": [
+                "aryeo/*",
+                "zillow/*"
+            ]
+        }
+    },
+    "require": {
+        "php": "^8.4",
+        "laravel/framework": "^12.37 || ^13",
+        "aryeo/eloquent-concurrency": "dev-feat/2026-10-24t1355-occ-versioning-m2",
+        "aryeo/tooling-laravel": "0.0.41"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^10.6 || ^11",
+        "orchestra/testbench-core": "^10.7 || ^11",
+        "phpunit/phpunit": "^12.4.1 || ^13"
+    },
+    "autoload": {
+        "psr-4": {
+            "Support\\": "src/Support/",
+            "Tooling\\": "src/Tooling/"
+        },
+        "exclude-from-classmap": [
+            "*Test.php",
+            "*TestCases.php",
+            "/tests/"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Workbench\\App\\": "workbench/app/",
+            "Tests\\": "tests/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Justin Seliga",
+            "email": "justinsel@zillowgroup.com"
+        }
+    ],
+    "minimum-stability": "stable",
+    "config": {
+        "allow-plugins": {
+            "aryeo/tooling-laravel": true
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Support\\Database\\Eloquent\\Ordering\\Providers\\Provider"
+            ]
+        },
+        "tooling": {
+            "rector": {
+                "config": {
+                    "paths": [
+                        "src"
+                    ]
+                },
+                "configured_rules": "tooling/rector/configured-rules.php"
+            },
+            "phpstan": {
+                "config": {
+                    "paths": [
+                        "src",
+                        "tests",
+                        "workbench"
+                    ]
+                },
+                "rules": "tooling/phpstan/rules.neon"
+            },
+            "pint": {
+                "config": {
+                    "paths": [
+                        "src",
+                        "tests",
+                        "workbench"
+                    ]
+                }
+            }
+        }
+    }
+}
