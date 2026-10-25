@@ -6,12 +6,22 @@ namespace Support\Database\Eloquent\Ordering;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
+use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
+use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
+use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
+use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
+use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Sections\Section;
+use Tests\Fixtures\Support\Sections\SectionRevision;
+use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\TestCase;
 use Throwable;
@@ -27,6 +37,14 @@ class OrderedRelationTest extends TestCase
     public static function shapes(): iterable
     {
         return Shape::all();
+    }
+
+    /**
+     * @return iterable<string, array{PivotShape}>
+     */
+    public static function pivots(): iterable
+    {
+        return PivotShape::pivots();
     }
 
     /**
@@ -234,6 +252,133 @@ class OrderedRelationTest extends TestCase
         $this->assertSame(array_map(fn (int|string $id, int $index): array => ['id' => $id, 'position' => $index + 1], $ids, array_keys($ids)), $change->order);
         $this->assertSame($revision, $shape->storedRevision($parent));
         $this->assertSame($keys, $shape->rankKeys($parent));
+    }
+
+    #[Test]
+    public function it_orders_by_rank_key_over_an_order_its_relation_declares(): void
+    {
+        $section = Section::create();
+        $zebra = $this->addAsset($section, 'Zebra');
+        $alpha = $this->addAsset($section, 'Alpha');
+
+        $parent = (new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->orderBy('title');
+            }
+        })->newQuery()->findOrFail($section->id);
+        $relation = $parent->orderedRelation(SectionRevision::AssetsOrder);
+
+        $this->assertSame([$zebra->id, $alpha->id], $relation->query()->pluck('assets.id')->all());
+
+        $unchanged = $relation->reorder([$zebra->id, $alpha->id], expected: null);
+
+        $this->assertSame([], $unchanged->changed);
+        $this->assertSame([['id' => $zebra->id, 'position' => 1], ['id' => $alpha->id, 'position' => 2]], $unchanged->order);
+
+        $change = $relation->reorder([$alpha->id, $zebra->id], expected: null);
+
+        $this->assertSame([['id' => $alpha->id, 'position' => 1], ['id' => $zebra->id, 'position' => 2]], $change->order);
+        $this->assertSame([
+            ['id' => $alpha->id, 'position' => 1, 'previous_position' => 2],
+            ['id' => $zebra->id, 'position' => 2, 'previous_position' => 1],
+        ], $change->changed);
+        $this->assertSame([$alpha->id, $zebra->id], $relation->query()->pluck('assets.id')->all());
+    }
+
+    #[Test]
+    public function it_keeps_a_row_its_relation_excludes_after_the_member_that_precedes_it(): void
+    {
+        $section = Section::create();
+        $first = $this->addAsset($section, 'Shown');
+        $excluded = $this->addAsset($section, 'Excluded');
+        $last = $this->addAsset($section, 'Shown');
+
+        $parent = (new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('title', 'Shown');
+            }
+        })->newQuery()->findOrFail($section->id);
+
+        $change = $parent->orderedRelation(SectionRevision::AssetsOrder)->reorder([$last->id, $first->id], expected: null);
+
+        $this->assertSame([['id' => $last->id, 'position' => 1], ['id' => $first->id, 'position' => 2]], $change->order);
+        $this->assertSame([$last->id, $first->id, $excluded->id], DB::table('assets')->where('section_id', $section->id)->orderBy('rank_key')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_reorders_a_trashed_row_that_its_relation_includes(): void
+    {
+        $section = Section::create();
+        $first = $this->addAsset($section, 'Shown');
+        $trashed = $this->addAsset($section, 'Shown');
+        Asset::query()->whereKey($trashed->id)->delete();
+
+        $parent = (new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->withTrashed();
+            }
+        })->newQuery()->findOrFail($section->id);
+
+        $change = $parent->orderedRelation(SectionRevision::AssetsOrder)->reorder([$trashed->id, $first->id], expected: null);
+
+        $this->assertSame([['id' => $trashed->id, 'position' => 1], ['id' => $first->id, 'position' => 2]], $change->order);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_reorders_pivots_on_the_connection_of_their_parent(PivotShape $shape): void
+    {
+        [$parent, [$first, $second]] = $shape->with(2);
+        $default = config()->string('database.default');
+        config()->set('database.default', 'sqlite');
+
+        try {
+            $change = $shape->orderedRelation($parent)->reorder([$this->key($second), $this->key($first)], expected: null);
+        } finally {
+            config()->set('database.default', $default);
+        }
+
+        $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($parent));
+        $this->assertSame($shape->storedRevision($parent), $change->revision);
+    }
+
+    private function addAsset(Section $section, string $title): Asset
+    {
+        $asset = new Asset(['title' => $title]);
+        $asset->section()->associate($section);
+        $asset->save();
+
+        return $asset;
     }
 
     private function key(Model $member): int|string

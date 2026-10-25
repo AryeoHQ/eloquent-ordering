@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Ordering;
 
+use Closure;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
@@ -12,6 +13,7 @@ use Illuminate\Database\Eloquent\Relations\MorphMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Str;
@@ -214,15 +216,17 @@ final class OrderedRelation
             self::lockAll([$this]);
             $this->compareConcurrencyRevision($expected);
 
-            $keys = $this->keys();
-            $members = array_keys($keys);
+            $members = array_keys($this->keys($this->members()));
             $order = $this->match($members, $ids);
 
             if ($order === $members) {
                 return $this->change([]);
             }
 
-            $this->rewrite($keys, array_combine($order, FractionalIndex::keysBetween(null, null, count($order))));
+            $keys = $this->keys($this->indexedRows());
+            $sequence = $this->sequence(array_keys($keys), $members, $order);
+
+            $this->rewrite($keys, array_combine($sequence, FractionalIndex::keysBetween(null, null, count($sequence))));
             $this->refreshConcurrencyRevision();
 
             $before = array_flip($members);
@@ -327,7 +331,7 @@ final class OrderedRelation
      */
     public function keyAt(Placement $placement, null|int|string $exclude = null): string
     {
-        $key = FractionalIndex::keyBetween(...$this->bounds($placement, $exclude));
+        $key = FractionalIndex::keyBetween(...$this->bounds($placement, $exclude, $this->indexedRows(...)));
 
         if (strlen($key) <= self::MAX_KEY_LENGTH) {
             return $key;
@@ -335,7 +339,7 @@ final class OrderedRelation
 
         $this->rebalance();
 
-        return FractionalIndex::keyBetween(...$this->bounds($placement, $exclude));
+        return FractionalIndex::keyBetween(...$this->bounds($placement, $exclude, $this->indexedRows(...)));
     }
 
     /**
@@ -518,7 +522,7 @@ final class OrderedRelation
             $class = $relation->getPivotClass();
 
             return [
-                'item' => (new $class)->setTable($relation->getTable()),
+                'item' => (new $class)->setTable($relation->getTable())->setConnection($relation->getParent()->getConnectionName()),
                 'foreignKey' => $relation->getForeignPivotKeyName(),
                 'ownerKey' => $relation->getParentKeyName(),
                 ...$morph,
@@ -560,33 +564,34 @@ final class OrderedRelation
     }
 
     /**
+     * @param  Closure(): Builder  $rows
      * @return array{null|string, null|string}
      */
-    private function bounds(Placement $placement, null|int|string $exclude): array
+    private function bounds(Placement $placement, null|int|string $exclude, Closure $rows): array
     {
         $rankKey = $this->item->qualifyColumn(self::RANK_KEY);
-        $others = fn (): Builder => $this->members()->when(
+        $others = fn (Builder $query): Builder => $query->when(
             $exclude !== null,
             fn (Builder $query): Builder => $query->where($this->item->getQualifiedKeyName(), '!=', $exclude),
         );
 
         if ($placement->first) {
-            return [null, self::keyOrNull($others()->min($rankKey))];
+            return [null, self::keyOrNull($others($rows())->min($rankKey))];
         }
 
         if ($placement->before !== null) {
-            $anchor = $this->anchor($others(), $placement->before);
+            $anchor = $this->anchor($others($this->members()), $placement->before);
 
-            return [self::keyOrNull($others()->where($rankKey, '<', $anchor)->max($rankKey)), $anchor];
+            return [self::keyOrNull($others($rows())->where($rankKey, '<', $anchor)->max($rankKey)), $anchor];
         }
 
         if ($placement->after !== null) {
-            $anchor = $this->anchor($others(), $placement->after);
+            $anchor = $this->anchor($others($this->members()), $placement->after);
 
-            return [$anchor, self::keyOrNull($others()->where($rankKey, '>', $anchor)->min($rankKey))];
+            return [$anchor, self::keyOrNull($others($rows())->where($rankKey, '>', $anchor)->min($rankKey))];
         }
 
-        return [self::keyOrNull($others()->max($rankKey)), null];
+        return [self::keyOrNull($others($rows())->max($rankKey)), null];
     }
 
     private function anchor(Builder $members, int|string $anchor): string
@@ -602,7 +607,7 @@ final class OrderedRelation
     private function holdsPlace(int|string $id, Placement $placement): bool
     {
         $key = $this->rows([$id])->value($this->item->qualifyColumn(self::RANK_KEY));
-        [$lower, $upper] = $this->bounds($placement, $id);
+        [$lower, $upper] = $this->bounds($placement, $id, $this->members(...));
 
         return is_string($key)
             && ($lower === null || strcmp($key, $lower) > 0)
@@ -611,7 +616,7 @@ final class OrderedRelation
 
     private function rebalance(): void
     {
-        $keys = $this->keys();
+        $keys = $this->keys($this->indexedRows());
 
         $this->rewrite($keys, array_combine(array_keys($keys), FractionalIndex::keysBetween(null, null, count($keys))));
     }
@@ -622,7 +627,7 @@ final class OrderedRelation
      */
     private function rewrite(array $current, array $next): void
     {
-        $changed = array_filter($next, static fn (string $key, int|string $id): bool => $current[$id] !== $key, ARRAY_FILTER_USE_BOTH);
+        $changed = array_filter($next, static fn (string $key, int|string $id): bool => ($current[$id] ?? null) !== $key, ARRAY_FILTER_USE_BOTH);
 
         if ($changed === []) {
             return;
@@ -661,6 +666,36 @@ final class OrderedRelation
         return array_values($order);
     }
 
+    /**
+     * @param  list<int|string>  $rows
+     * @param  list<int|string>  $members
+     * @param  list<int|string>  $order
+     * @return list<int|string>
+     */
+    private function sequence(array $rows, array $members, array $order): array
+    {
+        $visible = array_flip($members);
+        $sequence = [];
+        $following = [];
+        $previous = null;
+
+        foreach ($rows as $id) {
+            if (array_key_exists($id, $visible)) {
+                $previous = $id;
+            } elseif ($previous === null) {
+                $sequence[] = $id;
+            } else {
+                $following[$previous][] = $id;
+            }
+        }
+
+        foreach ($order as $id) {
+            array_push($sequence, $id, ...($following[$id] ?? []));
+        }
+
+        return $sequence;
+    }
+
     private function announce(OrderChange $change): OrderChange
     {
         event(new Reordered($change));
@@ -673,7 +708,7 @@ final class OrderedRelation
      */
     private function change(array $moved, null|OrderChange $source = null): OrderChange
     {
-        $ids = array_keys($this->keys());
+        $ids = array_keys($this->keys($this->members()));
         $positions = array_flip($ids);
 
         return new OrderChange(
@@ -698,8 +733,16 @@ final class OrderedRelation
      */
     private function write(Model $item, array $attributes): void
     {
-        $item->newQueryWithoutScopes()->whereKey($item->getKey())->toBase()->update($attributes);
+        $row = static fn (): Builder => $item->newQueryWithoutScopes()->whereKey($item->getKey())->toBase();
+
+        $row()->update($attributes);
         $item->forceFill($attributes)->syncOriginalAttributes(array_keys($attributes));
+
+        if ($item instanceof Revisioned) {
+            $revisions = (array) $row()->useWritePdo()->first(array_values($item->concurrencyRevisionColumns()));
+
+            $item->forceFill($revisions)->syncOriginalAttributes(array_keys($revisions));
+        }
     }
 
     private function refreshWith(self $source): void
@@ -714,13 +757,13 @@ final class OrderedRelation
     /**
      * @return array<int|string, string>
      */
-    private function keys(): array
+    private function keys(Builder $rows): array
     {
         $rankKey = $this->item->qualifyColumn(self::RANK_KEY);
         $key = $this->item->getQualifiedKeyName();
 
         /** @var array<int|string, string> */
-        return $this->members()->whereNotNull($rankKey)->orderBy($rankKey)->orderBy($key)->pluck($rankKey, $key)->all();
+        return $rows->whereNotNull($rankKey)->orderBy($rankKey)->orderBy($key)->pluck($rankKey, $key)->all();
     }
 
     private function anchorId(int|string $anchor): null|int|string
@@ -742,6 +785,7 @@ final class OrderedRelation
     private function scopedRelation(): HasMany|MorphMany|BelongsToMany
     {
         $relation = self::relation($this->parent, $this->relationName);
+        $relation->getBaseQuery()->reorder();
         $scopes = array_keys($relation->getRelated()->getGlobalScopes());
 
         return $relation->withoutGlobalScopes(array_values(array_diff($scopes, [SoftDeletingScope::class])));
@@ -750,6 +794,22 @@ final class OrderedRelation
     private function members(): Builder
     {
         return $this->scopedRelation()->toBase();
+    }
+
+    private function indexedRows(): Builder
+    {
+        $rows = $this->item->newQueryWithoutScopes()->toBase()
+            ->where($this->item->qualifyColumn($this->foreignKey), $this->parent->getAttribute($this->ownerKey));
+
+        if ($this->morphType !== null) {
+            $rows->where($this->item->qualifyColumn($this->morphType), $this->morphClass);
+        }
+
+        if (in_array(SoftDeletes::class, class_uses_recursive($this->item), true)) {
+            $rows->whereNull($this->item->qualifyColumn(OrderedRelations::DELETED_AT));
+        }
+
+        return $rows;
     }
 
     /**

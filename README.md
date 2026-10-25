@@ -199,7 +199,9 @@ $assets->query()->get();                 // members in order, scoped by the pare
 $assets->concurrencyRevision();          // the stored order revision, read on the write connection
 ```
 
-`query()` returns the parent's relation ordered by `rank_key`, then by key. It removes every global scope of the item except `SoftDeletingScope`, so a hidden item still holds its place. For a pivot relation each result carries the pivot id.
+`query()` returns the parent's relation ordered by `rank_key`, then by key, and drops any order the relation method declares. It removes every global scope of the related model except `SoftDeletingScope`, so an item that a global scope hides still holds its place. For a pivot relation each result carries the pivot id.
+
+**A row the relation excludes keeps its rank key.** A `where()` on the relation method excludes rows, and so does a soft delete of a pivot's related model. Such a row has no `position` and cannot be an anchor. It still holds its key in the unique index, so every new key and every rebalance avoids that key, and the row keeps its place.
 
 ## Placing a new item
 
@@ -234,9 +236,9 @@ $change = $asset->move(Placement::last()->in($destination), expected: 4);      /
 
 `Placement::in($parent)` names the destination parent. The destination must be saved and must order the item's class.
 
-`expected` is the order revision of the parent the item **leaves**. It is the value a caller read before the move.
+`expected` is the order revision of the **destination**: the parent that the placement's anchor refers to. It is the value a caller read before the move. Inside one parent, the source and the destination are the same parent. A move between parents does not compare the source.
 
-- `expected: 4` throws `StaleConcurrencyRevision` when the stored revision of that parent is not `4`. It also throws when this instance was read from a parent the item has since left.
+- `expected: 4` throws `StaleConcurrencyRevision` when the stored revision of the destination is not `4`. It also throws when this instance was read from a parent the item has since left.
 - `expected: null` skips both checks. The move starts from wherever the item is now.
 
 Both outcomes leave the data unchanged. A move that keeps the order writes nothing and dispatches nothing.
@@ -262,7 +264,19 @@ $section->orderedRelation(SectionRevision::AssetsOrder)
     ->reorder([$thirdId, $firstId, $secondId], expected: 4);
 ```
 
-`expected` is the order revision of this parent. `null` skips the check. A list that omits a member, repeats one, or names a stranger throws `MembershipMismatch` (`InvalidArgumentException`). A trashed member, and a member with no rank key, are not current members. `reorder()` rewrites only the keys that change, and returns an `OrderChange`.
+`expected` is the order revision of this parent. `null` skips the check. A list that omits a member, repeats one, or names a stranger throws `MembershipMismatch` (`InvalidArgumentException`). A trashed member, a member with no rank key, and a row the relation excludes are not current members. `reorder()` keeps an excluded row directly after the member that precedes it now. It rewrites only the keys that change, and returns an `OrderChange`.
+
+## The order revision in memory
+
+After each order write, the package reads the new order revision into the parent instances it can reach:
+
+- the parent that the item holds through a loaded relation, such as `$asset->section()->associate($section)`;
+- the parent whose relation ran `attach()` or `detach()`;
+- the parent whose `orderedRelation()` ran `reorder()`.
+
+It refreshes no other instance. `$section->assets()->create()` and `$section->assets()->save($asset)` set only the foreign key, so the asset holds no parent, and `$section` keeps its old revision. An item loaded by id holds no parent either. After a move, a caller who needs the new order revision reads `OrderChange::$revision` or `$change->relation->parent`. For a create, associate the parent before the save, or reload the parent after it.
+
+A moved item that is itself `Revisioned` reads its revision columns again after the write.
 
 ## Locking
 
@@ -315,7 +329,9 @@ A bulk write fires no `Reordered` event, assigns no rank key, and does not refre
 
 - **A model soft delete adds 2 to the order revision.** The delete is one statement, and the `trashed` listener nulls `rank_key` in a second. Tests assert the stored value, never a step size.
 - **Revision steps follow the statement count.** A move adds 1 to each affected parent. A reorder that changes `k` keys adds `k + 1`.
-- **`restore()` leaves the item without a position.** Its `rank_key` stays `null`, it is not a current member, `reorder()` leaves it out, and `restore()` dispatches no event.- **A foreign-key change saved through Eloquent keeps the old rank key.** It can collide in the new parent, and it dispatches nothing. Use `move()`.
+- **`restore()` leaves the item without a position.** It sets `rank_key` to `null`, also after a bulk soft delete that kept the key. The item is not a current member, `reorder()` leaves it out, and `restore()` dispatches no event.
+- **`reorder()` and a rebalance refresh no item instance in memory.** An instance keeps the `rank_key` it was read with, and a `Revisioned` item keeps its own revision. Reload the item.
+- **A foreign-key change saved through Eloquent keeps the old rank key.** It can collide in the new parent, and it dispatches nothing. Use `move()`.
 - **`attach([a, b])` and `detach([a, b])` dispatch one `Reordered` per pivot.** Each pivot row is one order write, and no batch API exists.
 - **The inverse side of a `MorphToMany` cannot be ordered.** Order it from the side that names the morph type. A `morphedByMany` relation throws `LogicException`.
 - **An item's class must match the relation's class exactly.** A subclass of the related model does not resolve. For a pivot relation, the `using()` class must be the item class.

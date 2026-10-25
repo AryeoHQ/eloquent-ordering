@@ -19,6 +19,7 @@ use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
+use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
@@ -239,6 +240,28 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
+    public function it_restores_a_member_soft_deleted_in_bulk_without_a_rank_key(Shape $shape): void
+    {
+        [$parent, [$first, $deleted]] = $shape->with(2);
+
+        $shape->memberClass()::query()->whereKey($deleted->getKey())->delete();
+        $created = $shape->add($parent);
+        $restored = $shape->find($this->key($deleted));
+        assert(method_exists($restored, 'restore'));
+
+        $this->assertTrue($restored->restore());
+
+        $this->assertNull(DB::table($shape->memberTable())->where('id', $deleted->getKey())->value('deleted_at'));
+        $this->assertNull(DB::table($shape->memberTable())->where('id', $deleted->getKey())->value('rank_key'));
+        $this->assertNull($restored->getAttribute('rank_key'));
+        $this->assertNull($restored->getAttribute('position'));
+        $this->assertFalse($restored->isDirty());
+        $this->assertSame(1, $shape->find($this->key($first))->getAttribute('position'));
+        $this->assertSame(2, $shape->find($this->key($created))->getAttribute('position'));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
     public function it_increments_the_order_revision_for_a_create_and_a_delete_only(Shape $shape): void
     {
         $parent = $shape->createParent();
@@ -329,6 +352,28 @@ class IsOrderedTest extends TestCase
         $this->assertSame([$video->id], $section->orderedRelation(SectionRevision::VideosOrder)->query()->pluck('id')->all());
     }
 
+    #[Test]
+    public function it_reads_the_own_revision_of_a_revisioned_member_again_after_a_move(): void
+    {
+        $section = Section::create();
+        $destination = Section::create();
+        $this->addVideo($section);
+        $video = $this->addVideo($section);
+        $video->setAttribute('title', 'Dusk');
+
+        $video->move(Placement::first(), expected: null);
+
+        $this->assertGreaterThan(1, $this->videoRevision($video));
+        $this->assertSame($this->videoRevision($video), $video->concurrencyRevision());
+        $this->assertSame(['title' => 'Dusk'], $video->getDirty());
+
+        $video->move(Placement::last()->in($destination), expected: null);
+
+        $this->assertSame($this->videoRevision($video), $video->concurrencyRevision());
+        $this->assertSame(['title' => 'Dusk'], $video->getDirty());
+        $this->assertSame($video->concurrencyRevision() + 1, $video->claimConcurrencyRevision($video->concurrencyRevision()));
+    }
+
     #[DataProvider('shapes')]
     #[Test]
     public function it_places_a_new_member_in_the_relation_that_its_foreign_key_names(Shape $shape): void
@@ -406,6 +451,30 @@ class IsOrderedTest extends TestCase
         $this->assertFalse($halted->exists);
         $this->assertSame(2, $shape->storedRevision($parent));
         $this->assertOrder($shape, [$member->getKey()], $parent);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_keeps_the_requested_placement_through_a_halted_create(Shape $shape): void
+    {
+        [$parent, [$first, $second]] = $shape->with(2);
+        $halt = true;
+
+        $shape->memberClass()::creating(function () use (&$halt): null|bool {
+            if (! $halt) {
+                return null;
+            }
+
+            $halt = false;
+
+            return false;
+        });
+
+        $member = $shape->newMember($parent)->placeAt(Placement::first());
+
+        $this->assertFalse($member->save());
+        $this->assertTrue($member->save());
+        $this->assertOrder($shape, [$member->getKey(), $first->getKey(), $second->getKey()], $parent);
     }
 
     #[DataProvider('shapes')]
@@ -546,7 +615,7 @@ class IsOrderedTest extends TestCase
         [$source, [$first, $moved, $third]] = $shape->with(3);
         [$destination, [$anchor, $last]] = $shape->with(2);
 
-        $change = $moved->move(Placement::after($this->key($anchor))->in($destination), expected: 4);
+        $change = $moved->move(Placement::after($this->key($anchor))->in($destination), expected: 3);
 
         $this->assertOrder($shape, [$first->getKey(), $third->getKey()], $source);
         $this->assertOrder($shape, [$anchor->getKey(), $moved->getKey(), $last->getKey()], $destination);
@@ -606,14 +675,14 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_compares_the_expected_revision_with_the_parent_that_a_member_leaves(Shape $shape): void
+    public function it_compares_the_expected_revision_with_the_parent_that_a_member_enters(Shape $shape): void
     {
         [$source, [$moved]] = $shape->with(1);
         [$destination] = $shape->with(2);
 
-        $this->assertRejected($shape, StaleConcurrencyRevision::class, fn (): OrderChange => $moved->move(Placement::first()->in($destination), expected: 3), $source, $destination);
+        $this->assertRejected($shape, StaleConcurrencyRevision::class, fn (): OrderChange => $moved->move(Placement::first()->in($destination), expected: 2), $source, $destination);
 
-        $moved->move(Placement::first()->in($destination), expected: 2);
+        $moved->move(Placement::first()->in($destination), expected: 3);
 
         $this->assertSame($destination->getKey(), $moved->getAttribute($shape->foreignKey()));
     }
@@ -660,7 +729,7 @@ class IsOrderedTest extends TestCase
         [$source, [$first, $moved]] = $shape->with(2);
         [$destination, [$member]] = $shape->with(1);
 
-        $this->assertRejected($shape, InvalidAnchor::class, fn (): OrderChange => $moved->move(Placement::before($this->key($first))->in($destination), expected: 3), $source, $destination);
+        $this->assertRejected($shape, InvalidAnchor::class, fn (): OrderChange => $moved->move(Placement::before($this->key($first))->in($destination), expected: 2), $source, $destination);
         $this->assertOrder($shape, [$first->getKey(), $moved->getKey()], $source);
         $this->assertOrder($shape, [$member->getKey()], $destination);
         $this->assertSame($source->getKey(), $moved->getAttribute($shape->foreignKey()));
@@ -674,7 +743,7 @@ class IsOrderedTest extends TestCase
         [$elsewhere, [$member]] = $shape->with(1);
         $stale = $shape->find($this->key($moved));
 
-        $moved->move(Placement::last()->in($elsewhere), expected: 3);
+        $moved->move(Placement::last()->in($elsewhere), expected: 2);
 
         $this->assertSame(3, $shape->storedRevision($elsewhere));
         $this->assertRejected($shape, StaleConcurrencyRevision::class, fn (): OrderChange => $stale->move(Placement::first(), expected: 3), $source, $elsewhere);
@@ -868,6 +937,65 @@ class IsOrderedTest extends TestCase
         $this->assertOrder($shape, [$shape->pivotOf($parent, $second)->getKey(), $attached->getKey()], $parent);
     }
 
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_keeps_the_rank_key_of_a_pivot_whose_customer_is_soft_deleted_out_of_new_keys(PivotShape $shape): void
+    {
+        $parent = $shape->createParent();
+        $first = $shape->add($parent);
+        $hidden = $shape->add($parent);
+        Customer::query()->findOrFail($hidden->getAttribute('customer_id'))->delete();
+
+        $customer = Customer::create();
+        $shape->customers($parent)->attach($customer);
+        $attached = $shape->pivotOf($parent, $customer);
+
+        $shape->orderedRelation($parent)->reorder([$this->key($attached), $this->key($first)], expected: null);
+
+        $this->assertSame([$attached->getKey(), $first->getKey()], $shape->members($parent));
+        $this->assertSame([$attached->getKey(), $first->getKey(), $hidden->getKey()], $this->storedOrder($shape, $parent));
+
+        $next = $first;
+        $inserted = [];
+
+        while (strlen(FractionalIndex::keyBetween($this->storedRankKey($shape, $attached), $this->storedRankKey($shape, $next))) <= OrderedRelation::MAX_KEY_LENGTH) {
+            $next = $shape->add($parent, Placement::after($this->key($attached)));
+            array_unshift($inserted, $next->getKey());
+        }
+
+        $longest = $shape->longestRankKey($parent);
+
+        $member = $shape->add($parent, Placement::after($this->key($attached)));
+
+        $this->assertLessThan($longest, $shape->longestRankKey($parent));
+        $this->assertSame([$attached->getKey(), $member->getKey(), ...$inserted, $first->getKey()], $shape->members($parent));
+        $this->assertSame([$attached->getKey(), $member->getKey(), ...$inserted, $first->getKey(), $hidden->getKey()], $this->storedOrder($shape, $parent));
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_counts_no_pivot_whose_customer_is_soft_deleted_as_a_member(PivotShape $shape): void
+    {
+        $parent = $shape->createParent();
+        $first = $shape->add($parent);
+        $hidden = $shape->add($parent);
+        $last = $shape->add($parent);
+        Customer::query()->findOrFail($hidden->getAttribute('customer_id'))->delete();
+        $revision = $shape->storedRevision($parent);
+        DB::enableQueryLog();
+
+        $change = $last->move(Placement::after($this->key($first)), expected: $revision);
+
+        $this->assertSame([], $this->writes());
+        $this->assertSame([], $change->changed);
+        $this->assertSame([['id' => $first->getKey(), 'position' => 1], ['id' => $last->getKey(), 'position' => 2]], $change->order);
+        $this->assertNull($shape->find($this->key($hidden))->getAttribute('position'));
+        $this->assertSame(2, $shape->find($this->key($last))->getAttribute('position'));
+        $this->assertRejected($shape, InvalidAnchor::class, fn (): OrderChange => $last->move(Placement::before($this->key($hidden)), expected: null), $parent);
+        $this->assertRejected($shape, InvalidAnchor::class, fn (): Model => $shape->add($parent, Placement::before($this->key($hidden))), $parent);
+        $this->assertRejected($shape, MembershipMismatch::class, fn (): OrderChange => $shape->orderedRelation($parent)->reorder([$this->key($last), $this->key($hidden), $this->key($first)], expected: null), $parent);
+    }
+
     #[Test]
     public function it_increments_only_the_order_revision_of_the_parent_type_that_a_scene_names(): void
     {
@@ -898,7 +1026,7 @@ class IsOrderedTest extends TestCase
         $moved = $this->addScene($tour);
         $member = $this->addScene($listing);
 
-        $change = $moved->move(Placement::first()->in($listing), expected: 3);
+        $change = $moved->move(Placement::first()->in($listing), expected: 2);
 
         $this->assertSame($listing, $change->relation->parent);
         $this->assertSame([['id' => $moved->id, 'position' => 1], ['id' => $member->id, 'position' => 2]], $change->order);
@@ -990,7 +1118,7 @@ class IsOrderedTest extends TestCase
             $rivals[] = $this->startDelete($moved);
             $this->awaitLockWait(1, ...$rivals);
 
-            $moved->move(Placement::first()->in($destination), expected: 3);
+            $moved->move(Placement::first()->in($destination), expected: 1);
 
             $racer->commit();
 
@@ -1063,6 +1191,40 @@ class IsOrderedTest extends TestCase
         $this->assertIsString($key);
 
         return $key;
+    }
+
+    private function storedRankKey(Shape $shape, Model $member): string
+    {
+        $key = DB::table($shape->memberTable())->where('id', $member->getKey())->value('rank_key');
+
+        $this->assertIsString($key);
+
+        return $key;
+    }
+
+    /**
+     * @return list<int|string>
+     */
+    private function storedOrder(Shape $shape, Model $parent): array
+    {
+        $keys = array_filter($shape->rankKeys($parent), is_string(...));
+        uasort($keys, strcmp(...));
+
+        return array_keys($keys);
+    }
+
+    private function addVideo(Section $section): Video
+    {
+        $video = new Video;
+        $video->section()->associate($section);
+        $video->save();
+
+        return $video;
+    }
+
+    private function videoRevision(Video $video): int
+    {
+        return (int) DB::table('videos')->where('id', $video->id)->value('concurrency_revision');
     }
 
     private function addScene(Tour|Listing $parent): Scene

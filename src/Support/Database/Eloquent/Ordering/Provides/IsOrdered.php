@@ -15,6 +15,7 @@ use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
+use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
 
 /**
  * @phpstan-require-extends Model
@@ -38,16 +39,21 @@ trait IsOrdered
             if (! $item->exists) {
                 $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
             } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
+                if ($item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
+                    $item->setAttribute(OrderedRelation::RANK_KEY, null);
+                }
+
                 [, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations($item->resolveOrderedRelation($item->getAttributes()));
             }
         });
 
         static::creating(static function (self $item): void {
             $item->setAttribute(OrderedRelation::RANK_KEY, $item->orderedRelation()->keyAt($item->placement ?? Placement::last()));
-            $item->placement = null;
         });
 
         static::created(static function (self $item): void {
+            $item->placement = null;
+
             foreach ($item->refreshLockedOrderedRelations() as $relation) {
                 $relation->placed($item);
             }
@@ -126,7 +132,7 @@ trait IsOrdered
                     throw new StaleConcurrencyRevision(($read ?? $source)->parent, ($read ?? $source)->revision, $expected);
                 }
 
-                $source->compareConcurrencyRevision($expected);
+                ($destination ?? $source)->compareConcurrencyRevision($expected);
             }
 
             $change = ($destination ?? $source)->move($this, $placement, $source);
