@@ -7,6 +7,7 @@ namespace Support\Database\Eloquent\Ordering\Provides;
 use Closure;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\Pivot;
 use LogicException;
 use RuntimeException;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
@@ -75,9 +76,9 @@ trait IsOrdered
         return $this->commitUnlessHalted(fn (): bool => parent::save($options));
     }
 
-    public function delete(): null|bool
+    public function delete()
     {
-        return $this->commitUnlessHalted(fn (): null|bool => parent::delete());
+        return $this->commitUnlessHalted(fn () => parent::delete());
     }
 
     public function placeAt(Placement $placement): static
@@ -126,6 +127,10 @@ trait IsOrdered
                         $this->unsetRelation($name);
                     }
                 }
+
+                if ($this instanceof Pivot && $this->pivotParent === $source->parent) {
+                    $this->pivotParent = $change->relation->parent;
+                }
             }
 
             $this->resolvedOrderedRelation = $change->relation;
@@ -173,7 +178,7 @@ trait IsOrdered
      */
     private function storedOrderedAttributes(): null|array
     {
-        $stored = $this->newQueryWithoutScopes()->whereKey($this->getKey())->toBase()->useWritePdo()->first(OrderedRelation::foreignKeys($this));
+        $stored = $this->newQueryWithoutScopes()->whereKey($this->getKey())->toBase()->useWritePdo()->first(OrderedRelation::membershipColumns($this));
 
         return $stored === null ? null : (array) $stored;
     }
@@ -188,17 +193,18 @@ trait IsOrdered
     }
 
     /**
-     * @template TResult of null|bool
+     * @template TResult of null|bool|int
      *
      * @param  Closure(): TResult  $write
-     * @return TResult|false
+     * @return TResult
      */
-    private function commitUnlessHalted(Closure $write): null|bool
+    private function commitUnlessHalted(Closure $write): null|bool|int
     {
         $halted = new RuntimeException;
+        $result = null;
 
         try {
-            return $this->getConnection()->transaction(function () use ($write, $halted): null|bool {
+            return $this->getConnection()->transaction(function () use ($write, $halted, &$result): null|bool|int {
                 $result = $write();
 
                 throw_if($result === false, $halted);
@@ -208,7 +214,7 @@ trait IsOrdered
         } catch (RuntimeException $exception) {
             throw_unless($exception === $halted, $exception);
 
-            return false;
+            return $result;
         }
     }
 }

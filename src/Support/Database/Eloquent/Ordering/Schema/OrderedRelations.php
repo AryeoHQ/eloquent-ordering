@@ -19,7 +19,18 @@ final class OrderedRelations
             NamedRevisionTrigger::on($table)
                 ->increments($parent, $revision)
                 ->through($foreignKey)
-                ->whenColumnsChange(OrderedRelation::RANK_KEY, $foreignKey, ...Schema::hasColumn($table, self::DELETED_AT) ? [self::DELETED_AT] : [])
+                ->whenColumnsChange(...self::watchedColumns($table, $foreignKey))
+                ->whenRowsInsertedOrDeleted(),
+        );
+    }
+
+    public static function createMorphTrigger(string $table, string $parent, string $morphName, string $morphType, string $revision): void
+    {
+        ConcurrencyRevisions::createNamedTrigger(
+            NamedRevisionTrigger::on($table)
+                ->increments($parent, $revision)
+                ->throughMorph($morphName, $morphType)
+                ->whenColumnsChange(...self::watchedColumns($table, $morphName.'_id', $morphName.'_type'))
                 ->whenRowsInsertedOrDeleted(),
         );
     }
@@ -27,5 +38,13 @@ final class OrderedRelations
     public static function dropTrigger(string $table, string $revision): void
     {
         ConcurrencyRevisions::dropNamedTrigger($table, $revision);
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function watchedColumns(string $table, string ...$relation): array
+    {
+        return [OrderedRelation::RANK_KEY, ...$relation, ...Schema::hasColumn($table, self::DELETED_AT) ? [self::DELETED_AT] : []];
     }
 }

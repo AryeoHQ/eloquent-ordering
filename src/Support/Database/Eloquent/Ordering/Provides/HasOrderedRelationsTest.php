@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering\Provides;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Support\Facades\DB;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -18,8 +20,11 @@ use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Clips\Clip;
+use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Customers\Customerable;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
+use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Videos\Video;
 use Tests\Fixtures\Support\Videos\VideoRevision;
 use Tests\TestCase;
@@ -199,6 +204,60 @@ class HasOrderedRelationsTest extends TestCase
             $this->fail('A method that declares no HasMany relation was accepted.');
         } catch (LogicException) {
             $this->assertTrue(DB::table('sections')->where('id', $parent->getKey())->exists());
+        }
+    }
+
+    #[Test]
+    public function it_rejects_a_belongs_to_many_relation_without_an_ordered_pivot(): void
+    {
+        $parent = new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this>
+             */
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id');
+            }
+        };
+
+        try {
+            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $this->fail('A BelongsToMany relation without an Ordered pivot was accepted.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString('must name an Ordered pivot class through using()', $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function it_rejects_the_inverse_side_of_a_morph_to_many_relation(): void
+    {
+        $parent = new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'tours')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'customers';
+
+            /**
+             * @return MorphToMany<Tour, $this, Customerable>
+             */
+            public function tours(): MorphToMany
+            {
+                return $this->morphedByMany(Tour::class, 'customerable', 'customerables', 'customer_id')->using(Customerable::class);
+            }
+        };
+
+        try {
+            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $this->fail('The inverse side of a MorphToMany relation was accepted.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString('inverse side of a MorphToMany relation', $exception->getMessage());
         }
     }
 

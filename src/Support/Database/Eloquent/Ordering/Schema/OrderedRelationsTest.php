@@ -6,11 +6,16 @@ namespace Support\Database\Eloquent\Ordering\Schema;
 
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
+use Tests\Fixtures\Support\Tours\Tour;
+use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\TestCase;
 
 #[CoversClass(OrderedRelations::class)]
@@ -123,6 +128,76 @@ class OrderedRelationsTest extends TestCase
         DB::table('assets')->insert(['section_id' => $section->id, 'rank_key' => 'a0']);
 
         $this->assertSame(1, $this->storedRevision($section));
+    }
+
+    #[Test]
+    public function it_increments_the_order_revision_of_the_morph_parent_whose_type_a_statement_names(): void
+    {
+        $tour = Tour::create();
+        $listing = Listing::create(['id' => $tour->id]);
+
+        DB::table('scenes')->insert([
+            ['id' => Str::uuid7()->toString(), 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0'],
+            ['id' => Str::uuid7()->toString(), 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a1'],
+        ]);
+
+        $this->assertSame(2, $this->scenesRevision($tour));
+        $this->assertSame(1, $this->scenesRevision($listing));
+
+        DB::table('scenes')->insert(['id' => Str::uuid7()->toString(), 'sceneable_type' => $listing->getMorphClass(), 'sceneable_id' => $listing->id, 'rank_key' => 'a0']);
+
+        $this->assertSame(2, $this->scenesRevision($tour));
+        $this->assertSame(2, $this->scenesRevision($listing));
+    }
+
+    #[Test]
+    public function it_increments_both_morph_parents_when_an_item_changes_parent_type(): void
+    {
+        $tour = Tour::create();
+        $listing = Listing::create();
+        $id = Str::uuid7()->toString();
+        DB::table('scenes')->insert(['id' => $id, 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0']);
+
+        DB::table('scenes')->where('id', $id)->update(['sceneable_type' => $listing->getMorphClass(), 'sceneable_id' => $listing->id]);
+
+        $this->assertSame(3, $this->scenesRevision($tour));
+        $this->assertSame(2, $this->scenesRevision($listing));
+    }
+
+    #[Test]
+    public function it_watches_the_rank_key_and_the_soft_delete_of_a_morph_item(): void
+    {
+        $tour = Tour::create();
+        $id = Str::uuid7()->toString();
+        DB::table('scenes')->insert(['id' => $id, 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0']);
+
+        DB::table('scenes')->where('id', $id)->update(['rank_key' => 'a1']);
+        DB::table('scenes')->where('id', $id)->update(['title' => 'Porch']);
+        DB::table('scenes')->where('id', $id)->update(['deleted_at' => now()]);
+
+        $this->assertSame(4, $this->scenesRevision($tour));
+    }
+
+    #[Test]
+    public function it_drops_the_morph_trigger_of_every_parent_type(): void
+    {
+        $tour = Tour::create();
+        $listing = Listing::create();
+
+        OrderedRelations::dropTrigger('scenes', TourRevision::ScenesOrder->value);
+        DB::table('scenes')->insert([
+            ['id' => Str::uuid7()->toString(), 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0'],
+            ['id' => Str::uuid7()->toString(), 'sceneable_type' => $listing->getMorphClass(), 'sceneable_id' => $listing->id, 'rank_key' => 'a0'],
+        ]);
+
+        $this->assertSame(ListingRevision::ScenesOrder->value, TourRevision::ScenesOrder->value);
+        $this->assertSame(1, $this->scenesRevision($tour));
+        $this->assertSame(1, $this->scenesRevision($listing));
+    }
+
+    private function scenesRevision(Tour|Listing $parent): int
+    {
+        return (int) DB::table($parent->getTable())->where('id', $parent->id)->value('scenes_order_concurrency_revision');
     }
 
     private function storedRevision(Section $section): int
