@@ -9,7 +9,9 @@ use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
 use LogicException;
 use RuntimeException;
+use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
+use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
 
@@ -31,9 +33,9 @@ trait IsOrdered
     {
         static::saving(static function (self $item): void {
             if (! $item->exists) {
-                $item->lockOrderedRelations([$item->getAttributes()]);
+                $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
             } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
-                $item->lockOrderedRelations([$item->getRawOriginal(), $item->getAttributes()]);
+                [, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations($item->resolveOrderedRelation($item->getAttributes()));
             }
         });
 
@@ -43,7 +45,7 @@ trait IsOrdered
         });
 
         static::deleting(static function (self $item): void {
-            $item->lockOrderedRelations([$item->getRawOriginal()]);
+            [, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations();
         });
 
         static::registerModelEvent('trashed', static function (self $item): void {
@@ -81,10 +83,55 @@ trait IsOrdered
     public function placeAt(Placement $placement): static
     {
         throw_if($this->exists, LogicException::class, sprintf('[%s:%s] already has a place in its order.', static::class, $this->getKey()));
+        throw_if($placement->parent !== null, LogicException::class, sprintf('Associate the parent of a new [%s] rather than name it in the placement.', static::class));
 
         $this->placement = $placement;
 
         return $this;
+    }
+
+    public function move(Placement $placement, null|int $expected): OrderChange
+    {
+        throw_unless($this->exists, LogicException::class, sprintf('[%s] must be saved before it moves.', static::class));
+
+        return $this->getConnection()->transaction(function () use ($placement, $expected): OrderChange {
+            $destination = $placement->parent === null ? null : OrderedRelation::in($placement->parent, $this);
+            [$source] = $this->lockCurrentOrderedRelations($destination);
+
+            if ($source === null) {
+                throw new LogicException(sprintf('[%s:%s] has no parent that orders it.', static::class, $this->getKey()));
+            }
+
+            if ($expected !== null) {
+                $read = $this->resolveOrderedRelation($this->getRawOriginal());
+
+                if ($read === null || ! $read->is($source)) {
+                    throw new StaleConcurrencyRevision(($read ?? $source)->parent, ($read ?? $source)->revision, $expected);
+                }
+
+                $source->compareConcurrencyRevision($expected);
+            }
+
+            $change = ($destination ?? $source)->move($this, $placement, $source);
+
+            if ($change->source !== null) {
+                foreach ($this->getRelations() as $name => $related) {
+                    if ($related !== $source->parent) {
+                        continue;
+                    }
+
+                    if ($related::class === $change->relation->parent::class) {
+                        $this->setRelation($name, $change->relation->parent);
+                    } else {
+                        $this->unsetRelation($name);
+                    }
+                }
+            }
+
+            $this->resolvedOrderedRelation = $change->relation;
+
+            return $change;
+        });
     }
 
     /**
@@ -98,28 +145,37 @@ trait IsOrdered
     }
 
     /**
-     * @param  list<array<string, mixed>>  $states
+     * @return array{null|OrderedRelation, list<OrderedRelation>}
      */
-    private function lockOrderedRelations(array $states): void
+    private function lockCurrentOrderedRelations(null|OrderedRelation $next = null): array
     {
-        $relations = [];
+        $stored = $this->storedOrderedAttributes();
+        $current = $stored === null ? null : $this->resolveOrderedRelation($stored);
+        $moved = new RuntimeException;
 
-        foreach ($states as $attributes) {
-            $relation = $this->resolveOrderedRelation($attributes);
+        try {
+            return $this->getConnection()->transaction(function () use ($stored, $current, $next, $moved): array {
+                $locked = OrderedRelation::lockAll([$current, $next]);
 
-            if ($relation !== null) {
-                $relations[sprintf('%s:%s', $relation->parent->getMorphClass(), $relation->parent->getKey())] = $relation;
-            }
+                throw_unless($this->storedOrderedAttributes() === $stored, $moved);
+
+                return [$current, $locked];
+            });
+        } catch (RuntimeException $exception) {
+            throw_unless($exception === $moved, $exception);
+
+            return $this->lockCurrentOrderedRelations($next);
         }
+    }
 
-        uasort($relations, static fn (OrderedRelation $first, OrderedRelation $second): int => [$first->parent->getMorphClass(), $first->parent->getKey()]
-            <=> [$second->parent->getMorphClass(), $second->parent->getKey()]);
+    /**
+     * @return null|array<string, mixed>
+     */
+    private function storedOrderedAttributes(): null|array
+    {
+        $stored = $this->newQueryWithoutScopes()->whereKey($this->getKey())->toBase()->useWritePdo()->first(OrderedRelation::foreignKeys($this));
 
-        foreach ($relations as $relation) {
-            $relation->lock();
-        }
-
-        $this->lockedOrderedRelations = array_values($relations);
+        return $stored === null ? null : (array) $stored;
     }
 
     private function refreshLockedOrderedRelations(): void
