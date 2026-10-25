@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Ordering\Schema;
 
+use Illuminate\Support\Facades\Schema;
 use Support\Database\Eloquent\Concurrency\Schema\ConcurrencyRevisions;
 use Support\Database\Eloquent\Concurrency\Schema\NamedRevisionTrigger;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
@@ -18,7 +19,7 @@ final class OrderedRelations
             NamedRevisionTrigger::on($table)
                 ->increments($parent, $revision)
                 ->through($foreignKey)
-                ->whenColumnsChange(OrderedRelation::RANK_KEY, $foreignKey, self::DELETED_AT)
+                ->whenColumnsChange(OrderedRelation::RANK_KEY, $foreignKey, ...Schema::hasColumn($table, self::DELETED_AT) ? [self::DELETED_AT] : [])
                 ->whenRowsInsertedOrDeleted(),
         );
     }
