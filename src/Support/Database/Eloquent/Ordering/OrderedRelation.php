@@ -27,6 +27,7 @@ use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
+use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
@@ -233,7 +234,7 @@ final class OrderedRelation
                 }
             }
 
-            return $this->change($moved);
+            return $this->announce($this->change($moved));
         });
     }
 
@@ -253,7 +254,7 @@ final class OrderedRelation
             $this->write($item, [self::RANK_KEY => $this->keyAt($placement, $id)]);
             $this->refreshWith($source);
 
-            return $this->change([$id => $previous]);
+            return $this->announce($this->change([$id => $previous]));
         }
 
         $this->write($item, [
@@ -264,7 +265,25 @@ final class OrderedRelation
         ]);
         $this->refreshWith($source);
 
-        return $this->change([$id => null], $source->change([$id => $previous]));
+        $left = $source->announce($source->change([$id => $previous]));
+
+        return $this->announce($this->change([$id => null], $left));
+    }
+
+    /**
+     * @internal
+     */
+    public function placed(Model&Ordered $item): void
+    {
+        $this->announce($this->change([self::keyOf($item) => null]));
+    }
+
+    /**
+     * @internal
+     */
+    public function removed(Model&Ordered $item, int $previous): void
+    {
+        $this->announce($this->change([self::keyOf($item) => $previous]));
     }
 
     /**
@@ -640,6 +659,13 @@ final class OrderedRelation
         throw_unless(count($order) === count($members), new MembershipMismatch($this));
 
         return array_values($order);
+    }
+
+    private function announce(OrderChange $change): OrderChange
+    {
+        event(new Reordered($change));
+
+        return $change;
     }
 
     /**

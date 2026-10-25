@@ -27,6 +27,8 @@ trait IsOrdered
 
     private null|Placement $placement = null;
 
+    private null|int $vacatedPosition = null;
+
     /** @var list<OrderedRelation> */
     private array $lockedOrderedRelations = [];
 
@@ -45,8 +47,15 @@ trait IsOrdered
             $item->placement = null;
         });
 
+        static::created(static function (self $item): void {
+            foreach ($item->refreshLockedOrderedRelations() as $relation) {
+                $relation->placed($item);
+            }
+        });
+
         static::deleting(static function (self $item): void {
-            [, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations();
+            [$current, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations();
+            $item->vacatedPosition = $current?->position($item);
         });
 
         static::registerModelEvent('trashed', static function (self $item): void {
@@ -59,7 +68,14 @@ trait IsOrdered
         });
 
         static::deleted(static function (self $item): void {
-            $item->refreshLockedOrderedRelations();
+            $vacated = $item->vacatedPosition;
+            $item->vacatedPosition = null;
+
+            foreach ($item->refreshLockedOrderedRelations() as $relation) {
+                if ($vacated !== null) {
+                    $relation->removed($item, $vacated);
+                }
+            }
         });
     }
 
@@ -183,13 +199,20 @@ trait IsOrdered
         return $stored === null ? null : (array) $stored;
     }
 
-    private function refreshLockedOrderedRelations(): void
+    /**
+     * @return list<OrderedRelation>
+     */
+    private function refreshLockedOrderedRelations(): array
     {
-        foreach ($this->lockedOrderedRelations as $relation) {
+        $relations = $this->lockedOrderedRelations;
+
+        foreach ($relations as $relation) {
             $relation->refreshConcurrencyRevision();
         }
 
         $this->lockedOrderedRelations = [];
+
+        return $relations;
     }
 
     /**
