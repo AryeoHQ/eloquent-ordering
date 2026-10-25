@@ -11,5 +11,4 @@ return $config
     ->addPathToScan(__DIR__.'/tests', isDev: true)
     ->addPathToScan(__DIR__.'/workbench', isDev: true)
     ->addPathRegexToExclude('~Test(Cases)?\.php$~')
-    ->ignoreErrorsOnPackage('aryeo/tooling-laravel', [ErrorType::UNUSED_DEPENDENCY])
-    ->ignoreErrorsOnPackage('aryeo/eloquent-concurrency', [ErrorType::UNUSED_DEPENDENCY]);
+    ->ignoreErrorsOnPackage('aryeo/tooling-laravel', [ErrorType::UNUSED_DEPENDENCY]);

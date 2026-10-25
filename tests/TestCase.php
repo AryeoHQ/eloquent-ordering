@@ -25,4 +25,9 @@ abstract class TestCase extends Testbench\TestCase
     {
         $app['config']->set('database.connections.sqlite.database', ':memory:');
     }
+
+    protected function defineDatabaseMigrationsAfterDatabaseRefreshed(): void
+    {
+        $this->app?->make('migrator')->run(__DIR__.'/Fixtures/Support/Migrations');
+    }
 }
