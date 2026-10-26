@@ -41,6 +41,8 @@ final class OrderedRelation
 
     public const int MAX_KEY_LENGTH = 64;
 
+    private const string KEY_NAME = 'id';
+
     private readonly string $relationName;
 
     private readonly Model $item;
@@ -478,7 +480,32 @@ final class OrderedRelation
 
         throw_unless(is_a(self::itemClass($relation), Ordered::class, true), LogicException::class, $message);
 
+        self::requireIdKeys($parent, $name, $relation);
+
         return $relation;
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     */
+    private static function requireIdKeys(Model $parent, string $name, HasMany|MorphMany|BelongsToMany $relation): void
+    {
+        $item = self::describe($relation)['item'];
+
+        foreach ([
+            'the primary key of the parent' => $parent->getKeyName(),
+            'the owner key of the relation' => $relation instanceof BelongsToMany ? $relation->getParentKeyName() : $relation->getLocalKeyName(),
+            'the primary key of the item' => $item->getKeyName(),
+        ] as $role => $key) {
+            throw_unless($key === self::KEY_NAME, LogicException::class, sprintf(
+                '[%s::%s()] uses [%s] as %s. Ordered relations require the key [%s], because the named revision trigger matches the parent by it.',
+                $parent::class,
+                $name,
+                $key,
+                $role,
+                self::KEY_NAME,
+            ));
+        }
     }
 
     private static function declaresOrderableRelation(Model $parent, string $name): bool

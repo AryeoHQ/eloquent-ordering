@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
+use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Support\Facades\DB;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -22,6 +23,8 @@ use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Clips\Clip;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\Customerable;
+use Tests\Fixtures\Support\Listings\ListingCustomer;
+use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Tours\Tour;
@@ -258,6 +261,183 @@ class HasOrderedRelationsTest extends TestCase
             $this->fail('The inverse side of a MorphToMany relation was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString('inverse side of a MorphToMany relation', $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function it_rejects_a_has_many_relation_with_an_owner_key_other_than_id(): void
+    {
+        $parent = new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_legacy_id', 'legacy_id');
+            }
+        };
+
+        try {
+            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $this->fail('A HasMany relation with a custom owner key was accepted.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString($parent::class, $exception->getMessage());
+            $this->assertStringContainsString('assets()', $exception->getMessage());
+            $this->assertStringContainsString('legacy_id', $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function it_rejects_a_parent_whose_primary_key_is_not_named_id(): void
+    {
+        $parent = new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            protected $primaryKey = 'legacy_id';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id');
+            }
+        };
+
+        try {
+            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $this->fail('A parent whose primary key is not named id was accepted.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString($parent::class, $exception->getMessage());
+            $this->assertStringContainsString('assets()', $exception->getMessage());
+            $this->assertStringContainsString('legacy_id', $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function it_rejects_an_item_whose_primary_key_is_not_named_id(): void
+    {
+        $item = new class extends Model implements Ordered, OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+            use IsOrdered;
+
+            protected $table = 'assets';
+
+            protected $primaryKey = 'legacy_id';
+        };
+
+        $parent = new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            /** @var class-string<Model&Ordered> */
+            public string $itemClass = Asset::class;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Model&Ordered, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany($this->itemClass, 'section_id');
+            }
+        };
+        $parent->itemClass = $item::class;
+
+        try {
+            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $this->fail('An item whose primary key is not named id was accepted.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString($parent::class, $exception->getMessage());
+            $this->assertStringContainsString('assets()', $exception->getMessage());
+            $this->assertStringContainsString('legacy_id', $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function it_rejects_a_belongs_to_many_relation_with_a_parent_key_other_than_id(): void
+    {
+        $parent = new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id', 'customer_id', 'legacy_id')->using(ListingCustomer::class);
+            }
+        };
+
+        try {
+            $parent->orderedRelation(ListingRevision::CustomersOrder);
+            $this->fail('A BelongsToMany relation with a custom parent key was accepted.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString($parent::class, $exception->getMessage());
+            $this->assertStringContainsString('customers()', $exception->getMessage());
+            $this->assertStringContainsString('legacy_id', $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function it_rejects_a_pivot_whose_primary_key_is_not_named_id(): void
+    {
+        $pivot = new class extends Pivot implements Ordered, OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+            use IsOrdered;
+
+            protected $table = 'listing_customer';
+
+            protected $primaryKey = 'legacy_id';
+        };
+
+        $parent = new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            /** @var class-string<Pivot&Ordered> */
+            public string $pivotClass = ListingCustomer::class;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, Pivot&Ordered>
+             */
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')->using($this->pivotClass);
+            }
+        };
+        $parent->pivotClass = $pivot::class;
+
+        try {
+            $parent->orderedRelation(ListingRevision::CustomersOrder);
+            $this->fail('A pivot whose primary key is not named id was accepted.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString($parent::class, $exception->getMessage());
+            $this->assertStringContainsString('customers()', $exception->getMessage());
+            $this->assertStringContainsString('legacy_id', $exception->getMessage());
         }
     }
 
