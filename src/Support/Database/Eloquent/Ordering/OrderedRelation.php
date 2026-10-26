@@ -758,15 +758,18 @@ final class OrderedRelation
 
     private function memberKey(int|string $id): null|string
     {
-        if (in_array($this->keys->item->getKeyType(), ['int', 'integer'], true)) {
-            return is_int($id) || (string) (int) $id === $id ? (string) (int) $id : null;
+        $key = (string) $id;
+        $integer = in_array($this->keys->item->getKeyType(), ['int', 'integer'], true);
+
+        if (Str::isUuid($key)) {
+            return $integer && $this->keys->item->getIncrementing() ? null : strtolower($key);
         }
 
-        if (in_array(HasUuids::class, class_uses_recursive($this->keys->item), true)) {
-            return Str::isUuid((string) $id) ? strtolower((string) $id) : null;
+        if ($integer) {
+            return (string) (int) $key === $key ? $key : null;
         }
 
-        return (string) $id;
+        return in_array(HasUuids::class, class_uses_recursive($this->keys->item), true) ? null : $key;
     }
 
     /**
@@ -814,7 +817,7 @@ final class OrderedRelation
      */
     private function itemRows(array $ids): Builder
     {
-        return $this->keys->item->newQueryWithoutScopes()->whereKey($ids)->toBase();
+        return $this->keys->item->newQueryWithoutScopes()->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $ids);
     }
 
     private function lock(): void

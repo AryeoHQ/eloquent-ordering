@@ -24,7 +24,6 @@ use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
-use Support\Database\Eloquent\Ordering\PositionChange;
 use Tests\Fixtures\Support\Albums\Album;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Boards\Board;
@@ -206,6 +205,18 @@ class IsOrderedTest extends TestCase
         $this->expectException(InvalidAnchor::class);
 
         $shape->add($parent, Placement::after('first'));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_rejects_a_uuid_anchor_that_names_no_member(Shape $shape): void
+    {
+        $parent = $shape->createParent();
+        $shape->add($parent);
+
+        $this->expectException(InvalidAnchor::class);
+
+        $shape->add($parent, Placement::after('0190a5b2-0000-7000-8000-000000000000'));
     }
 
     #[DataProvider('shapes')]
@@ -613,7 +624,7 @@ class IsOrderedTest extends TestCase
 
         $this->assertOrder($shape, $ids, $parent);
         $this->assertSame($ids, $change->order);
-        $this->assertEquals([new PositionChange($this->key($members[$moved]), position: (int) array_search($moved, $expected, true) + 1, previousPosition: $moved + 1)], $change->changed);
+        $this->assertSame([['id' => $this->key($members[$moved]), 'position' => (int) array_search($moved, $expected, true) + 1, 'previousPosition' => $moved + 1]], array_map(get_object_vars(...), $change->changed));
         $this->assertSame($parent, $change->relation->parent);
         $this->assertSame($shape->revision(), $change->relation->revision);
         $this->assertNull($change->source);
@@ -638,7 +649,7 @@ class IsOrderedTest extends TestCase
 
         $this->assertSame($destination, $change->relation->parent);
         $this->assertSame([$anchor->getKey(), $moved->getKey(), $last->getKey()], $change->order);
-        $this->assertEquals([new PositionChange($this->key($moved), position: 2, previousPosition: null)], $change->changed);
+        $this->assertSame([['id' => $this->key($moved), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
         $this->assertGreaterThan(3, $change->revision);
         $this->assertSame($shape->storedRevision($destination), $change->revision);
         $this->assertSame($change->revision, $destination->concurrencyRevision($shape->revision()));
@@ -647,7 +658,7 @@ class IsOrderedTest extends TestCase
         $this->assertNotNull($change->source);
         $this->assertSame($source, $change->source->relation->parent);
         $this->assertSame([$first->getKey(), $third->getKey()], $change->source->order);
-        $this->assertEquals([new PositionChange($this->key($moved), position: null, previousPosition: 2)], $change->source->changed);
+        $this->assertSame([['id' => $this->key($moved), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $change->source->changed));
         $this->assertGreaterThan(4, $change->source->revision);
         $this->assertSame($shape->storedRevision($source), $change->source->revision);
         $this->assertSame($change->source->revision, $source->concurrencyRevision($shape->revision()));
@@ -859,7 +870,7 @@ class IsOrderedTest extends TestCase
             $change = $moving->move(Placement::after($this->key($first)), expected: null);
 
             $this->assertSame([$first->getKey(), $moving->getKey(), $other->getKey()], $change->order);
-            $this->assertEquals([new PositionChange($this->key($moving), position: 2, previousPosition: 3)], $change->changed);
+            $this->assertSame([['id' => $this->key($moving), 'position' => 2, 'previousPosition' => 3]], array_map(get_object_vars(...), $change->changed));
 
             $length = strlen($this->rankKey($moving));
             $rebalanced = $length < $longest;
@@ -889,7 +900,7 @@ class IsOrderedTest extends TestCase
         $change = $moved->move(Placement::after($this->key($first))->in($destination), expected: null);
 
         $this->assertLessThan($longest, $shape->longestRankKey($destination));
-        $this->assertEquals([new PositionChange($this->key($moved), position: 2, previousPosition: null)], $change->changed);
+        $this->assertSame([['id' => $this->key($moved), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
         $this->assertOrder($shape, [$first->getKey(), $moved->getKey(), ...$inserted], $destination);
         $this->assertOrder($shape, [$staying->getKey()], $source);
     }

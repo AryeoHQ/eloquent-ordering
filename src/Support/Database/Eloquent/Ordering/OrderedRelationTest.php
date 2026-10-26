@@ -6,7 +6,10 @@ namespace Support\Database\Eloquent\Ordering;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -15,12 +18,17 @@ use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
+use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
+use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
+use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\TestCase;
@@ -137,10 +145,10 @@ class OrderedRelationTest extends TestCase
 
         $this->assertSame([$third->getKey(), $second->getKey(), $first->getKey(), $fourth->getKey()], $shape->members($parent));
         $this->assertSame([$third->getKey(), $second->getKey(), $first->getKey(), $fourth->getKey()], $change->order);
-        $this->assertEquals([
-            new PositionChange($this->key($third), position: 1, previousPosition: 3),
-            new PositionChange($this->key($first), position: 3, previousPosition: 1),
-        ], $change->changed);
+        $this->assertSame([
+            ['id' => $this->key($third), 'position' => 1, 'previousPosition' => 3],
+            ['id' => $this->key($first), 'position' => 3, 'previousPosition' => 1],
+        ], array_map(get_object_vars(...), $change->changed));
         $this->assertSame($relation, $change->relation);
         $this->assertNull($change->source);
         $this->assertGreaterThan(5, $change->revision);
@@ -284,10 +292,10 @@ class OrderedRelationTest extends TestCase
         $change = $relation->reorder([$alpha->id, $zebra->id], expected: null);
 
         $this->assertSame([$alpha->id, $zebra->id], $change->order);
-        $this->assertEquals([
-            new PositionChange($alpha->id, position: 1, previousPosition: 2),
-            new PositionChange($zebra->id, position: 2, previousPosition: 1),
-        ], $change->changed);
+        $this->assertSame([
+            ['id' => $alpha->id, 'position' => 1, 'previousPosition' => 2],
+            ['id' => $zebra->id, 'position' => 2, 'previousPosition' => 1],
+        ], array_map(get_object_vars(...), $change->changed));
         $this->assertSame([$alpha->id, $zebra->id], $relation->query()->pluck('assets.id')->all());
     }
 
@@ -362,6 +370,32 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([$second->getKey(), $first->getKey()], $change->order);
     }
 
+    #[Test]
+    public function it_reorders_a_uuid_pivot_that_declares_an_integer_key_type(): void
+    {
+        $shape = new BelongsToManyShape;
+        [$listing, [$first, $second]] = $shape->with(2);
+        $parent = $this->parentOfPivot($listing, $this->integerKeyedPivot());
+
+        $change = $parent->orderedRelation(ListingRevision::CustomersOrder)->reorder([(string) $this->key($second), (string) $this->key($first)], expected: null);
+
+        $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($listing));
+        $this->assertSame([$second->getKey(), $first->getKey()], $change->order);
+    }
+
+    #[Test]
+    public function it_reorders_by_upper_case_uuids_on_a_pivot_that_does_not_use_uuids(): void
+    {
+        $shape = new BelongsToManyShape;
+        [$listing, [$first, $second]] = $shape->with(2);
+        $parent = $this->parentOfPivot($listing, $this->stringKeyedPivot());
+
+        $change = $parent->orderedRelation(ListingRevision::CustomersOrder)->reorder([strtoupper((string) $this->key($second)), strtoupper((string) $this->key($first))], expected: null);
+
+        $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($listing));
+        $this->assertSame([$second->getKey(), $first->getKey()], $change->order);
+    }
+
     #[DataProvider('pivots')]
     #[Test]
     public function it_reorders_pivots_on_the_connection_of_their_parent(PivotShape $shape): void
@@ -378,6 +412,67 @@ class OrderedRelationTest extends TestCase
 
         $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($parent));
         $this->assertSame($shape->storedRevision($parent), $change->revision);
+    }
+
+    /**
+     * @return class-string<Pivot&Ordered>
+     */
+    private function integerKeyedPivot(): string
+    {
+        return (new class extends Pivot implements Ordered
+        {
+            use IsOrdered;
+            use SoftDeletes;
+
+            protected $table = 'listing_customer';
+        })::class;
+    }
+
+    /**
+     * @return class-string<Pivot&Ordered>
+     */
+    private function stringKeyedPivot(): string
+    {
+        return (new class extends Pivot implements Ordered
+        {
+            use IsOrdered;
+            use SoftDeletes;
+
+            protected $table = 'listing_customer';
+
+            protected $keyType = 'string';
+        })::class;
+    }
+
+    /**
+     * @param  class-string<Pivot&Ordered>  $pivot
+     */
+    private function parentOfPivot(Model $listing, string $pivot): Model&OrdersRelations&Revisioned
+    {
+        $declared = new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            /** @var class-string<Pivot> */
+            public static string $pivot;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this>
+             */
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id', 'customer_id')->using(self::$pivot)->wherePivotNull('deleted_at');
+            }
+        };
+        $declared::$pivot = $pivot;
+
+        $parent = $declared->newQuery()->findOrFail($listing->getKey());
+        assert($parent instanceof OrdersRelations && $parent instanceof Revisioned);
+
+        return $parent;
     }
 
     private function addAsset(Section $section, string $title): Asset
