@@ -17,6 +17,7 @@ use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
+use Support\Database\Eloquent\Ordering\PositionChange;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
@@ -150,8 +151,8 @@ class ReorderedTest extends TestCase
         $change = $this->dispatched[0]->change;
 
         $this->assertSame($parent, $change->relation->parent);
-        $this->assertSame([$member->getKey(), $first->getKey(), $second->getKey()], array_column($change->order, 'id'));
-        $this->assertSame([['id' => $member->getKey(), 'position' => 1, 'previous_position' => null]], $change->changed);
+        $this->assertSame([$member->getKey(), $first->getKey(), $second->getKey()], $change->order);
+        $this->assertEquals([new PositionChange($this->key($member), position: 1, previousPosition: null)], $change->changed);
         $this->assertSame($shape->storedRevision($parent), $change->revision);
         $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
@@ -176,8 +177,8 @@ class ReorderedTest extends TestCase
         $change = $this->dispatched[0]->change;
 
         $this->assertSame($parent, $change->relation->parent);
-        $this->assertSame($pivot->getKey(), array_column($change->order, 'id')[1]);
-        $this->assertSame([['id' => $pivot->getKey(), 'position' => 2, 'previous_position' => null]], $change->changed);
+        $this->assertSame($pivot->getKey(), $change->order[1]);
+        $this->assertEquals([new PositionChange($this->key($pivot), position: 2, previousPosition: null)], $change->changed);
         $this->assertSame($shape->storedRevision($parent), $change->revision);
         $this->assertSame([$this->baseline], $this->levels);
     }
@@ -244,8 +245,8 @@ class ReorderedTest extends TestCase
         $change = $this->dispatched[0]->change;
 
         $this->assertSame($parent, $change->relation->parent);
-        $this->assertSame([$first->getKey(), $third->getKey()], array_column($change->order, 'id'));
-        $this->assertSame([['id' => $second->getKey(), 'position' => null, 'previous_position' => 2]], $change->changed);
+        $this->assertSame([$first->getKey(), $third->getKey()], $change->order);
+        $this->assertEquals([new PositionChange($this->key($second), position: null, previousPosition: 2)], $change->changed);
         $this->assertSame($shape->storedRevision($parent), $change->revision);
         $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
@@ -265,8 +266,8 @@ class ReorderedTest extends TestCase
         $change = $this->dispatched[0]->change;
 
         $this->assertSame($parent, $change->relation->parent);
-        $this->assertSame([$first->getKey(), $third->getKey()], array_column($change->order, 'id'));
-        $this->assertSame([['id' => $second->getKey(), 'position' => null, 'previous_position' => 2]], $change->changed);
+        $this->assertSame([$first->getKey(), $third->getKey()], $change->order);
+        $this->assertEquals([new PositionChange($this->key($second), position: null, previousPosition: 2)], $change->changed);
         $this->assertSame($shape->storedRevision($parent), $change->revision);
         $this->assertSame([$this->baseline], $this->levels);
     }
@@ -288,8 +289,8 @@ class ReorderedTest extends TestCase
         $change = $this->dispatched[0]->change;
 
         $this->assertSame($parent, $change->relation->parent);
-        $this->assertSame([$firstPivot->getKey(), $thirdPivot->getKey()], array_column($change->order, 'id'));
-        $this->assertSame([['id' => $secondPivot->getKey(), 'position' => null, 'previous_position' => 2]], $change->changed);
+        $this->assertSame([$firstPivot->getKey(), $thirdPivot->getKey()], $change->order);
+        $this->assertEquals([new PositionChange($this->key($secondPivot), position: null, previousPosition: 2)], $change->changed);
         $this->assertSame($shape->storedRevision($parent), $change->revision);
         $this->assertSame([$this->baseline], $this->levels);
     }
@@ -467,6 +468,15 @@ class ReorderedTest extends TestCase
     {
         $this->dispatched = [];
         $this->levels = [];
+    }
+
+    private function key(Model $member): int|string
+    {
+        $key = $member->getKey();
+
+        $this->assertTrue(is_int($key) || is_string($key));
+
+        return $key;
     }
 
     private function rankKey(Model $member): string

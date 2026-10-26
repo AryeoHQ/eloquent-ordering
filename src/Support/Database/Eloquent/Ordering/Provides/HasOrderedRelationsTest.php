@@ -14,6 +14,7 @@ use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
+use ReflectionClass;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
@@ -34,7 +35,6 @@ use Tests\TestCase;
 
 #[CoversClass(OrdersRelation::class)]
 #[CoversTrait(HasOrderedRelations::class)]
-#[CoversTrait(ResolvesOrderedRelations::class)]
 class HasOrderedRelationsTest extends TestCase
 {
     #[Test]
@@ -84,7 +84,7 @@ class HasOrderedRelationsTest extends TestCase
         $section = Section::create();
         $video = $this->addVideo($section);
 
-        $item = $video->orderedRelation();
+        $item = $video->orderingRelation();
         $parent = $video->orderedRelation(VideoRevision::ClipsOrder);
 
         $this->assertSame($section, $item->parent);
@@ -115,19 +115,12 @@ class HasOrderedRelationsTest extends TestCase
     }
 
     #[Test]
-    public function it_rejects_the_item_side_of_a_model_that_is_not_ordered(): void
+    public function it_gives_each_role_only_its_own_relation_method(): void
     {
-        $this->expectException(LogicException::class);
-
-        Section::create()->orderedRelation();
-    }
-
-    #[Test]
-    public function it_rejects_the_parent_side_of_a_model_that_orders_nothing(): void
-    {
-        $this->expectException(LogicException::class);
-
-        (new Asset)->orderedRelation(SectionRevision::AssetsOrder);
+        $this->assertTrue((new ReflectionClass(Section::class))->hasMethod('orderedRelation'));
+        $this->assertFalse((new ReflectionClass(Section::class))->hasMethod('orderingRelation'));
+        $this->assertTrue((new ReflectionClass(Asset::class))->hasMethod('orderingRelation'));
+        $this->assertFalse((new ReflectionClass(Asset::class))->hasMethod('orderedRelation'));
     }
 
     #[Test]

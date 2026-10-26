@@ -7,8 +7,8 @@ namespace Support\Database\Eloquent\Ordering;
 final readonly class OrderChange
 {
     /**
-     * @param  list<array{id: int|string, position: int}>  $order
-     * @param  list<array{id: int|string, position: int|null, previous_position: int|null}>  $changed
+     * @param  list<int|string>  $order
+     * @param  list<PositionChange>  $changed
      */
     public function __construct(
         public OrderedRelation $relation,

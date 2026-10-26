@@ -24,7 +24,7 @@ use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
  */
 trait IsOrdered
 {
-    use ResolvesOrderedRelations;
+    private null|OrderedRelation $resolvedOrderedRelation = null;
 
     private null|Placement $placement = null;
 
@@ -48,7 +48,7 @@ trait IsOrdered
         });
 
         static::creating(static function (self $item): void {
-            $item->setAttribute(OrderedRelation::RANK_KEY, $item->orderedRelation()->keyAt($item->placement ?? Placement::last()));
+            $item->setAttribute(OrderedRelation::RANK_KEY, $item->orderingRelation()->keyAt($item->placement ?? Placement::last()));
         });
 
         static::created(static function (self $item): void {
@@ -161,6 +161,12 @@ trait IsOrdered
         });
     }
 
+    public function orderingRelation(): OrderedRelation
+    {
+        return $this->resolveOrderedRelation($this->getAttributes())
+            ?? throw new LogicException(sprintf('[%s:%s] has no parent that orders it.', static::class, $this->getKey()));
+    }
+
     /**
      * @return Attribute<null|int, never>
      */
@@ -169,6 +175,25 @@ trait IsOrdered
         return Attribute::make(get: fn (): null|int => $this->exists
             ? $this->resolveOrderedRelation($this->getAttributes())?->position($this)
             : null);
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     */
+    private function resolveOrderedRelation(array $attributes): null|OrderedRelation
+    {
+        $held = array_values(array_filter(
+            [...array_values($this->getRelations()), $this->resolvedOrderedRelation?->parent],
+            static fn (mixed $model): bool => $model instanceof Model,
+        ));
+
+        $relation = OrderedRelation::of($this, $attributes, $held);
+
+        if ($relation !== null) {
+            $this->resolvedOrderedRelation = $relation;
+        }
+
+        return $relation;
     }
 
     /**

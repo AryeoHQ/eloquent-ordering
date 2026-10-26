@@ -19,7 +19,7 @@ final class OrderedRelations
             NamedRevisionTrigger::on($table)
                 ->increments($parent, $revision)
                 ->through($foreignKey)
-                ->whenColumnsChange(...self::watchedColumns($table, $foreignKey))
+                ->whenColumnsChange(...self::watchedColumns($table))
                 ->whenRowsInsertedOrDeleted(),
         );
     }
@@ -30,7 +30,7 @@ final class OrderedRelations
             NamedRevisionTrigger::on($table)
                 ->increments($parent, $revision)
                 ->throughMorph($morphName, $morphType)
-                ->whenColumnsChange(...self::watchedColumns($table, $morphName.'_id', $morphName.'_type'))
+                ->whenColumnsChange(...self::watchedColumns($table))
                 ->whenRowsInsertedOrDeleted(),
         );
     }
@@ -43,8 +43,8 @@ final class OrderedRelations
     /**
      * @return list<string>
      */
-    private static function watchedColumns(string $table, string ...$relation): array
+    private static function watchedColumns(string $table): array
     {
-        return [OrderedRelation::RANK_KEY, ...$relation, ...Schema::hasColumn($table, self::DELETED_AT) ? [self::DELETED_AT] : []];
+        return [OrderedRelation::RANK_KEY, ...Schema::hasColumn($table, self::DELETED_AT) ? [self::DELETED_AT] : []];
     }
 }

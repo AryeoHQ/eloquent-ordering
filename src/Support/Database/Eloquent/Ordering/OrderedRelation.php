@@ -21,7 +21,6 @@ use LogicException;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionNamedType;
-use Support\Database\Eloquent\Concurrency\ConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
@@ -45,15 +44,7 @@ final class OrderedRelation
 
     private readonly string $relationName;
 
-    private readonly Model $item;
-
-    private readonly string $foreignKey;
-
-    private readonly string $ownerKey;
-
-    private readonly null|string $morphType;
-
-    private readonly null|string $morphClass;
+    private readonly RelationKeys $keys;
 
     public function __construct(
         public readonly Model&OrdersRelations&Revisioned $parent,
@@ -66,13 +57,7 @@ final class OrderedRelation
         ));
 
         $this->relationName = $declaration['declaration']->relation;
-        [
-            'item' => $this->item,
-            'foreignKey' => $this->foreignKey,
-            'ownerKey' => $this->ownerKey,
-            'morphType' => $this->morphType,
-            'morphClass' => $this->morphClass,
-        ] = self::describe($declaration['relation']);
+        $this->keys = self::describe($declaration['relation']);
     }
 
     /**
@@ -85,8 +70,7 @@ final class OrderedRelation
     {
         $memberships = array_values(array_filter(
             self::memberships($item),
-            static fn (array $membership): bool => ($attributes[$membership['foreignKey']] ?? null) !== null
-                && ($membership['morphType'] === null || ($attributes[$membership['morphType']] ?? null) === $membership['morphClass']),
+            static fn (array $membership): bool => $membership['keys']->names($attributes),
         ));
 
         if ($memberships === []) {
@@ -99,18 +83,18 @@ final class OrderedRelation
             $item->getKey(),
         ));
 
-        ['parent' => $parent, 'revision' => $revision, 'foreignKey' => $foreignKey, 'ownerKey' => $ownerKey] = $memberships[0];
-        $key = $attributes[$foreignKey];
+        ['parent' => $parent, 'revision' => $revision, 'keys' => $keys] = $memberships[0];
+        $key = $attributes[$keys->foreignKey];
 
         foreach ([...$held, ...$item instanceof Pivot ? [$item->pivotParent] : []] as $model) {
             $candidate = self::asParent($model);
 
-            if ($candidate !== null && $candidate::class === $parent::class && self::sameKey($candidate->getAttribute($ownerKey), $key)) {
+            if ($candidate !== null && $candidate::class === $parent::class && self::sameKey($candidate->getAttribute($keys->ownerKey), $key)) {
                 return new self($candidate, $revision);
             }
         }
 
-        $loaded = self::asParent($parent->newQueryWithoutScopes()->where($ownerKey, $key)->first()) ?? throw new LogicException(sprintf(
+        $loaded = self::asParent($parent->newQueryWithoutScopes()->where($keys->ownerKey, $key)->first()) ?? throw new LogicException(sprintf(
             '[%s:%s] names a [%s] that does not exist.',
             $item::class,
             $item->getKey(),
@@ -170,12 +154,9 @@ final class OrderedRelation
      */
     public static function membershipColumns(Model&Ordered $item): array
     {
-        $memberships = self::memberships($item);
-
-        return array_values(array_unique(array_filter([
-            ...array_column($memberships, 'foreignKey'),
-            ...array_column($memberships, 'morphType'),
-        ], is_string(...))));
+        return array_values(array_unique(array_merge(
+            ...array_map(static fn (array $membership): array => $membership['keys']->columns(), self::memberships($item)),
+        )));
     }
 
     /**
@@ -201,12 +182,12 @@ final class OrderedRelation
         $relation = $this->scopedRelation();
 
         if ($relation instanceof BelongsToMany) {
-            $relation->withPivot($this->item->getKeyName());
+            $relation->withPivot($this->keys->item->getKeyName());
         }
 
         return $relation
-            ->orderBy($this->item->qualifyColumn(self::RANK_KEY))
-            ->orderBy($this->item->getQualifiedKeyName());
+            ->orderBy($this->keys->item->qualifyColumn(self::RANK_KEY))
+            ->orderBy($this->keys->item->getQualifiedKeyName());
     }
 
     /**
@@ -218,14 +199,14 @@ final class OrderedRelation
             self::lockAll([$this]);
             $this->compareConcurrencyRevision($expected);
 
-            $members = array_keys($this->keys($this->members()));
+            $members = array_keys($this->rankKeys($this->members()));
             $order = $this->match($members, $ids);
 
             if ($order === $members) {
                 return $this->change([]);
             }
 
-            $keys = $this->keys($this->indexedRows());
+            $keys = $this->rankKeys($this->indexedRows());
             $sequence = $this->sequence(array_keys($keys), $members, $order);
 
             $this->rewrite($keys, array_combine($sequence, FractionalIndex::keysBetween(null, null, count($sequence))));
@@ -264,9 +245,8 @@ final class OrderedRelation
         }
 
         $this->write($item, [
-            ...array_fill_keys(array_filter([$source->foreignKey, $source->morphType], is_string(...)), null),
-            $this->foreignKey => $this->parent->getAttribute($this->ownerKey),
-            ...($this->morphType === null ? [] : [$this->morphType => $this->morphClass]),
+            ...$source->keys->detached(),
+            ...$this->keys->pointingAt($this->parent),
             self::RANK_KEY => $this->keyAt($placement),
         ]);
         $this->refreshWith($source);
@@ -315,14 +295,6 @@ final class OrderedRelation
     /**
      * @internal
      */
-    public function lock(): void
-    {
-        $this->fillParent($this->parentRow()->lock('for no key update')->value($this->column()));
-    }
-
-    /**
-     * @internal
-     */
     public function refreshConcurrencyRevision(): void
     {
         $this->fillParent($this->parentRow()->useWritePdo()->value($this->column()));
@@ -349,8 +321,8 @@ final class OrderedRelation
      */
     public function position(Model $item): null|int
     {
-        $rankKey = $this->item->qualifyColumn(self::RANK_KEY);
-        $key = $this->members()->where($this->item->getQualifiedKeyName(), $item->getKey())->value($rankKey);
+        $rankKey = $this->keys->item->qualifyColumn(self::RANK_KEY);
+        $key = $this->members()->where($this->keys->item->getQualifiedKeyName(), $item->getKey())->value($rankKey);
 
         if (! is_string($key)) {
             return null;
@@ -360,7 +332,7 @@ final class OrderedRelation
     }
 
     /**
-     * @return list<array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, foreignKey: string, ownerKey: string, morphType: null|string, morphClass: null|string}>
+     * @return list<array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}>
      */
     private static function memberships(Model&Ordered $item): array
     {
@@ -386,15 +358,10 @@ final class OrderedRelation
                 $item::class,
             ));
 
-            $description = self::describe($declaration['relation']);
-
             $memberships[] = [
                 'parent' => $parent,
                 'revision' => $declaration['declaration']->revision,
-                'foreignKey' => $description['foreignKey'],
-                'ownerKey' => $description['ownerKey'],
-                'morphType' => $description['morphType'],
-                'morphClass' => $description['morphClass'],
+                'keys' => self::describe($declaration['relation']),
             ];
         }
 
@@ -490,7 +457,7 @@ final class OrderedRelation
      */
     private static function requireIdKeys(Model $parent, string $name, HasMany|MorphMany|BelongsToMany $relation): void
     {
-        $item = self::describe($relation)['item'];
+        $item = self::describe($relation)->item;
 
         foreach ([
             'the primary key of the parent' => $parent->getKeyName(),
@@ -537,31 +504,25 @@ final class OrderedRelation
 
     /**
      * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
-     * @return array{item: Model, foreignKey: string, ownerKey: string, morphType: null|string, morphClass: null|string}
      */
-    private static function describe(HasMany|MorphMany|BelongsToMany $relation): array
+    private static function describe(HasMany|MorphMany|BelongsToMany $relation): RelationKeys
     {
         $morph = $relation instanceof MorphMany || $relation instanceof MorphToMany
-            ? ['morphType' => $relation->getMorphType(), 'morphClass' => $relation->getMorphClass()]
-            : ['morphType' => null, 'morphClass' => null];
+            ? [$relation->getMorphType(), $relation->getMorphClass()]
+            : [];
 
         if ($relation instanceof BelongsToMany) {
             $class = $relation->getPivotClass();
 
-            return [
-                'item' => (new $class)->setTable($relation->getTable())->setConnection($relation->getParent()->getConnectionName()),
-                'foreignKey' => $relation->getForeignPivotKeyName(),
-                'ownerKey' => $relation->getParentKeyName(),
+            return new RelationKeys(
+                (new $class)->setTable($relation->getTable())->setConnection($relation->getParent()->getConnectionName()),
+                $relation->getForeignPivotKeyName(),
+                $relation->getParentKeyName(),
                 ...$morph,
-            ];
+            );
         }
 
-        return [
-            'item' => $relation->getRelated(),
-            'foreignKey' => $relation->getForeignKeyName(),
-            'ownerKey' => $relation->getLocalKeyName(),
-            ...$morph,
-        ];
+        return new RelationKeys($relation->getRelated(), $relation->getForeignKeyName(), $relation->getLocalKeyName(), ...$morph);
     }
 
     private static function asParent(mixed $model): null|(Model&OrdersRelations&Revisioned)
@@ -596,10 +557,10 @@ final class OrderedRelation
      */
     private function bounds(Placement $placement, null|int|string $exclude, Closure $rows): array
     {
-        $rankKey = $this->item->qualifyColumn(self::RANK_KEY);
+        $rankKey = $this->keys->item->qualifyColumn(self::RANK_KEY);
         $others = fn (Builder $query): Builder => $query->when(
             $exclude !== null,
-            fn (Builder $query): Builder => $query->where($this->item->getQualifiedKeyName(), '!=', $exclude),
+            fn (Builder $query): Builder => $query->where($this->keys->item->getQualifiedKeyName(), '!=', $exclude),
         );
 
         if ($placement->first) {
@@ -623,8 +584,8 @@ final class OrderedRelation
 
     private function anchor(Builder $members, int|string $anchor): string
     {
-        $id = $this->anchorId($anchor);
-        $key = $id === null ? null : $members->where($this->item->getQualifiedKeyName(), $id)->value($this->item->qualifyColumn(self::RANK_KEY));
+        $id = $this->memberKey($anchor);
+        $key = $id === null ? null : $members->where($this->keys->item->getQualifiedKeyName(), $id)->value($this->keys->item->qualifyColumn(self::RANK_KEY));
 
         throw_unless(is_string($key), new InvalidAnchor($this, $anchor));
 
@@ -633,7 +594,7 @@ final class OrderedRelation
 
     private function holdsPlace(int|string $id, Placement $placement): bool
     {
-        $key = $this->rows([$id])->value($this->item->qualifyColumn(self::RANK_KEY));
+        $key = $this->rows([$id])->value($this->keys->item->qualifyColumn(self::RANK_KEY));
         [$lower, $upper] = $this->bounds($placement, $id, $this->members(...));
 
         return is_string($key)
@@ -643,7 +604,7 @@ final class OrderedRelation
 
     private function rebalance(): void
     {
-        $keys = $this->keys($this->indexedRows());
+        $keys = $this->rankKeys($this->indexedRows());
 
         $this->rewrite($keys, array_combine(array_keys($keys), FractionalIndex::keysBetween(null, null, count($keys))));
     }
@@ -677,15 +638,21 @@ final class OrderedRelation
         $byKey = [];
 
         foreach ($members as $member) {
-            $byKey[(string) $member] = $member;
+            $key = $this->memberKey($member);
+
+            if ($key !== null) {
+                $byKey[$key] = $member;
+            }
         }
 
         $order = [];
 
         foreach ($ids as $id) {
-            throw_unless(array_key_exists((string) $id, $byKey) && ! array_key_exists((string) $id, $order), new MembershipMismatch($this));
+            $key = $this->memberKey($id);
 
-            $order[(string) $id] = $byKey[(string) $id];
+            throw_unless($key !== null && array_key_exists($key, $byKey) && ! array_key_exists($key, $order), new MembershipMismatch($this));
+
+            $order[$key] = $byKey[$key];
         }
 
         throw_unless(count($order) === count($members), new MembershipMismatch($this));
@@ -735,18 +702,18 @@ final class OrderedRelation
      */
     private function change(array $moved, null|OrderChange $source = null): OrderChange
     {
-        $ids = array_keys($this->keys($this->members()));
+        $ids = array_keys($this->rankKeys($this->members()));
         $positions = array_flip($ids);
 
         return new OrderChange(
             relation: $this,
-            order: array_map(static fn (int|string $id, int $index): array => ['id' => $id, 'position' => $index + 1], $ids, array_keys($ids)),
+            order: $ids,
             changed: array_map(
-                static fn (int|string $id, null|int $previous): array => [
-                    'id' => $id,
-                    'position' => array_key_exists($id, $positions) ? $positions[$id] + 1 : null,
-                    'previous_position' => $previous,
-                ],
+                static fn (int|string $id, null|int $previous): PositionChange => new PositionChange(
+                    $id,
+                    array_key_exists($id, $positions) ? $positions[$id] + 1 : null,
+                    $previous,
+                ),
                 array_keys($moved),
                 array_values($moved),
             ),
@@ -760,15 +727,11 @@ final class OrderedRelation
      */
     private function write(Model $item, array $attributes): void
     {
-        $row = static fn (): Builder => $item->newQueryWithoutScopes()->whereKey($item->getKey())->toBase();
-
-        $row()->update($attributes);
+        $item->newQueryWithoutScopes()->whereKey($item->getKey())->toBase()->update($attributes);
         $item->forceFill($attributes)->syncOriginalAttributes(array_keys($attributes));
 
         if ($item instanceof Revisioned) {
-            $revisions = (array) $row()->useWritePdo()->first(array_values($item->concurrencyRevisionColumns()));
-
-            $item->forceFill($revisions)->syncOriginalAttributes(array_keys($revisions));
+            $item->refreshConcurrencyRevisions();
         }
     }
 
@@ -784,26 +747,26 @@ final class OrderedRelation
     /**
      * @return array<int|string, string>
      */
-    private function keys(Builder $rows): array
+    private function rankKeys(Builder $rows): array
     {
-        $rankKey = $this->item->qualifyColumn(self::RANK_KEY);
-        $key = $this->item->getQualifiedKeyName();
+        $rankKey = $this->keys->item->qualifyColumn(self::RANK_KEY);
+        $key = $this->keys->item->getQualifiedKeyName();
 
         /** @var array<int|string, string> */
         return $rows->whereNotNull($rankKey)->orderBy($rankKey)->orderBy($key)->pluck($rankKey, $key)->all();
     }
 
-    private function anchorId(int|string $anchor): null|int|string
+    private function memberKey(int|string $id): null|string
     {
-        if (in_array($this->item->getKeyType(), ['int', 'integer'], true)) {
-            return is_int($anchor) || (string) (int) $anchor === $anchor ? (int) $anchor : null;
+        if (in_array($this->keys->item->getKeyType(), ['int', 'integer'], true)) {
+            return is_int($id) || (string) (int) $id === $id ? (string) (int) $id : null;
         }
 
-        if (in_array(HasUuids::class, class_uses_recursive($this->item), true)) {
-            return Str::isUuid((string) $anchor) ? (string) $anchor : null;
+        if (in_array(HasUuids::class, class_uses_recursive($this->keys->item), true)) {
+            return Str::isUuid((string) $id) ? strtolower((string) $id) : null;
         }
 
-        return (string) $anchor;
+        return (string) $id;
     }
 
     /**
@@ -825,15 +788,14 @@ final class OrderedRelation
 
     private function indexedRows(): Builder
     {
-        $rows = $this->item->newQueryWithoutScopes()->toBase()
-            ->where($this->item->qualifyColumn($this->foreignKey), $this->parent->getAttribute($this->ownerKey));
+        $rows = $this->keys->item->newQueryWithoutScopes()->toBase();
 
-        if ($this->morphType !== null) {
-            $rows->where($this->item->qualifyColumn($this->morphType), $this->morphClass);
+        foreach ($this->keys->pointingAt($this->parent) as $column => $value) {
+            $rows->where($this->keys->item->qualifyColumn($column), $value);
         }
 
-        if (in_array(SoftDeletes::class, class_uses_recursive($this->item), true)) {
-            $rows->whereNull($this->item->qualifyColumn(OrderedRelations::DELETED_AT));
+        if (in_array(SoftDeletes::class, class_uses_recursive($this->keys->item), true)) {
+            $rows->whereNull($this->keys->item->qualifyColumn(OrderedRelations::DELETED_AT));
         }
 
         return $rows;
@@ -844,7 +806,7 @@ final class OrderedRelation
      */
     private function rows(array $ids): Builder
     {
-        return $this->members()->whereIn($this->item->getQualifiedKeyName(), $ids);
+        return $this->members()->whereIn($this->keys->item->getQualifiedKeyName(), $ids);
     }
 
     /**
@@ -852,7 +814,12 @@ final class OrderedRelation
      */
     private function itemRows(array $ids): Builder
     {
-        return $this->item->newQueryWithoutScopes()->whereKey($ids)->toBase();
+        return $this->keys->item->newQueryWithoutScopes()->whereKey($ids)->toBase();
+    }
+
+    private function lock(): void
+    {
+        $this->fillParent($this->parentRow()->lock('for no key update')->value($this->column()));
     }
 
     private function parentRow(): Builder
@@ -862,7 +829,7 @@ final class OrderedRelation
 
     private function column(): string
     {
-        return ConcurrencyRevision::namedColumn((string) $this->revision->value);
+        return $this->parent->concurrencyRevisionColumn($this->revision);
     }
 
     private function fillParent(mixed $revision): void

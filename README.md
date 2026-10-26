@@ -117,14 +117,14 @@ class Asset extends Model implements Ordered
 
 `IsOrdered` hides `rank_key` from serialization and adds a read-only `position` attribute (1-based, `null` until the item has a place). A model must never write `rank_key` itself. The traits do that.
 
-`orderedRelation()` resolves the relation from either side:
+The parent resolves a relation with `orderedRelation()`, and the item with `orderingRelation()`:
 
 ```php
 $section->orderedRelation(SectionRevision::AssetsOrder);   // OrderedRelation of this parent
-$asset->orderedRelation();                                 // the OrderedRelation the asset sits in
+$asset->orderingRelation();                                // the OrderedRelation the asset sits in
 ```
 
-On a parent it throws `LogicException` when the model orders no relation. On an item it throws `LogicException` when the model is not `Ordered`, or has no parent.
+`orderedRelation()` throws `LogicException` when the parent declares no ordered relation for the revision. `orderingRelation()` throws `LogicException` when the item has no parent.
 
 If your project uses Rector with `AddInterfaceByTrait`, map `HasOrderedRelations` to `OrdersRelations` and `IsOrdered` to `Ordered`.
 
@@ -177,7 +177,7 @@ class Listing extends Model implements OrdersRelations, Revisioned
 
 **An item can order in several parents.** A `Scene` carries `#[OrderedIn(Tour::class)]` and `#[OrderedIn(Listing::class)]`. Each row resolves to the one parent whose foreign key, and morph type, it names.
 
-**One model can be both item and parent.** A `Video` sits in a `Section` and orders its own `Clip` items. It uses both traits and declares both attributes. `orderedRelation()` with no argument returns the section side. `orderedRelation(VideoRevision::ClipsOrder)` returns the clip side.
+**One model can be both item and parent.** A `Video` sits in a `Section` and orders its own `Clip` items. It uses both traits and declares both attributes. `orderingRelation()` returns the section side. `orderedRelation(VideoRevision::ClipsOrder)` returns the clip side.
 
 ```php
 #[OrderedIn(Section::class)]
@@ -250,12 +250,12 @@ Both outcomes leave the data unchanged. A move that keeps the order writes nothi
 | Property | Meaning |
 |---|---|
 | `relation` | The `OrderedRelation` that changed. |
-| `order` | Every member after the write: a list of `['id' => …, 'position' => …]`. |
-| `changed` | The members that moved: `id`, `position`, and `previous_position` (`null` for a new member). |
+| `order` | The id of every member after the write, in order. A member's position is its index plus 1. |
+| `changed` | A `PositionChange` for each member that moved: `id`, `position` (`null` when it left this order), and `previousPosition` (`null` when it is new to this order). |
 | `revision` | The stored order revision after the write. |
 | `source` | For a move between parents, the `OrderChange` of the parent the item left. Otherwise `null`. |
 
-After a move between parents, `$asset->orderedRelation()` returns the destination.
+After a move between parents, `$asset->orderingRelation()` returns the destination.
 
 ## Reordering a parent
 
@@ -266,7 +266,7 @@ $section->orderedRelation(SectionRevision::AssetsOrder)
     ->reorder([$thirdId, $firstId, $secondId], expected: 4);
 ```
 
-`expected` is the order revision of this parent. `null` skips the check. A list that omits a member, repeats one, or names a stranger throws `MembershipMismatch` (`InvalidArgumentException`). A trashed member, a member with no rank key, and a row the relation excludes are not current members. `reorder()` keeps an excluded row directly after the member that precedes it now. It rewrites only the keys that change, and returns an `OrderChange`.
+`expected` is the order revision of this parent. `null` skips the check. A list that omits a member, repeats one, or names a stranger throws `MembershipMismatch` (`InvalidArgumentException`). `reorder()` and an anchor match a UUID id in either letter case, and `OrderChange` reports each id as the database stores it. A trashed member, a member with no rank key, and a row the relation excludes are not current members. `reorder()` keeps an excluded row directly after the member that precedes it now. It rewrites only the keys that change, and returns an `OrderChange`.
 
 ## The order revision in memory
 

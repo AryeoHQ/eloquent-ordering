@@ -8,7 +8,9 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use PHPUnit\Framework\Attributes\CoversClass;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Concurrency\Schema\ConcurrencyRevisions;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingRevision;
@@ -22,6 +24,43 @@ use Tests\TestCase;
 #[CoversClass(Macros::class)]
 class OrderedRelationsTest extends TestCase
 {
+    /**
+     * @return iterable<string, array{string, list<string>}>
+     */
+    public static function watchedColumns(): iterable
+    {
+        yield 'a foreign key with soft deletes' => ['assets', ['deleted_at', 'rank_key', 'section_id']];
+        yield 'a foreign key without soft deletes' => ['clips', ['rank_key', 'video_id']];
+        yield 'a pivot' => ['listing_customer', ['deleted_at', 'listing_id', 'rank_key']];
+        yield 'a morph of two parent types' => ['scenes', ['deleted_at', 'rank_key', 'sceneable_id', 'sceneable_type']];
+        yield 'a morph pivot' => ['customerables', ['customerable_id', 'customerable_type', 'deleted_at', 'rank_key']];
+    }
+
+    /**
+     * @param  list<string>  $columns
+     */
+    #[DataProvider('watchedColumns')]
+    #[Test]
+    public function it_compiles_triggers_that_watch_the_rank_key_the_relation_and_the_soft_delete(string $table, array $columns): void
+    {
+        $sets = array_map(function (mixed $trigger): array {
+            $this->assertIsObject($trigger);
+            $this->assertIsString($trigger->arguments);
+
+            $watched = json_decode(explode('\000', $trigger->arguments)[3] ?? '', true, flags: JSON_THROW_ON_ERROR);
+            $this->assertIsArray($watched);
+            sort($watched);
+
+            return $watched;
+        }, DB::select(
+            "select encode(t.tgargs, 'escape') as arguments from pg_trigger t join pg_proc p on p.oid = t.tgfoid where t.tgrelid = to_regclass(?) and p.proname = ?",
+            [$table, ConcurrencyRevisions::NAMED_FUNCTION],
+        ));
+
+        $this->assertNotSame([], $sets);
+        $this->assertSame([$columns], array_values(array_unique($sets, SORT_REGULAR)));
+    }
+
     #[Test]
     public function it_adds_a_nullable_byte_collated_rank_key(): void
     {

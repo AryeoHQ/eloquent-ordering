@@ -9,5 +9,5 @@ use Support\Database\Eloquent\Ordering\OrderedRelation;
 
 interface OrdersRelations
 {
-    public function orderedRelation(null|NamesConcurrencyRevision $revision = null): OrderedRelation;
+    public function orderedRelation(NamesConcurrencyRevision $revision): OrderedRelation;
 }

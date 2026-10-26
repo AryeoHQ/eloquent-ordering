@@ -56,6 +56,7 @@ class OrderedRelationTest extends TestCase
             'a member is missing' => [fn (array $ids, int|string $foreign): array => [$ids[2], $ids[1]]],
             'an id repeats' => [fn (array $ids, int|string $foreign): array => [$ids[2], $ids[1], $ids[0], $ids[0]]],
             'an id repeats as a string' => [fn (array $ids, int|string $foreign): array => [$ids[2], $ids[1], $ids[0], (string) $ids[0]]],
+            'an id repeats in upper case' => [fn (array $ids, int|string $foreign): array => [$ids[2], $ids[1], $ids[0], strtoupper((string) $ids[0])]],
             'an id is foreign' => [fn (array $ids, int|string $foreign): array => [$ids[2], $ids[1], $ids[0], $foreign]],
             'a foreign id replaces a member' => [fn (array $ids, int|string $foreign): array => [$ids[2], $ids[1], $foreign]],
         ]);
@@ -135,15 +136,10 @@ class OrderedRelationTest extends TestCase
         $change = $relation->reorder([(string) $this->key($third), (string) $this->key($second), (string) $this->key($first), (string) $this->key($fourth)], expected: 5);
 
         $this->assertSame([$third->getKey(), $second->getKey(), $first->getKey(), $fourth->getKey()], $shape->members($parent));
-        $this->assertSame([
-            ['id' => $third->getKey(), 'position' => 1],
-            ['id' => $second->getKey(), 'position' => 2],
-            ['id' => $first->getKey(), 'position' => 3],
-            ['id' => $fourth->getKey(), 'position' => 4],
-        ], $change->order);
-        $this->assertSame([
-            ['id' => $third->getKey(), 'position' => 1, 'previous_position' => 3],
-            ['id' => $first->getKey(), 'position' => 3, 'previous_position' => 1],
+        $this->assertSame([$third->getKey(), $second->getKey(), $first->getKey(), $fourth->getKey()], $change->order);
+        $this->assertEquals([
+            new PositionChange($this->key($third), position: 1, previousPosition: 3),
+            new PositionChange($this->key($first), position: 3, previousPosition: 1),
         ], $change->changed);
         $this->assertSame($relation, $change->relation);
         $this->assertNull($change->source);
@@ -249,7 +245,7 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([], $this->writes());
         $this->assertSame([], $change->changed);
         $this->assertSame($revision, $change->revision);
-        $this->assertSame(array_map(fn (int|string $id, int $index): array => ['id' => $id, 'position' => $index + 1], $ids, array_keys($ids)), $change->order);
+        $this->assertSame($ids, $change->order);
         $this->assertSame($revision, $shape->storedRevision($parent));
         $this->assertSame($keys, $shape->rankKeys($parent));
     }
@@ -283,14 +279,14 @@ class OrderedRelationTest extends TestCase
         $unchanged = $relation->reorder([$zebra->id, $alpha->id], expected: null);
 
         $this->assertSame([], $unchanged->changed);
-        $this->assertSame([['id' => $zebra->id, 'position' => 1], ['id' => $alpha->id, 'position' => 2]], $unchanged->order);
+        $this->assertSame([$zebra->id, $alpha->id], $unchanged->order);
 
         $change = $relation->reorder([$alpha->id, $zebra->id], expected: null);
 
-        $this->assertSame([['id' => $alpha->id, 'position' => 1], ['id' => $zebra->id, 'position' => 2]], $change->order);
-        $this->assertSame([
-            ['id' => $alpha->id, 'position' => 1, 'previous_position' => 2],
-            ['id' => $zebra->id, 'position' => 2, 'previous_position' => 1],
+        $this->assertSame([$alpha->id, $zebra->id], $change->order);
+        $this->assertEquals([
+            new PositionChange($alpha->id, position: 1, previousPosition: 2),
+            new PositionChange($zebra->id, position: 2, previousPosition: 1),
         ], $change->changed);
         $this->assertSame([$alpha->id, $zebra->id], $relation->query()->pluck('assets.id')->all());
     }
@@ -321,7 +317,7 @@ class OrderedRelationTest extends TestCase
 
         $change = $parent->orderedRelation(SectionRevision::AssetsOrder)->reorder([$last->id, $first->id], expected: null);
 
-        $this->assertSame([['id' => $last->id, 'position' => 1], ['id' => $first->id, 'position' => 2]], $change->order);
+        $this->assertSame([$last->id, $first->id], $change->order);
         $this->assertSame([$last->id, $first->id, $excluded->id], DB::table('assets')->where('section_id', $section->id)->orderBy('rank_key')->pluck('id')->all());
     }
 
@@ -351,7 +347,19 @@ class OrderedRelationTest extends TestCase
 
         $change = $parent->orderedRelation(SectionRevision::AssetsOrder)->reorder([$trashed->id, $first->id], expected: null);
 
-        $this->assertSame([['id' => $trashed->id, 'position' => 1], ['id' => $first->id, 'position' => 2]], $change->order);
+        $this->assertSame([$trashed->id, $first->id], $change->order);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_reorders_by_upper_case_uuids(PivotShape $shape): void
+    {
+        [$parent, [$first, $second]] = $shape->with(2);
+
+        $change = $shape->orderedRelation($parent)->reorder([strtoupper((string) $this->key($second)), strtoupper((string) $this->key($first))], expected: 3);
+
+        $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($parent));
+        $this->assertSame([$second->getKey(), $first->getKey()], $change->order);
     }
 
     #[DataProvider('pivots')]
