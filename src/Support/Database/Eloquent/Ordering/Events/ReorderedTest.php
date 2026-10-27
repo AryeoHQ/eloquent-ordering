@@ -107,6 +107,37 @@ class ReorderedTest extends TestCase
                 },
                 1,
             ],
+            'a restore' => [
+                function (Shape $shape): Closure {
+                    [, $members] = $shape->with(3);
+                    $members[1]->delete();
+                    assert(method_exists($members[1], 'restore'));
+
+                    return fn (): mixed => $members[1]->restore();
+                },
+                1,
+            ],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function restores(): iterable
+    {
+        return Shape::crossed([
+            'after a model soft delete' => [function (Shape $shape, Model $member): Model {
+                $member->delete();
+
+                return $member;
+            }],
+            'after a bulk soft delete' => [function (Shape $shape, Model $member): Model {
+                $key = $member->getKey();
+                assert(is_int($key) || is_string($key));
+                $shape->memberClass()::query()->whereKey($key)->delete();
+
+                return $shape->find($key);
+            }],
         ]);
     }
 
@@ -268,6 +299,32 @@ class ReorderedTest extends TestCase
         $this->assertSame([$first->getKey(), $third->getKey()], $change->order);
         $this->assertSame([['id' => $this->key($second), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $change->changed));
         $this->assertSame($shape->storedRevision($parent), $change->revision);
+        $this->assertSame([$this->baseline], $this->levels);
+    }
+
+    /**
+     * @param  Closure(Shape, Model&Ordered): (Model&Ordered)  $delete
+     */
+    #[DataProvider('restores')]
+    #[Test]
+    public function it_dispatches_one_event_for_a_restore(Shape $shape, Closure $delete): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $restored = $delete($shape, $first);
+        assert(method_exists($restored, 'restore'));
+        $this->forget();
+
+        $restored->restore();
+
+        $this->assertCount(1, $this->dispatched);
+
+        $change = $this->dispatched[0]->change;
+
+        $this->assertTrue($parent->is($change->relation->parent));
+        $this->assertSame([$second->getKey(), $third->getKey(), $first->getKey()], $change->order);
+        $this->assertSame([['id' => $this->key($first), 'position' => 3, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
+        $this->assertSame($shape->storedRevision($parent), $change->revision);
+        $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
     }
 

@@ -267,24 +267,65 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_restores_a_member_soft_deleted_in_bulk_without_a_rank_key(Shape $shape): void
+    public function it_places_a_member_restored_after_a_soft_delete_last(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $first->delete();
+        $deleted = $shape->storedRevision($parent);
+        assert(method_exists($first, 'restore'));
+
+        $this->assertTrue($first->restore());
+
+        $this->assertSame(3, $first->getAttribute('position'));
+        $this->assertSame($this->storedRankKey($shape, $first), $this->rankKey($first));
+        $this->assertFalse($first->isDirty());
+        $this->assertOrder($shape, [$second->getKey(), $third->getKey(), $first->getKey()], $parent);
+        $this->assertGreaterThan($deleted, $shape->storedRevision($parent));
+        $this->assertSame($shape->storedRevision($parent), $parent->concurrencyRevision($shape->revision()));
+        $this->assertFalse($parent->isDirty());
+        $this->assertSame($parent, $first->orderingRelation()->parent);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_places_a_member_restored_after_a_bulk_soft_delete_last(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $kept = $this->storedRankKey($shape, $first);
+
+        $shape->memberClass()::query()->whereKey($first->getKey())->delete();
+        $restored = $shape->find($this->key($first));
+        assert(method_exists($restored, 'restore'));
+
+        $this->assertSame($kept, $this->rankKey($restored));
+        $this->assertTrue($restored->restore());
+
+        $this->assertNull(DB::table($shape->memberTable())->where('id', $first->getKey())->value('deleted_at'));
+        $this->assertNotSame($kept, $this->storedRankKey($shape, $restored));
+        $this->assertSame($this->storedRankKey($shape, $restored), $this->rankKey($restored));
+        $this->assertSame(3, $restored->getAttribute('position'));
+        $this->assertFalse($restored->isDirty());
+        $this->assertOrder($shape, [$second->getKey(), $third->getKey(), $first->getKey()], $parent);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_places_a_restored_member_last_while_another_member_holds_its_old_key(Shape $shape): void
     {
         [$parent, [$first, $deleted]] = $shape->with(2);
+        $kept = $this->storedRankKey($shape, $deleted);
 
         $shape->memberClass()::query()->whereKey($deleted->getKey())->delete();
         $created = $shape->add($parent);
         $restored = $shape->find($this->key($deleted));
         assert(method_exists($restored, 'restore'));
 
+        $this->assertSame($kept, $this->storedRankKey($shape, $created));
         $this->assertTrue($restored->restore());
 
-        $this->assertNull(DB::table($shape->memberTable())->where('id', $deleted->getKey())->value('deleted_at'));
-        $this->assertNull(DB::table($shape->memberTable())->where('id', $deleted->getKey())->value('rank_key'));
-        $this->assertNull($restored->getAttribute('rank_key'));
-        $this->assertNull($restored->getAttribute('position'));
-        $this->assertFalse($restored->isDirty());
-        $this->assertSame(1, $shape->find($this->key($first))->getAttribute('position'));
-        $this->assertSame(2, $shape->find($this->key($created))->getAttribute('position'));
+        $this->assertNotSame($kept, $this->storedRankKey($shape, $restored));
+        $this->assertSame(3, $restored->getAttribute('position'));
+        $this->assertOrder($shape, [$first->getKey(), $created->getKey(), $deleted->getKey()], $parent);
     }
 
     #[DataProvider('shapes')]

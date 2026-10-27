@@ -30,20 +30,26 @@ trait IsOrdered
 
     private null|int $vacatedPosition = null;
 
+    private null|OrderedRelation $restoredInto = null;
+
     /** @var list<OrderedRelation> */
     private array $lockedOrderedRelations = [];
 
     public static function bootIsOrdered(): void
     {
         static::saving(static function (self $item): void {
+            $item->restoredInto = null;
+
             if (! $item->exists) {
                 $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
             } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
-                if ($item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
-                    $item->setAttribute(OrderedRelation::RANK_KEY, null);
-                }
+                $next = $item->resolveOrderedRelation($item->getAttributes());
+                [, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations($next);
 
-                [, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations($item->resolveOrderedRelation($item->getAttributes()));
+                if ($item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
+                    $item->setAttribute(OrderedRelation::RANK_KEY, $next?->keyAt(Placement::last()));
+                    $item->restoredInto = $next;
+                }
             }
         });
 
@@ -70,7 +76,11 @@ trait IsOrdered
         });
 
         static::saved(static function (self $item): void {
+            $restored = $item->restoredInto;
+            $item->restoredInto = null;
+
             $item->refreshLockedOrderedRelations();
+            $restored?->placed($item);
         });
 
         static::deleted(static function (self $item): void {

@@ -312,12 +312,15 @@ Event::listen(Reordered::class, function (Reordered $event): void {
 | `reorder()` | One. |
 | A create, including a pivot `attach()` | One. |
 | A delete, soft or force, including a pivot `detach()` | One. |
+| `restore()` | One. The item enters last. |
 | A move or reorder that keeps the order | None. |
 | A stale move, a halted write, or a rollback | None. |
 
 ## A bulk write bypasses Eloquent, and the trigger still counts
 
-The database increments the order revision, so a write that skips the model still moves it.
+Write ordered rows through their models. A write through the query builder or raw SQL is unsupported. Such a write assigns no rank key, dispatches no `Reordered` event, and refreshes no instance held in memory.
+
+The database still increments the order revision for such a write, so a stale `If-Match` cannot pass. The trigger exists for that reason.
 
 ```php
 Asset::query()->whereKey($id)->update(['title' => 'Dusk']);       // title is not watched: no increment
@@ -325,13 +328,14 @@ DB::table('assets')->where('id', $id)->update(['rank_key' => 'a1']);   // +1
 Asset::query()->whereKey($id)->delete();                          // soft delete through a query: +1
 ```
 
-A bulk write fires no `Reordered` event, assigns no rank key, and does not refresh a parent instance held in memory. Reload it to read the new revision.
+The rule covers application code. The query-builder writes inside `move()`, `reorder()`, and a rebalance are part of the package.
 
 ## Limits
 
 - **A model soft delete adds 2 to the order revision.** The delete is one statement, and the `trashed` listener nulls `rank_key` in a second. Tests assert the stored value, never a step size.
 - **Revision steps follow the statement count.** A move adds 1 to each affected parent. A reorder that changes `k` keys adds `k + 1`.
-- **`restore()` leaves the item without a position.** It sets `rank_key` to `null`, also after a bulk soft delete that kept the key. The item is not a current member, `reorder()` leaves it out, and `restore()` dispatches no event.
+- **`restore()` places the item last.** It assigns a new rank key under the parent lock, as a create does, and dispatches one `Reordered`. It discards a key that a bulk soft delete kept, because another member can hold that key now.
+- **An unsupported bulk write leaves stale keys.** A soft delete through a query keeps its rank key. A restore through a query keeps that stale key, and fails with `23505` when a live member holds it.
 - **`reorder()` and a rebalance refresh no item instance in memory.** An instance keeps the `rank_key` it was read with, and a `Revisioned` item keeps its own revision. Reload the item.
 - **A foreign-key change saved through Eloquent keeps the old rank key.** It can collide in the new parent, and it dispatches nothing. Use `move()`.
 - **`attach([a, b])` and `detach([a, b])` dispatch one `Reordered` per pivot.** Each pivot row is one order write, and no batch API exists.
