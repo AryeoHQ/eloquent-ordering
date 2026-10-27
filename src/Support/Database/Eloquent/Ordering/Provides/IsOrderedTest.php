@@ -330,6 +330,50 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
+    public function it_keeps_the_order_for_a_stale_restore_of_a_member_already_restored(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $first->delete();
+        $stale = $shape->find($this->key($first));
+        $restored = $shape->find($this->key($first));
+        assert(method_exists($stale, 'restore') && method_exists($restored, 'restore'));
+        $restored->restore();
+        $second->move(Placement::last(), null);
+        $kept = $this->storedRankKey($shape, $first);
+        $revision = $shape->storedRevision($parent);
+
+        $this->assertTrue($stale->restore());
+
+        $this->assertSame($kept, $this->storedRankKey($shape, $first));
+        $this->assertSame($kept, $this->rankKey($stale));
+        $this->assertSame(2, $stale->getAttribute('position'));
+        $this->assertFalse($stale->isDirty());
+        $this->assertOrder($shape, [$third->getKey(), $first->getKey(), $second->getKey()], $parent);
+        $this->assertSame($revision, $shape->storedRevision($parent));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_assigns_no_key_for_a_stale_restore_of_a_force_deleted_member(Shape $shape): void
+    {
+        [$parent, [$first, $second]] = $shape->with(2);
+        $first->delete();
+        $stale = $shape->find($this->key($first));
+        $shape->find($this->key($first))->forceDelete();
+        assert(method_exists($stale, 'restore'));
+        $revision = $shape->storedRevision($parent);
+
+        $this->assertTrue($stale->restore());
+
+        $this->assertNull($stale->getAttribute('rank_key'));
+        $this->assertNull($stale->getAttribute('position'));
+        $this->assertFalse(DB::table($shape->memberTable())->where('id', $first->getKey())->exists());
+        $this->assertOrder($shape, [$second->getKey()], $parent);
+        $this->assertSame($revision, $shape->storedRevision($parent));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
     public function it_increments_the_order_revision_for_a_create_and_a_delete_only(Shape $shape): void
     {
         $parent = $shape->createParent();

@@ -47,8 +47,14 @@ trait IsOrdered
                 [, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations($next);
 
                 if ($item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
-                    $item->setAttribute(OrderedRelation::RANK_KEY, $next?->keyAt(Placement::last()));
-                    $item->restoredInto = $next;
+                    $stored = $item->storedOrderedAttributes([OrderedRelation::RANK_KEY, OrderedRelations::DELETED_AT]);
+
+                    if ($stored !== null && $stored[OrderedRelations::DELETED_AT] !== null) {
+                        $item->setAttribute(OrderedRelation::RANK_KEY, $next?->keyAt(Placement::last()));
+                        $item->restoredInto = $next;
+                    } elseif ($stored !== null) {
+                        $item->setAttribute(OrderedRelation::RANK_KEY, $stored[OrderedRelation::RANK_KEY]);
+                    }
                 }
             }
         });
@@ -211,7 +217,7 @@ trait IsOrdered
      */
     private function lockCurrentOrderedRelations(null|OrderedRelation $next = null): array
     {
-        $stored = $this->storedOrderedAttributes();
+        $stored = $this->storedOrderedAttributes(OrderedRelation::membershipColumns($this));
         $current = $stored === null ? null : $this->resolveOrderedRelation($stored);
         $moved = new RuntimeException;
 
@@ -219,7 +225,7 @@ trait IsOrdered
             return $this->getConnection()->transaction(function () use ($stored, $current, $next, $moved): array {
                 $locked = OrderedRelation::lockAll([$current, $next]);
 
-                throw_unless($this->storedOrderedAttributes() === $stored, $moved);
+                throw_unless($this->storedOrderedAttributes(OrderedRelation::membershipColumns($this)) === $stored, $moved);
 
                 return [$current, $locked];
             });
@@ -231,11 +237,12 @@ trait IsOrdered
     }
 
     /**
+     * @param  list<string>  $columns
      * @return null|array<string, mixed>
      */
-    private function storedOrderedAttributes(): null|array
+    private function storedOrderedAttributes(array $columns): null|array
     {
-        $stored = $this->newQueryWithoutScopes()->whereKey($this->getKey())->toBase()->useWritePdo()->first(OrderedRelation::membershipColumns($this));
+        $stored = $this->newQueryWithoutScopes()->whereKey($this->getKey())->toBase()->useWritePdo()->first($columns);
 
         return $stored === null ? null : (array) $stored;
     }

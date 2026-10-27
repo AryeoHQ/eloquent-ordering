@@ -328,6 +328,40 @@ class ReorderedTest extends TestCase
         $this->assertSame([$this->baseline], $this->levels);
     }
 
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_dispatches_no_event_for_a_stale_restore_of_a_member_already_restored(Shape $shape): void
+    {
+        [, [$first, $second]] = $shape->with(3);
+        $first->delete();
+        $stale = $shape->find($this->key($first));
+        $restored = $shape->find($this->key($first));
+        assert(method_exists($stale, 'restore') && method_exists($restored, 'restore'));
+        $restored->restore();
+        $second->move(Placement::last(), null);
+        $this->forget();
+
+        $stale->restore();
+
+        $this->assertSame([], $this->dispatched);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_dispatches_no_event_for_a_stale_restore_of_a_force_deleted_member(Shape $shape): void
+    {
+        [, [$first]] = $shape->with(2);
+        $first->delete();
+        $stale = $shape->find($this->key($first));
+        $shape->find($this->key($first))->forceDelete();
+        assert(method_exists($stale, 'restore'));
+        $this->forget();
+
+        $stale->restore();
+
+        $this->assertSame([], $this->dispatched);
+    }
+
     #[DataProvider('pivots')]
     #[Test]
     public function it_dispatches_one_event_for_a_detach(PivotShape $shape): void
