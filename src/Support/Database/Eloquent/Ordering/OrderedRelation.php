@@ -189,6 +189,14 @@ final class OrderedRelation
         return [self::RANK_KEY, ...self::membershipColumns($item), OrderedRelations::DELETED_AT];
     }
 
+    /**
+     * @internal
+     */
+    public static function usesTimestamps(Model&Ordered $item): bool
+    {
+        return self::timestamps($item, self::membershipNamedBy($item, $item->getAttributes())['keys']->item ?? $item);
+    }
+
     public function concurrencyRevision(): int
     {
         return intval($this->parentRow()->useWritePdo()->value($this->column()));
@@ -201,7 +209,8 @@ final class OrderedRelation
      */
     public static function loadPositions(array $items): void
     {
-        $groups = [];
+        $named = [];
+        $parents = [];
 
         foreach ($items as $item) {
             throw_unless($item instanceof Ordered, LogicException::class, sprintf('[%s] is not ordered, so it has no position.', $item::class));
@@ -210,7 +219,8 @@ final class OrderedRelation
                 continue;
             }
 
-            $membership = self::membershipNamedBy($item, $item->getAttributes());
+            $attributes = $item->getAttributes();
+            $membership = self::membershipNamedBy($item, $attributes);
 
             if ($membership === null) {
                 self::fillPosition($item, null);
@@ -218,13 +228,66 @@ final class OrderedRelation
                 continue;
             }
 
-            $group = implode(':', [$item::class, $item->getTable(), (string) $item->getConnectionName(), $membership['parent']::class, (string) $membership['revision']->value]);
-            $groups[$group] ??= [new self($membership['parent'], $membership['revision']), []];
-            $groups[$group][1][] = $item;
+            $key = $item->getKey();
+
+            throw_unless(is_int($key) || is_string($key), LogicException::class, sprintf(
+                '[%s] has no [%s], so loadPositions() cannot match it to its position. Load a pivot through [%s::query()], or through a relation that declares withPivot(\'%s\').',
+                $item::class,
+                $item->getKeyName(),
+                self::class,
+                self::KEY_NAME,
+            ));
+
+            $parent = self::parentNamedBy($membership, $attributes[$membership['keys']->foreignKey]);
+
+            foreach ([...array_values($item->getRelations()), ...$item instanceof Pivot ? [$item->pivotParent] : []] as $model) {
+                $candidate = self::asParent($model);
+
+                if ($candidate !== null && self::isNamed($membership, $attributes, $candidate)) {
+                    self::requireConnectionOf($item, $candidate);
+                    $parents[$parent] ??= $candidate;
+                }
+            }
+
+            $named[] = [$item, $membership, $parent, $attributes[$membership['keys']->foreignKey]];
         }
 
-        foreach ($groups as [$relation, $members]) {
-            $positions = $relation->positionsOf($members);
+        $missing = [];
+
+        foreach ($named as [, $membership, $parent, $ownerKey]) {
+            if (! array_key_exists($parent, $parents)) {
+                $class = self::parentClassOf($membership);
+                $missing[$class] ??= [$membership, []];
+                $missing[$class][1][] = $ownerKey;
+            }
+        }
+
+        foreach ($missing as [$membership, $ownerKeys]) {
+            foreach ($membership['parent']->newQueryWithoutScopes()->whereIn($membership['keys']->ownerKey, array_values(array_unique($ownerKeys)))->get() as $model) {
+                $candidate = self::asParent($model);
+
+                if ($candidate !== null) {
+                    $parents[self::parentNamedBy($membership, $candidate->getAttribute($membership['keys']->ownerKey))] = $candidate;
+                }
+            }
+        }
+
+        $groups = [];
+
+        foreach ($named as [$item, $membership, $parent]) {
+            if (! array_key_exists($parent, $parents)) {
+                self::fillPosition($item, null);
+
+                continue;
+            }
+
+            $group = implode(':', [$item::class, $item->getTable(), (string) $item->getConnectionName(), $membership['parent']::class, (string) $membership['revision']->value]);
+            $groups[$group]['relations'][$parent] ??= new self($parents[$parent], $membership['revision']);
+            $groups[$group]['items'][] = $item;
+        }
+
+        foreach ($groups as ['relations' => $relations, 'items' => $members]) {
+            $positions = self::positionsOf(array_values($relations), $members);
 
             foreach ($members as $member) {
                 self::fillPosition($member, $positions[(string) self::keyOf($member)] ?? null);
@@ -244,13 +307,10 @@ final class OrderedRelation
         }
 
         $selectPositions = $this->selectPositions(...);
-        $positioned = false;
+        $pivot = $relation instanceof BelongsToMany;
 
-        $relation->getQuery()->macro('withPositions', function (EloquentBuilder $query) use ($selectPositions, $relation, &$positioned): EloquentBuilder {
-            if (! $positioned) {
-                $selectPositions($relation);
-                $positioned = true;
-            }
+        $relation->getQuery()->macro('withPositions', function (EloquentBuilder $query) use ($selectPositions, $pivot): EloquentBuilder {
+            $selectPositions($query, $pivot);
 
             return $query;
         });
@@ -481,6 +541,22 @@ final class OrderedRelation
             && self::sameKey($parent->getAttribute($membership['keys']->ownerKey), $attributes[$membership['keys']->foreignKey]);
     }
 
+    /**
+     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}  $membership
+     */
+    private static function parentClassOf(array $membership): string
+    {
+        return implode(':', [$membership['parent']::class, (string) $membership['parent']->getConnectionName(), $membership['keys']->ownerKey]);
+    }
+
+    /**
+     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}  $membership
+     */
+    private static function parentNamedBy(array $membership, mixed $ownerKey): string
+    {
+        return self::parentClassOf($membership).':'.(is_int($ownerKey) || is_string($ownerKey) ? (string) $ownerKey : '');
+    }
+
     private static function requireConnectionOf(Model $item, Model $parent): void
     {
         $connection = $item->getConnection()->getName();
@@ -684,9 +760,11 @@ final class OrderedRelation
 
         if ($relation instanceof BelongsToMany) {
             $class = $relation->getPivotClass();
+            $pivot = (new $class)->setTable($relation->getTable())->setConnection($relation->getParent()->getConnectionName());
+            $pivot->timestamps = $relation->hasPivotColumn($pivot->getUpdatedAtColumn());
 
             return new RelationKeys(
-                (new $class)->setTable($relation->getTable())->setConnection($relation->getParent()->getConnectionName()),
+                $pivot,
                 $relation->getForeignPivotKeyName(),
                 $relation->getParentKeyName(),
                 ...$morph,
@@ -711,6 +789,11 @@ final class OrderedRelation
     private static function keyOrNull(mixed $key): null|string
     {
         return is_string($key) ? $key : null;
+    }
+
+    private static function timestamps(Model $item, Model $template): bool
+    {
+        return ($item instanceof Pivot ? $template : $item)->usesTimestamps();
     }
 
     private static function fillPosition(Model $item, mixed $position): void
@@ -798,10 +881,12 @@ final class OrderedRelation
             return [];
         }
 
-        OrderWrite::update($this->keys->item, array_keys($changed), [self::RANK_KEY => null]);
+        $timestamps = $this->keys->item->usesTimestamps();
+
+        OrderWrite::update($this->keys->item, array_keys($changed), [self::RANK_KEY => null], $timestamps);
 
         foreach ($changed as $id => $key) {
-            OrderWrite::update($this->keys->item, [$id], [self::RANK_KEY => $key]);
+            OrderWrite::update($this->keys->item, [$id], [self::RANK_KEY => $key], $timestamps);
         }
 
         return array_keys($changed);
@@ -907,7 +992,7 @@ final class OrderedRelation
      */
     private function write(Model $item, array $attributes): void
     {
-        $written = OrderWrite::update($item, [$item->getKey()], $attributes);
+        $written = OrderWrite::update($item, [$item->getKey()], $attributes, self::timestamps($item, $this->keys->item));
         $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
 
         if ($item instanceof Revisioned) {
@@ -970,49 +1055,72 @@ final class OrderedRelation
     }
 
     /**
-     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     * @param  EloquentBuilder<Model>  $query
      */
-    private function selectPositions(HasMany|MorphMany|BelongsToMany $relation): void
+    private function selectPositions(EloquentBuilder $query, bool $pivot): void
     {
+        $base = $query->getQuery();
         $table = $this->keys->item->getTable();
         $numbered = $this->numbered($this->members(), [$this->keys->item->qualifyColumn('*')]);
-        $query = $relation->getBaseQuery();
+        $sql = sprintf('(%s) as %s', $numbered->toSql(), $base->getGrammar()->wrapTable($table));
+        $numbers = static fn (mixed $table): bool => $table instanceof Expression && $table->getValue($base->getGrammar()) === $sql;
 
-        if (! $relation instanceof BelongsToMany) {
-            $query->fromSub($numbered, $table);
+        if (! $pivot) {
+            if (! $numbers($base->from)) {
+                $base->fromRaw($sql, $numbered->getBindings());
+            }
 
             return;
         }
 
-        $join = array_find($query->joins ?? [], static fn (JoinClause $join): bool => $join->table === $table)
-            ?? throw new LogicException(sprintf('[%s] does not join the pivot table [%s].', $relation::class, $table));
+        $joins = $base->joins ?? [];
 
-        $join->table = new Expression(sprintf('(%s) as %s', $numbered->toSql(), $query->getGrammar()->wrapTable($table)));
-        $query->setBindings([...$numbered->getBindings(), ...$query->getRawBindings()['join']], 'join');
-        $relation->withPivot(self::POSITION);
+        if (array_any($joins, static fn (JoinClause $join): bool => $numbers($join->table))) {
+            return;
+        }
+
+        $index = array_find_key($joins, static fn (JoinClause $join): bool => $join->table === $table)
+            ?? throw new LogicException(sprintf('[%s::%s()] does not join the pivot table [%s].', $this->parent::class, $this->relationName, $table));
+
+        $join = clone $joins[$index];
+        $join->table = new Expression($sql);
+        $base->joins[$index] = $join;
+        $base->setBindings([...$numbered->getBindings(), ...$base->getRawBindings()['join']], 'join');
+
+        if ($base->columns === null) {
+            $query->select($query->getModel()->qualifyColumn('*'));
+        }
+
+        $base->addSelect(sprintf('%s as pivot_%s', $this->keys->item->qualifyColumn(self::POSITION), self::POSITION));
     }
 
     /**
+     * @param  non-empty-list<self>  $relations
      * @param  list<Model>  $items
      * @return array<string, mixed>
      */
-    private function positionsOf(array $items): array
+    private static function positionsOf(array $relations, array $items): array
     {
-        $foreignKey = $this->keys->foreignKey;
-        $members = Relation::noConstraints(fn (): Builder => $this->scopedRelation()->toBase())
-            ->whereIn($this->keys->item->qualifyColumn($foreignKey), array_values(array_unique(array_map(static fn (Model $item): mixed => $item->getAttribute($foreignKey), $items))));
+        $keys = $relations[0]->keys;
+        $rows = array_map(static fn (self $relation): Builder => $relation->members()->select([
+            $keys->item->getQualifiedKeyName(),
+            $keys->item->qualifyColumn($keys->foreignKey),
+            $keys->item->qualifyColumn(self::RANK_KEY),
+        ]), $relations);
+        $members = array_shift($rows);
 
-        if ($this->keys->morphType !== null) {
-            $members->where($this->keys->item->qualifyColumn($this->keys->morphType), $this->keys->morphClass);
+        foreach ($rows as $row) {
+            $members->unionAll($row);
         }
 
-        $table = $this->keys->item->getTable();
+        $table = $keys->item->getTable();
+        $numbered = $relations[0]->numbered($members->newQuery()->fromSub($members, $table), [$keys->item->getQualifiedKeyName()]);
 
         /** @var array<string, mixed> */
-        return $members->newQuery()
-            ->fromSub($this->numbered($members, [$this->keys->item->getQualifiedKeyName()]), $table)
-            ->whereIn($this->keys->item->getQualifiedKeyName(), array_map(self::keyOf(...), $items))
-            ->pluck(self::POSITION, $this->keys->item->getKeyName())
+        return $numbered->newQuery()
+            ->fromSub($numbered, $table)
+            ->whereIn($keys->item->getQualifiedKeyName(), array_map(self::keyOf(...), $items))
+            ->pluck(self::POSITION, $keys->item->getKeyName())
             ->all();
     }
 

@@ -17,6 +17,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use stdClass;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
@@ -31,6 +32,7 @@ use Support\Database\Eloquent\Ordering\Placement;
 use Tests\Fixtures\Support\Albums\Album;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Boards\Board;
+use Tests\Fixtures\Support\Casts\JsonObject;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Events\ModelUpdated;
@@ -119,6 +121,21 @@ class IsOrderedTest extends TestCase
         return Shape::crossed([
             'a saving listener of the member' => [fn (Shape $shape, Model $parent): string => $shape->memberClass(), 'saving'],
             'an updating listener of the parent' => [fn (Shape $shape, Model $parent): string => $parent::class, 'updating'],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function castChanges(): iterable
+    {
+        return Shape::crossed([
+            'an assignment' => [fn (Model $model): mixed => $model->setAttribute('address', (object) ['zip' => '2', 'city' => 'X'])],
+            'a change to the cast object' => [function (Model $model): void {
+                $address = $model->getAttribute('address');
+                assert($address instanceof stdClass);
+                $address->zip = '2';
+            }],
         ]);
     }
 
@@ -1953,6 +1970,44 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
+    public function it_lets_a_listener_read_a_class_cast_attribute_of_a_replayed_row(Shape $shape): void
+    {
+        [$parent, [$first, $moved]] = $this->withAddresses($shape);
+
+        Event::listen(sprintf('eloquent.saving: %s', $shape->memberClass()), function (Model $model): void {
+            $model->mergeCasts(['address' => JsonObject::class])->getAttribute('address');
+        });
+
+        $moved->move(Placement::first(), expected: null);
+
+        $this->assertOrder($shape, [$moved->getKey(), $first->getKey()], $parent);
+    }
+
+    /**
+     * @param  Closure(Model): void  $change
+     */
+    #[DataProvider('castChanges')]
+    #[Test]
+    public function it_refuses_a_listener_that_changes_a_class_cast_attribute_of_a_replayed_row(Shape $shape, Closure $change): void
+    {
+        [$parent, [$first, $moved]] = $this->withAddresses($shape);
+
+        Event::listen(sprintf('eloquent.saving: %s', $shape->memberClass()), function (Model $model) use ($change): void {
+            $change($model->mergeCasts(['address' => JsonObject::class]));
+        });
+
+        try {
+            $moved->move(Placement::first(), expected: null);
+            $this->fail('A listener changed a class cast attribute of a replayed row.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString(sprintf('changed [address] of [%s:', $shape->memberClass()), $exception->getMessage());
+        }
+
+        $this->assertOrder($shape, [$first->getKey(), $moved->getKey()], $parent);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
     public function it_runs_none_of_its_own_listeners_for_a_replayed_member(Shape $shape): void
     {
         [, [, $moved]] = $shape->with(2);
@@ -2042,6 +2097,21 @@ class IsOrderedTest extends TestCase
     private function sceneRevision(Tour|Listing $parent): int
     {
         return (int) DB::table($parent->getTable())->where('id', $parent->id)->value('scenes_order_concurrency_revision');
+    }
+
+    /**
+     * @return array{Model&OrdersRelations&Revisioned, list<Model&Ordered>}
+     */
+    private function withAddresses(Shape $shape): array
+    {
+        [$parent, $members] = $shape->with(2);
+        $address = json_encode(['zip' => '1', 'city' => 'X']);
+        DB::statement(sprintf('alter table "%s" add column "address" jsonb', $shape->memberTable()));
+        DB::table($shape->memberTable())->whereIn('id', array_map(fn (Model $member): int|string => $this->key($member), $members))->update(['address' => $address]);
+
+        $this->assertNotSame($address, DB::table($shape->memberTable())->where('id', $members[1]->getKey())->value('address'));
+
+        return [$parent, array_map(fn (Model $member): Model&Ordered => $shape->find($this->key($member)), $members)];
     }
 
     /**

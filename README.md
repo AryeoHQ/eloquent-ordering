@@ -119,13 +119,13 @@ class Asset extends Model implements Ordered
 }
 ```
 
-`IsOrdered` hides `rank_key` from serialization and adds a read-only `position` attribute (1-based, `null` until the item has a place). A model must never write `rank_key` itself. The traits do that.
+`IsOrdered` hides `rank_key` from serialization and adds a read-only `position` attribute (1-based, `null` until the item has a place). A model must never write `rank_key` itself. The traits do that. An ordered table must have no `position` column, because the readers and the accessor own that name.
 
 Three readers fill `position`. Each one counts the rows that the parent's relation returns, as `OrderChange::$order` lists them. A trashed row, a row that the relation excludes, and a row without a rank key have no position.
 
 - **The accessor.** `$asset->position` returns a position that a query or `loadPositions()` selected, and runs no query. Without a selected value, it counts with queries.
-- **`withPositions()`** numbers the query that `query()` returns, in one query. The caller's filters, order, limit, and offset apply after the numbering, in either call order. A filter therefore hides rows without renumbering the rest, and page 3 of 15 still starts at position 31. For a pivot relation, the pivot carries `position`. On any other query, `withPositions()` throws `LogicException`.
-- **`loadPositions()`** sets `position` on each item of an `OrderedCollection`. It runs one query per item class and relation, so the items can come from several parents and classes. An item with no position gets `null`, and an item that is not `Ordered` throws `LogicException`.
+- **`withPositions()`** numbers the query that `query()` returns, in one query. The caller's filters, order, limit, and offset apply after the numbering, in either call order. A filter therefore hides rows without renumbering the rest, and page 3 of 15 still starts at position 31. For a pivot relation, the pivot carries `position`, and a `select()` must come before `withPositions()`, because a later `select()` replaces that column. A copy of the query, such as `clone $query`, numbers only when `withPositions()` names that copy. On any other query, `withPositions()` throws `LogicException`.
+- **`loadPositions()`** sets `position` on each item of an `OrderedCollection`. It loads each item's parent with one query per parent class, and reuses a parent that the item already holds. It then runs one query per item class and relation, so the items can come from several parents and classes. Each item counts among the rows of its own parent's relation, so a relation `where()` that reads a parent attribute applies. An item with no position gets `null`, and an item that is not `Ordered` throws `LogicException`.
 
 ```php
 $assets = $section->orderedRelation(SectionRevision::AssetsOrder)
@@ -139,7 +139,7 @@ $results = Asset::query()->where('title', 'like', 'Dusk%')->get()
     ->loadPositions();
 ```
 
-Declare `#[CollectedBy(OrderedCollection::class)]` on an item to make its queries return an `OrderedCollection`. Wrap other items, such as the pivots of a relation's results, in `new OrderedCollection($items)`.
+Declare `#[CollectedBy(OrderedCollection::class)]` on an item to make its queries return an `OrderedCollection`. Wrap other items, such as the pivots of a relation's results, in `new OrderedCollection($items)`. A pivot needs its `id` for `loadPositions()`, so load it through `OrderedRelation::query()`, or through a relation that declares `withPivot('id')`. A pivot without its `id` throws `LogicException`.
 
 A selected `position` is never dirty, and no save writes it. `move()`, a save that changes the parent, a delete, and `restore()` drop it from that instance, so the accessor counts again. A write by another request does not change it.
 
@@ -328,7 +328,7 @@ The package writes items through the query builder, and the trigger writes the p
 
 Each replay fires `saving`, `updating`, `updated`, and `saved` on a fresh instance of the row's model. The instance holds the row read before the write as its original, and the row read after the write as its attributes. `getDirty()` therefore describes the write, and from `updated` on so does `getChanges()`. Observers, `Event::listen('eloquent.updated: …')` listeners, and `$dispatchesEvents` classes all receive the replay. Items replay first, then parents in lock order. One write replays each row once. A row that the caller saves through Eloquent fires its own events and never replays.
 
-The package's item writes also set `updated_at` when the item model uses timestamps. No write touches a parent's `updated_at`, because that change would raise the parent's own revision and fail a concurrent `If-Match`.
+The package's item writes also set `updated_at` when the item model uses timestamps. For a pivot, the relation decides: the writes set `updated_at` only when the relation declares `withTimestamps()`, so a pivot table without timestamps needs no other setting. No write touches a parent's `updated_at`, because that change would raise the parent's own revision and fail a concurrent `If-Match`.
 
 - **A halt rolls the write back.** A `saving` or `updating` listener that returns `false` for a replayed instance halts the whole write. The transaction rolls back, no `Reordered` or `Rebalanced` dispatches, and the call throws `WriteHalted`. `save()` and `delete()` throw too, because the halted model is not the one the caller saved.
 - **A replayed row cannot change.** A `saving` or `updating` listener that changes an attribute of a replayed instance throws `LogicException`, and the write rolls back.
@@ -405,6 +405,8 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 - **One parent orders an item class in one relation only.** Declaring two relations for one class, or two relations under one revision, throws `LogicException`.
 - **A key longer than 64 characters triggers a rebalance.** The rebalance rewrites every member of the parent, and adds `n + 1` to the revision.
 - **The accessor's fallback costs queries.** Without a selected value, `position` counts with queries for each item. Number a list with `withPositions()` or `loadPositions()` instead.
+- **An ordered table cannot have a `position` column.** The readers select `position`, and the accessor returns any `position` attribute it finds, so a stored column hides the computed position. Drop or rename such a column.
+- **The package reserves the scope name `withPositions`.** It registers a global `withPositions` macro on the Eloquent builder, and a macro runs before a named scope. A model's own `scopeWithPositions()` never runs.
 - **A create or delete reads the whole order.** It builds `OrderChange::$order`, which lists every member, so the cost grows with the relation.
 - **`Placement::in()` does not work on a create.** Associate the parent instead.
 - **A move between parent classes unsets the item's loaded relation** for the old parent. It does not set the new one.
@@ -420,4 +422,4 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
 | `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
 | `WriteHalted` (`RuntimeException`) | A `saving` or `updating` listener returned `false` for a replayed instance. The message names the model, its key, and the event. The write rolled back. |
-| `LogicException` | A relation is misdeclared, a model is unsaved, an item has no parent, an item and its parent use different connections, a listener changed an attribute of a replayed instance, `withPositions()` ran on a query that `OrderedRelation::query()` did not return, or `loadPositions()` met a model that is not `Ordered`. |
+| `LogicException` | A relation is misdeclared, a model is unsaved, an item has no parent, an item and its parent use different connections, a listener changed an attribute of a replayed instance, `withPositions()` ran on a query that `OrderedRelation::query()` did not return, or `loadPositions()` met a model that is not `Ordered` or a pivot without its `id`. |

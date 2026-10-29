@@ -84,11 +84,11 @@ final class OrderWrite
      * @param  array<string, mixed>  $attributes
      * @return array<string, mixed>
      */
-    public static function update(Model $item, array $ids, array $attributes): array
+    public static function update(Model $item, array $ids, array $attributes, bool $timestamps): array
     {
         self::current()?->record($item, $ids);
 
-        $column = $item->usesTimestamps() ? $item->getUpdatedAtColumn() : null;
+        $column = $timestamps ? $item->getUpdatedAtColumn() : null;
 
         if ($column !== null) {
             $attributes[$column] = $item->freshTimestampString();
@@ -286,9 +286,32 @@ final class OrderWrite
     private static function changed(Model $model, array $after): array
     {
         $attributes = $model->getAttributes();
-        $probe = $model->newInstance([], true)->setRawAttributes($after, true)->setRawAttributes($attributes);
+        $read = $model->newInstance([], true)->setRawAttributes($after, true);
 
-        return array_map(strval(...), array_keys([...array_diff_key($after, $attributes), ...$probe->getDirty()]));
+        foreach (self::castsRead($model) as $key) {
+            $read->getAttribute($key);
+        }
+
+        $stored = $read->getAttributes();
+        $probe = $model->newInstance([], true)->setRawAttributes($stored, true)->setRawAttributes($attributes);
+
+        return array_map(strval(...), array_keys([...array_diff_key($stored, $attributes), ...$probe->getDirty()]));
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function castsRead(Model $model): array
+    {
+        $keys = [];
+
+        foreach (['classCastCache', 'attributeCastCache'] as $cache) {
+            /** @var array<string, mixed> $values */
+            $values = (new ReflectionProperty(Model::class, $cache))->getValue($model);
+            $keys = [...$keys, ...array_keys($values)];
+        }
+
+        return array_values(array_unique(array_map(strval(...), $keys)));
     }
 
     private function keep(Model $model): void

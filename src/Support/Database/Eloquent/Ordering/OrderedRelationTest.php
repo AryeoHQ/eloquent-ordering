@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Facades\DB;
 use LogicException;
@@ -24,9 +25,13 @@ use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
+use Tests\Fixtures\Support\Agencies\Agency;
+use Tests\Fixtures\Support\Agencies\AgencyCustomer;
+use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Events\ModelEvents;
+use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
@@ -98,6 +103,63 @@ class OrderedRelationTest extends TestCase
         ]);
     }
 
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function copiedQueries(): iterable
+    {
+        return Shape::crossed([
+            'the copy alone' => [fn (Relation $query): array => [(clone $query)->withPositions(), $query], [true, false]],
+            'the original alone' => [fn (Relation $query): array => [clone $query, $query->withPositions()], [false, true]],
+            'both' => [fn (Relation $query): array => [(clone $query)->withPositions(), $query->withPositions()], [true, true]],
+            'a copy of a numbered query, numbered again' => [fn (Relation $query): array => [(clone $query->withPositions())->withPositions(), $query], [true, true]],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(Agency, list<string>, Agency): mixed, list<int>, list<int>}>
+     */
+    public static function untimedPivotWrites(): iterable
+    {
+        yield 'a reorder' => [
+            fn (Agency $agency, array $ids, Agency $other): OrderChange => $agency->orderedRelation(AgencyRevision::CustomersOrder)->reorder(array_reverse($ids), expected: null),
+            [2, 1, 0],
+            [],
+        ];
+
+        yield 'a rebalance' => [
+            function (Agency $agency, array $ids, Agency $other): OrderChange {
+                $prefix = 'a0'.str_repeat('V', OrderedRelation::MAX_KEY_LENGTH - 3);
+                DB::table('agency_customer')->where('id', $ids[0])->update([OrderedRelation::RANK_KEY => $prefix.'V']);
+                DB::table('agency_customer')->where('id', $ids[1])->update([OrderedRelation::RANK_KEY => $prefix.'W']);
+                $pivot = $agency->orderedRelation(AgencyRevision::CustomersOrder)->query()->get()->all()[2]->getRelation('pivot');
+                assert($pivot instanceof AgencyCustomer);
+
+                return $pivot->move(Placement::after($ids[0]), expected: null);
+            },
+            [0, 2, 1],
+            [],
+        ];
+
+        yield 'a move of a pivot that its query loaded' => [
+            fn (Agency $agency, array $ids, Agency $other): OrderChange => AgencyCustomer::query()->findOrFail($ids[2])->move(Placement::first(), expected: null),
+            [2, 0, 1],
+            [],
+        ];
+
+        yield 'a move of a pivot that its query loaded to another parent' => [
+            fn (Agency $agency, array $ids, Agency $other): OrderChange => AgencyCustomer::query()->findOrFail($ids[0])->move(Placement::last()->in($other), expected: null),
+            [1, 2],
+            [0],
+        ];
+
+        yield 'a detach' => [
+            fn (Agency $agency, array $ids, Agency $other): int => $agency->customers()->detach(AgencyCustomer::query()->findOrFail($ids[1])->customer_id),
+            [0, 2],
+            [],
+        ];
+    }
+
     #[DataProvider('shapes')]
     #[Test]
     public function it_numbers_every_member_in_one_query_as_the_accessor_and_the_order_change_do(Shape $shape): void
@@ -123,6 +185,23 @@ class OrderedRelationTest extends TestCase
         $positions = $shape->selectedPositions($query($shape->orderedRelation($parent), $shape->memberTable().'.id', [$second->getKey(), $fourth->getKey()]));
 
         $this->assertSame([$second->getKey() => 2, $fourth->getKey() => 4], $positions);
+    }
+
+    /**
+     * @param  Closure(Relation<Model, Model, mixed>): array{Relation<Model, Model, mixed>, Relation<Model, Model, mixed>}  $copy
+     * @param  array{bool, bool}  $numbered
+     */
+    #[DataProvider('copiedQueries')]
+    #[Test]
+    public function it_numbers_each_copy_of_a_query_that_withpositions_names(Shape $shape, Closure $copy, array $numbered): void
+    {
+        [$parent, [$first, $second]] = $shape->with(2);
+        $positions = [$first->getKey() => 1, $second->getKey() => 2];
+        $missing = [$first->getKey() => 'missing', $second->getKey() => 'missing'];
+
+        $queries = $copy($shape->orderedRelation($parent)->query());
+
+        $this->assertSame([$numbered[0] ? $positions : $missing, $numbered[1] ? $positions : $missing], array_map(fn (Relation $query): array => $this->loadedPositions($shape, $query->get()), $queries));
     }
 
     #[DataProvider('shapes')]
@@ -213,6 +292,58 @@ class OrderedRelationTest extends TestCase
         } catch (LogicException $exception) {
             $this->assertStringContainsString('[withPositions()] numbers only a query that', $exception->getMessage());
         }
+    }
+
+    #[Test]
+    public function it_numbers_no_pivot_relation_that_does_not_join_its_pivot_table(): void
+    {
+        [$listing] = (new BelongsToManyShape)->with(1);
+
+        $parent = (new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            public function customers(): BelongsToMany
+            {
+                $relation = $this->belongsToMany(Customer::class, 'listing_customer')->using(ListingCustomer::class)->wherePivotNull('deleted_at');
+                $relation->getBaseQuery()->joins = [];
+
+                return $relation;
+            }
+        })->newQuery()->findOrFail($listing->getKey());
+
+        try {
+            $parent->orderedRelation(ListingRevision::CustomersOrder)->query()->withPositions();
+            $this->fail('A pivot relation without its pivot join was numbered.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString('does not join the pivot table [listing_customer].', $exception->getMessage());
+        }
+    }
+
+    /**
+     * @param  Closure(Agency, list<string>, Agency): mixed  $write
+     * @param  list<int>  $order
+     * @param  list<int>  $moved
+     */
+    #[DataProvider('untimedPivotWrites')]
+    #[Test]
+    public function it_writes_a_pivot_whose_relation_and_table_have_no_timestamps(Closure $write, array $order, array $moved): void
+    {
+        [$agency, $other] = [Agency::create(), Agency::create()];
+        $agency->customers()->attach([Customer::create()->id, Customer::create()->id, Customer::create()->id]);
+        $ids = $this->agencyMembers($agency);
+
+        $write($agency, $ids, $other);
+
+        $this->assertTrue((new AgencyCustomer)->usesTimestamps());
+        $this->assertSame(array_map(fn (int $index): string => $ids[$index], $order), $this->agencyMembers($agency));
+        $this->assertSame(array_map(fn (int $index): string => $ids[$index], $moved), $this->agencyMembers($other));
     }
 
     #[DataProvider('shapes')]
@@ -676,6 +807,36 @@ class OrderedRelationTest extends TestCase
         assert($parent instanceof OrdersRelations && $parent instanceof Revisioned);
 
         return $parent;
+    }
+
+    /**
+     * @param  iterable<Model>  $results
+     * @return array<int|string, mixed>
+     */
+    private function loadedPositions(Shape $shape, iterable $results): array
+    {
+        $positions = [];
+
+        foreach ($results as $result) {
+            $item = $shape->item($result);
+            $attributes = $item->getAttributes();
+            $positions[$this->key($item)] = array_key_exists(OrderedRelation::POSITION, $attributes) ? $attributes[OrderedRelation::POSITION] : 'missing';
+        }
+
+        return $positions;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function agencyMembers(Agency $agency): array
+    {
+        return $agency->orderedRelation(AgencyRevision::CustomersOrder)->query()->get()->map(function (Model $customer): string {
+            $key = $customer->getRelation('pivot')?->getKey();
+            assert(is_string($key));
+
+            return $key;
+        })->values()->all();
     }
 
     private function addAsset(Section $section, string $title): Asset

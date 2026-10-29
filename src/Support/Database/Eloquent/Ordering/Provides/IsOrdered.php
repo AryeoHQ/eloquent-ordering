@@ -115,7 +115,7 @@ trait IsOrdered
         });
 
         static::registerModelEvent('trashed', static function (self $item): void {
-            $written = OrderWrite::update($item, [$item->getKey()], [OrderedRelation::RANK_KEY => null]);
+            $written = OrderWrite::update($item, [$item->getKey()], [OrderedRelation::RANK_KEY => null], OrderedRelation::usesTimestamps($item));
             $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
         });
 
