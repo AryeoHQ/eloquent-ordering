@@ -187,6 +187,104 @@ class HasOrderedRelationsTest extends TestCase
         }, TourRevision::CustomersOrder, 'customers()'];
     }
 
+    /**
+     * @return iterable<string, array{Closure(string): (Model&OrdersRelations), NamesConcurrencyRevision, string}>
+     */
+    public static function ownerKeys(): iterable
+    {
+        yield 'has many' => [static function (string $ownerKey): Model&OrdersRelations {
+            $parent = new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+            {
+                use HasConcurrencyRevisions;
+                use HasOrderedRelations;
+
+                public string $ownerKey = 'id';
+
+                protected $table = 'sections';
+
+                /**
+                 * @return HasMany<Asset, $this>
+                 */
+                public function assets(): HasMany
+                {
+                    return $this->hasMany(Asset::class, 'section_id', $this->ownerKey);
+                }
+            };
+            $parent->ownerKey = $ownerKey;
+
+            return $parent;
+        }, SectionRevision::AssetsOrder, 'assets()'];
+
+        yield 'morph many' => [static function (string $ownerKey): Model&OrdersRelations {
+            $parent = new #[OrdersRelation(TourRevision::ScenesOrder, relation: 'scenes')] class extends Model implements OrdersRelations, Revisioned
+            {
+                use HasConcurrencyRevisions;
+                use HasOrderedRelations;
+
+                public string $ownerKey = 'id';
+
+                protected $table = 'tours';
+
+                /**
+                 * @return MorphMany<Scene, $this>
+                 */
+                public function scenes(): MorphMany
+                {
+                    return $this->morphMany(Scene::class, 'sceneable', localKey: $this->ownerKey);
+                }
+            };
+            $parent->ownerKey = $ownerKey;
+
+            return $parent;
+        }, TourRevision::ScenesOrder, 'scenes()'];
+
+        yield 'belongs to many' => [static function (string $ownerKey): Model&OrdersRelations {
+            $parent = new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+            {
+                use HasConcurrencyRevisions;
+                use HasOrderedRelations;
+
+                public string $ownerKey = 'id';
+
+                protected $table = 'listings';
+
+                /**
+                 * @return BelongsToMany<Customer, $this, ListingCustomer>
+                 */
+                public function customers(): BelongsToMany
+                {
+                    return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id', 'customer_id', $this->ownerKey)->using(ListingCustomer::class);
+                }
+            };
+            $parent->ownerKey = $ownerKey;
+
+            return $parent;
+        }, ListingRevision::CustomersOrder, 'customers()'];
+
+        yield 'morph to many' => [static function (string $ownerKey): Model&OrdersRelations {
+            $parent = new #[OrdersRelation(TourRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+            {
+                use HasConcurrencyRevisions;
+                use HasOrderedRelations;
+
+                public string $ownerKey = 'id';
+
+                protected $table = 'tours';
+
+                /**
+                 * @return MorphToMany<Customer, $this, Customerable>
+                 */
+                public function customers(): MorphToMany
+                {
+                    return $this->morphToMany(Customer::class, 'customerable', parentKey: $this->ownerKey)->using(Customerable::class);
+                }
+            };
+            $parent->ownerKey = $ownerKey;
+
+            return $parent;
+        }, TourRevision::CustomersOrder, 'customers()'];
+    }
+
     #[Test]
     public function it_returns_the_ordered_relation_of_a_revision(): void
     {
@@ -631,6 +729,24 @@ class HasOrderedRelationsTest extends TestCase
             } catch (LogicException $exception) {
                 $this->assertStringContainsString('legacy_id', $exception->getMessage());
             }
+        }
+    }
+
+    /**
+     * @param  Closure(string): (Model&OrdersRelations)  $parent
+     */
+    #[DataProvider('ownerKeys')]
+    #[Test]
+    public function it_validates_a_relation_again_when_another_instance_returns_other_keys(Closure $parent, NamesConcurrencyRevision $revision, string $relation): void
+    {
+        $this->assertSame($revision, $parent('id')->orderedRelation($revision)->revision);
+
+        try {
+            $parent('legacy_id')->orderedRelation($revision);
+            $this->fail('A second instance that returns the owner key [legacy_id] was accepted.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString($relation, $exception->getMessage());
+            $this->assertStringContainsString('legacy_id', $exception->getMessage());
         }
     }
 

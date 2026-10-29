@@ -35,7 +35,7 @@ trait IsOrdered
 
     private null|OrderedRelation $restoredInto = null;
 
-    /** @var null|array{OrderedRelation, OrderedRelation, int} */
+    /** @var null|array{null|OrderedRelation, null|OrderedRelation, null|int} */
     private null|array $reparented = null;
 
     /** @var list<OrderedRelation> */
@@ -44,6 +44,7 @@ trait IsOrdered
     public static function bootIsOrdered(): void
     {
         static::saving(static function (self $item): void {
+            $uncommitted = $item->reparented !== null;
             $item->restoredInto = null;
             $item->reparented = null;
 
@@ -52,23 +53,27 @@ trait IsOrdered
             } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
                 $next = OrderedRelation::of($item, $item->getAttributes(), $item->heldOrderedParents());
                 [$current, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations($next);
+                $kept = $uncommitted ? $item->getRawOriginal(OrderedRelation::RANK_KEY) : $item->getAttribute(OrderedRelation::RANK_KEY);
 
                 if ($item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
                     $stored = $item->storedOrderedAttributes([OrderedRelation::RANK_KEY, OrderedRelations::DELETED_AT]);
 
-                    if ($stored !== null && $stored[OrderedRelations::DELETED_AT] !== null) {
+                    if ($stored === null) {
+                        return;
+                    }
+
+                    if ($stored[OrderedRelations::DELETED_AT] !== null) {
                         $item->setAttribute(OrderedRelation::RANK_KEY, $next?->keyAt(Placement::last()));
                         $item->restoredInto = $next;
-                    } elseif ($stored !== null) {
-                        $item->setAttribute(OrderedRelation::RANK_KEY, $stored[OrderedRelation::RANK_KEY]);
-                    }
-                } elseif ($current !== null && $next !== null && ! $current->is($next) && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
-                    $previous = $current->position($item);
 
-                    if ($previous !== null) {
-                        $item->setAttribute(OrderedRelation::RANK_KEY, $next->keyAt(Placement::last()));
-                        $item->reparented = [$current, $next, $previous];
+                        return;
                     }
+
+                    $kept = $stored[OrderedRelation::RANK_KEY];
+                }
+
+                if ($item->getAttribute(OrderedRelations::DELETED_AT) === null) {
+                    $item->followOrderedParent($current, $next, $kept);
                 }
             }
         });
@@ -104,10 +109,24 @@ trait IsOrdered
             $item->refreshLockedOrderedRelations();
             $restored?->placed($item);
 
-            if ($reparented !== null) {
-                [$source, $destination, $previous] = $reparented;
+            if ($reparented === null) {
+                return;
+            }
+
+            [$source, $destination, $previous] = $reparented;
+
+            if ($destination !== null) {
                 $item->resolvedOrderedRelation = $destination;
-                $destination->entered($item, $source, $previous);
+            }
+
+            if ($source !== null && $previous !== null) {
+                if ($destination === null) {
+                    $source->removed($item, $previous);
+                } else {
+                    $destination->entered($item, $source, $previous);
+                }
+            } elseif ($destination !== null && $destination->position($item) !== null) {
+                $destination->placed($item);
             }
         });
 
@@ -227,6 +246,18 @@ trait IsOrdered
         }
 
         return $relation;
+    }
+
+    private function followOrderedParent(null|OrderedRelation $current, null|OrderedRelation $next, mixed $kept): void
+    {
+        if ($current === null ? $next === null : $next !== null && $current->is($next)) {
+            $this->setAttribute(OrderedRelation::RANK_KEY, $kept);
+
+            return;
+        }
+
+        $this->reparented = [$current, $next, $current?->position($this)];
+        $this->setAttribute(OrderedRelation::RANK_KEY, $next?->keyAt(Placement::last()));
     }
 
     /**

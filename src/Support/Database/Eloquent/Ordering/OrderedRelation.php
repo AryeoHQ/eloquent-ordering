@@ -470,7 +470,15 @@ final class OrderedRelation
 
         throw_unless(is_a(self::itemClass($relation), Ordered::class, true), LogicException::class, $message);
 
-        $validated = $parent::class.'::'.$name.':'.self::itemClass($relation);
+        $keys = self::describe($relation);
+        $validated = implode(':', [
+            $parent::class.'::'.$name,
+            self::itemClass($relation),
+            $parent->getKeyName(),
+            $keys->ownerKey,
+            $keys->item->getKeyName(),
+            method_exists($keys->item, 'getDeletedAtColumn') ? $keys->item->getDeletedAtColumn() : '',
+        ]);
 
         if (! array_key_exists($validated, self::$validatedRelations)) {
             self::requireIdKeys($parent, $name, $relation);

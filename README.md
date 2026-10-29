@@ -259,7 +259,7 @@ Both outcomes leave the data unchanged. A move that keeps the order writes nothi
 
 After a move between parents, `$asset->orderingRelation()` returns the destination.
 
-A save through Eloquent that changes the parent, such as `$asset->update(['section_id' => $other->id])`, moves the item to the end of the new parent without an `expected` check, so use `move()` when the caller needs one.
+A save through Eloquent that changes the parent, such as `$asset->update(['section_id' => $other->id])`, moves the item to the end of the new parent without an `expected` check, so use `move()` when the caller needs one. A save that leaves every parent, such as one that sets a nullable foreign key to `null`, clears the item's rank key.
 
 ## Reordering a parent
 
@@ -313,11 +313,11 @@ Event::listen(Reordered::class, function (Reordered $event): void {
 |---|---|
 | `move()` inside one parent | One. |
 | `move()` between parents | Two: the source first, then the destination. The destination's `change->source` holds the source change. |
-| A save through Eloquent that changes the parent | Two, with the same shapes as a `move()` between parents. |
+| A save through Eloquent that changes the parent | Two, with the same shapes as a `move()` between parents. One for the source alone when the item leaves every parent. One for the destination alone when the item had no position before the save. None when the destination relation excludes the item. |
 | `reorder()` | One. |
 | A create, including a pivot `attach()` | One. |
 | A delete, soft or force, including a pivot `detach()` | One. |
-| `restore()` | One when the stored row was trashed, and the item enters last. None when another request already restored or force deleted the row. |
+| `restore()` | One when the stored row was trashed, and the item enters last. None when another request already restored or force deleted the row. A restore of a row that another request already restored, and that also changes the parent, counts as a save that changes the parent. |
 | A move or reorder that keeps the order | None. |
 | A stale move, a halted write, or a rollback | None. |
 
@@ -339,7 +339,7 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 
 - **A model soft delete adds 2 to the order revision.** The delete is one statement, and the `trashed` listener nulls `rank_key` in a second. Tests assert the stored value, never a step size.
 - **Revision steps follow the statement count.** A move adds 1 to each affected parent. A reorder that changes `k` keys adds `k + 1`.
-- **`restore()` places the item last.** It assigns a new rank key under the parent lock, as a create does, and dispatches one `Reordered`. It discards a key that a bulk soft delete kept, because another member can hold that key now. A restore of a row that another request already restored, or force deleted, changes nothing and dispatches nothing.
+- **`restore()` places the item last.** It assigns a new rank key under the parent lock, as a create does, and dispatches one `Reordered`. It discards a key that a bulk soft delete kept, because another member can hold that key now. A restore of a row that another request already restored, or force deleted, changes nothing and dispatches nothing, unless it also changes the parent of a restored row.
 - **An unsupported bulk write leaves stale keys.** A soft delete through a query keeps its rank key. A restore through a query keeps that stale key, and fails with `23505` when a live member holds it.
 - **`reorder()` and a rebalance refresh no item instance in memory.** An instance keeps the `rank_key` it was read with, and a `Revisioned` item keeps its own revision. Reload the item.
 - **`attach([a, b])` and `detach([a, b])` dispatch one `Reordered` per pivot.** Each pivot row is one order write, and no batch API exists.

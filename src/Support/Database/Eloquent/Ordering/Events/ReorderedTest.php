@@ -12,6 +12,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
+use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
@@ -19,6 +20,7 @@ use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Shapes\PivotShape;
+use Tests\Fixtures\Support\Shapes\Reparenting;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\TestCase;
 
@@ -49,6 +51,22 @@ class ReorderedTest extends TestCase
     public static function pivots(): iterable
     {
         return PivotShape::pivots();
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): array{Model&OrdersRelations&Revisioned, Model&Ordered, list<Model&Ordered>, array<string, mixed>}}>
+     */
+    public static function departures(): iterable
+    {
+        return Reparenting::departures();
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): array{Model&OrdersRelations&Revisioned, Model&Ordered, list<Model&Ordered>, array<string, mixed>}}>
+     */
+    public static function arrivals(): iterable
+    {
+        return Reparenting::arrivals();
     }
 
     /**
@@ -283,6 +301,126 @@ class ReorderedTest extends TestCase
         $this->assertSame($destination, $entered->relation->parent);
         $this->assertSame([$member->getKey(), $moved->getKey()], $entered->order);
         $this->assertSame([['id' => $this->key($moved), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $entered->changed));
+        $this->assertSame($shape->storedRevision($destination), $entered->revision);
+        $this->assertSame($left, $entered->source);
+        $this->assertSame([$this->baseline, $this->baseline], $this->levels);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_dispatches_one_event_for_a_save_that_moves_a_member_without_a_rank_key_to_another_parent(Shape $shape): void
+    {
+        [, [$moved]] = $shape->with(2);
+        [$destination, [$member]] = $shape->with(1);
+        DB::table($shape->memberTable())->where('id', $moved->getKey())->update([OrderedRelation::RANK_KEY => null]);
+        $keyless = $shape->find($this->key($moved));
+        $this->forget();
+
+        $shape->associate($keyless, $destination);
+        $keyless->save();
+
+        $this->assertCount(1, $this->dispatched);
+
+        $change = $this->dispatched[0]->change;
+
+        $this->assertSame($destination, $change->relation->parent);
+        $this->assertSame([$member->getKey(), $moved->getKey()], $change->order);
+        $this->assertSame([['id' => $this->key($moved), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
+        $this->assertSame($shape->storedRevision($destination), $change->revision);
+        $this->assertNull($change->source);
+        $this->assertSame([$this->baseline], $this->levels);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_dispatches_no_event_for_a_save_that_moves_a_pivot_the_relation_excludes(PivotShape $shape): void
+    {
+        [, [$excluded]] = $shape->with(1);
+        [$destination] = $shape->with(1);
+        Customer::query()->findOrFail($excluded->getAttribute('customer_id'))->delete();
+        $this->forget();
+
+        $shape->associate($excluded, $destination);
+        $excluded->save();
+
+        $this->assertSame([], $this->dispatched);
+    }
+
+    /**
+     * @param  Closure(): array{Model&OrdersRelations&Revisioned, Model&Ordered, list<Model&Ordered>, array<string, mixed>}  $reparent
+     */
+    #[DataProvider('departures')]
+    #[Test]
+    public function it_dispatches_one_event_for_a_save_that_takes_a_member_out_of_every_order(Closure $reparent): void
+    {
+        [$parent, $leaving, $staying, $attributes] = $reparent();
+        $this->forget();
+
+        $leaving->update($attributes);
+
+        $this->assertCount(1, $this->dispatched);
+
+        $change = $this->dispatched[0]->change;
+
+        $this->assertSame($parent, $change->relation->parent);
+        $this->assertSame(array_map(fn (Model $member): mixed => $member->getKey(), $staying), $change->order);
+        $this->assertSame([['id' => $this->key($leaving), 'position' => null, 'previousPosition' => 1]], array_map(get_object_vars(...), $change->changed));
+        $this->assertSame($change->relation->concurrencyRevision(), $change->revision);
+        $this->assertNull($change->source);
+        $this->assertSame([$this->baseline], $this->levels);
+    }
+
+    /**
+     * @param  Closure(): array{Model&OrdersRelations&Revisioned, Model&Ordered, list<Model&Ordered>, array<string, mixed>}  $reparent
+     */
+    #[DataProvider('arrivals')]
+    #[Test]
+    public function it_dispatches_one_event_for_a_save_that_gives_a_member_a_parent(Closure $reparent): void
+    {
+        [$parent, $arriving, $members, $attributes] = $reparent();
+        $this->forget();
+
+        $arriving->update($attributes);
+
+        $this->assertCount(1, $this->dispatched);
+
+        $change = $this->dispatched[0]->change;
+
+        $this->assertTrue($parent->is($change->relation->parent));
+        $this->assertSame(array_map(fn (Model $member): mixed => $member->getKey(), [...$members, $arriving]), $change->order);
+        $this->assertSame([['id' => $this->key($arriving), 'position' => count($members) + 1, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
+        $this->assertSame($change->relation->concurrencyRevision(), $change->revision);
+        $this->assertNull($change->source);
+        $this->assertSame([$this->baseline], $this->levels);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_dispatches_one_event_for_each_parent_of_a_stale_restore_that_changes_the_parent(Shape $shape): void
+    {
+        [$source, [$restored]] = $shape->with(1);
+        [$destination, [$member]] = $shape->with(1);
+        $restored->delete();
+        $stale = $shape->find($this->key($restored));
+        assert(method_exists($restored, 'restore') && method_exists($stale, 'restore'));
+        $restored->restore();
+        $this->forget();
+
+        $shape->associate($stale, $destination);
+        $stale->restore();
+
+        $this->assertCount(2, $this->dispatched);
+
+        [$left, $entered] = [$this->dispatched[0]->change, $this->dispatched[1]->change];
+
+        $this->assertTrue($source->is($left->relation->parent));
+        $this->assertSame([], $left->order);
+        $this->assertSame([['id' => $this->key($stale), 'position' => null, 'previousPosition' => 1]], array_map(get_object_vars(...), $left->changed));
+        $this->assertSame($shape->storedRevision($source), $left->revision);
+
+        $this->assertSame($destination, $entered->relation->parent);
+        $this->assertSame([$member->getKey(), $stale->getKey()], $entered->order);
+        $this->assertSame([['id' => $this->key($stale), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $entered->changed));
         $this->assertSame($shape->storedRevision($destination), $entered->revision);
         $this->assertSame($left, $entered->source);
         $this->assertSame([$this->baseline, $this->baseline], $this->levels);

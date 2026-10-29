@@ -16,8 +16,10 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
+use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
@@ -36,6 +38,7 @@ use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\HasManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
+use Tests\Fixtures\Support\Shapes\Reparenting;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
@@ -100,6 +103,22 @@ class IsOrderedTest extends TestCase
     {
         yield 'while the first parent is locked' => [0];
         yield 'while the second parent is locked' => [1];
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): array{Model&OrdersRelations&Revisioned, Model&Ordered, list<Model&Ordered>, array<string, mixed>}}>
+     */
+    public static function departures(): iterable
+    {
+        return Reparenting::departures();
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): array{Model&OrdersRelations&Revisioned, Model&Ordered, list<Model&Ordered>, array<string, mixed>}}>
+     */
+    public static function arrivals(): iterable
+    {
+        return Reparenting::arrivals();
     }
 
     #[DataProvider('shapes')]
@@ -737,6 +756,130 @@ class IsOrderedTest extends TestCase
         $this->assertFalse($destination->isDirty());
         $this->assertSame($destination, $moved->orderingRelation()->parent);
         $this->assertSame(2, $moved->getAttribute('position'));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_places_a_member_without_a_rank_key_last_in_the_parent_a_save_moves_it_to(Shape $shape): void
+    {
+        [$source, [$moved, $staying]] = $shape->with(2);
+        [$destination, [$member]] = $shape->with(1);
+        DB::table($shape->memberTable())->where('id', $moved->getKey())->update(['rank_key' => null]);
+        $keyless = $shape->find($this->key($moved));
+
+        $this->assertTrue($keyless->update([$shape->foreignKey() => $destination->getKey()]));
+
+        $this->assertSame(2, $keyless->getAttribute('position'));
+        $this->assertSame($this->storedRankKey($shape, $keyless), $this->rankKey($keyless));
+        $this->assertFalse($keyless->isDirty());
+        $this->assertOrder($shape, [$member->getKey(), $moved->getKey()], $destination);
+        $this->assertOrder($shape, [$staying->getKey()], $source);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_gives_a_pivot_the_relation_excludes_a_new_last_key_in_the_parent_a_save_moves_it_to(PivotShape $shape): void
+    {
+        [$source, [$excluded]] = $shape->with(1);
+        [$destination, [$holder]] = $shape->with(1);
+        Customer::query()->findOrFail($excluded->getAttribute('customer_id'))->delete();
+
+        $this->assertSame($this->storedRankKey($shape, $holder), $this->storedRankKey($shape, $excluded));
+        $this->assertTrue($excluded->update([$shape->foreignKey() => $destination->getKey()]));
+
+        $this->assertNull($excluded->getAttribute('position'));
+        $this->assertSame($this->storedRankKey($shape, $excluded), $this->rankKey($excluded));
+        $this->assertFalse($excluded->isDirty());
+        $this->assertSame([$holder->getKey()], $shape->members($destination));
+        $this->assertSame([$holder->getKey(), $excluded->getKey()], $this->storedOrder($shape, $destination));
+        $this->assertSame([], $this->storedOrder($shape, $source));
+    }
+
+    /**
+     * @param  Closure(): array{Model&OrdersRelations&Revisioned, Model&Ordered, list<Model&Ordered>, array<string, mixed>}  $reparent
+     */
+    #[DataProvider('departures')]
+    #[Test]
+    public function it_clears_the_rank_key_of_a_member_that_a_save_takes_out_of_every_order(Closure $reparent): void
+    {
+        [, $leaving, [$staying], $attributes] = $reparent();
+
+        $this->assertTrue($leaving->update($attributes));
+
+        $this->assertNull($leaving->getAttribute('rank_key'));
+        $this->assertNull(DB::table($leaving->getTable())->where('id', $leaving->getKey())->value('rank_key'));
+        $this->assertNull($leaving->getAttribute('position'));
+        $this->assertFalse($leaving->isDirty());
+        $this->assertSame(1, $staying->getAttribute('position'));
+    }
+
+    /**
+     * @param  Closure(): array{Model&OrdersRelations&Revisioned, Model&Ordered, list<Model&Ordered>, array<string, mixed>}  $reparent
+     */
+    #[DataProvider('arrivals')]
+    #[Test]
+    public function it_places_a_member_that_a_save_gives_a_parent_last_in_that_parent(Closure $reparent): void
+    {
+        [, $arriving, $members, $attributes] = $reparent();
+
+        $this->assertTrue($arriving->update($attributes));
+
+        $this->assertSame(DB::table($arriving->getTable())->where('id', $arriving->getKey())->value('rank_key'), $this->rankKey($arriving));
+        $this->assertFalse($arriving->isDirty());
+        $this->assertSame(range(1, count($members) + 1), array_map(fn (Model $member): mixed => $member->getAttribute('position'), [...$members, $arriving]));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_moves_a_member_that_a_stale_restore_reparents_after_another_request_restored_it(Shape $shape): void
+    {
+        [$source, [$restored]] = $shape->with(1);
+        [$destination, [$holder]] = $shape->with(1);
+        $restored->delete();
+        $stale = $shape->find($this->key($restored));
+        assert(method_exists($restored, 'restore') && method_exists($stale, 'restore'));
+        $restored->restore();
+
+        $this->assertSame($this->storedRankKey($shape, $holder), $this->storedRankKey($shape, $restored));
+        $shape->associate($stale, $destination);
+        $this->assertTrue($stale->restore());
+
+        $this->assertSame(2, $stale->getAttribute('position'));
+        $this->assertSame($this->storedRankKey($shape, $stale), $this->rankKey($stale));
+        $this->assertFalse($stale->isDirty());
+        $this->assertOrder($shape, [$holder->getKey(), $restored->getKey()], $destination);
+        $this->assertOrder($shape, [], $source);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_keeps_the_rank_key_of_a_member_that_a_save_returns_to_its_parent_after_a_halted_reparent(Shape $shape): void
+    {
+        [$source, [$moved, $staying]] = $shape->with(2);
+        [$destination] = $shape->with(1);
+        $kept = $this->storedRankKey($shape, $moved);
+        $halt = true;
+
+        $shape->memberClass()::updating(function () use (&$halt): null|bool {
+            if (! $halt) {
+                return null;
+            }
+
+            $halt = false;
+
+            return false;
+        });
+
+        $shape->associate($moved, $destination);
+        $this->assertFalse($moved->save());
+        $shape->associate($moved, $source);
+
+        $this->assertTrue($moved->save());
+
+        $this->assertSame($kept, $this->storedRankKey($shape, $moved));
+        $this->assertSame($kept, $this->rankKey($moved));
+        $this->assertFalse($moved->isDirty());
+        $this->assertOrder($shape, [$moved->getKey(), $staying->getKey()], $source);
     }
 
     /**
