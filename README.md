@@ -8,7 +8,7 @@ This package builds on [`aryeo/eloquent-concurrency`](https://github.com/AryeoHQ
 
 ## Requirements
 
-- PHP 8.4 or later.
+- PHP 8.5 or later.
 - Laravel 12.37 or later, or Laravel 13.
 - PostgreSQL 14 or later. No other driver is supported. The rank key uses the byte collation `C`, and the order revision depends on PostgreSQL triggers. The eloquent-concurrency schema helpers throw `UnsupportedDriver` on any other connection.
 

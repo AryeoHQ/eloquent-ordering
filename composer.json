@@ -18,10 +18,10 @@
         }
     },
     "require": {
-        "php": "^8.4",
+        "php": "^8.5",
         "laravel/framework": "^12.37 || ^13",
-        "aryeo/eloquent-concurrency": "dev-feat/2026-10-24t1355-occ-versioning-m2",
-        "aryeo/tooling-laravel": "0.0.41"
+        "aryeo/eloquent-concurrency": "dev-main",
+        "aryeo/tooling-laravel": "0.0.43"
     },
     "require-dev": {
         "orchestra/testbench": "^10.6 || ^11",

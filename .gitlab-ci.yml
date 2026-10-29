@@ -39,6 +39,7 @@ tests:
     POSTGRES_PASSWORD: secret
     DB_CONNECTION: pgsql
     DB_HOST: postgres
+    TEST_COMMAND: ./vendor/bin/testbench package:test
   parallel:
     matrix:
       - COMPOSER_REQUIRE:
