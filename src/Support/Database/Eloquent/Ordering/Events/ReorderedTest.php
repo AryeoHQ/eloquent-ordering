@@ -712,45 +712,40 @@ class ReorderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_fires_no_updated_event_for_a_move_or_a_reorder(Shape $shape): void
+    public function it_fires_an_updated_event_for_each_member_a_move_or_a_reorder_rewrites(Shape $shape): void
     {
         [$parent, $members] = $shape->with(4);
         $ids = array_map(fn (Model $member): mixed => $member->getKey(), array_reverse($members));
         $this->countUpdatedEvents($shape);
         $this->forget();
+        $keys = [$shape->rankKeys($parent)];
 
         $members[3]->move(Placement::first(), null);
+        $keys[] = $shape->rankKeys($parent);
         $shape->orderedRelation($parent)->reorder($ids, null);
+        $keys[] = $shape->rankKeys($parent);
 
         $this->assertCount(2, $this->dispatched);
-        $this->assertSame(0, $this->updated);
+        $this->assertSame(count(array_diff_assoc($keys[1], $keys[0])) + count(array_diff_assoc($keys[2], $keys[1])), $this->updated);
+        $this->assertGreaterThan(1, $this->updated);
     }
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_fires_no_updated_event_for_a_rebalance(Shape $shape): void
+    public function it_reports_only_the_moved_member_for_a_move_that_rebalances(Shape $shape): void
     {
         [$parent, [$first, $second, $third]] = $shape->with(3);
+        $shape->crowd($first, $second);
         $this->countUpdatedEvents($shape);
         $this->forget();
-        $longest = 0;
-        $rebalanced = false;
-        $moves = 0;
 
-        for ($attempt = 0; ! $rebalanced && $attempt < 1000; $attempt++) {
-            $moving = $attempt % 2 === 0 ? $third : $second;
-            $moving->move(Placement::after($first->getKey()), null);
-            $moves++;
+        $change = $third->move(Placement::after($this->key($first)), null);
 
-            $length = strlen($this->rankKey($moving));
-            $rebalanced = $length < $longest;
-            $longest = $length;
-        }
-
-        $this->assertTrue($rebalanced);
-        $this->assertLessThanOrEqual(OrderedRelation::MAX_KEY_LENGTH, $shape->longestRankKey($parent));
-        $this->assertCount($moves, $this->dispatched);
-        $this->assertSame(0, $this->updated);
+        $this->assertLessThan(OrderedRelation::MAX_KEY_LENGTH, $shape->longestRankKey($parent));
+        $this->assertCount(1, $this->dispatched);
+        $this->assertSame($change, $this->dispatched[0]->change);
+        $this->assertSame([['id' => $this->key($third), 'position' => 2, 'previousPosition' => 3]], array_map(get_object_vars(...), $change->changed));
+        $this->assertSame(3, $this->updated);
     }
 
     #[DataProvider('shapes')]
@@ -776,15 +771,6 @@ class ReorderedTest extends TestCase
         $key = $member->getKey();
 
         $this->assertTrue(is_int($key) || is_string($key));
-
-        return $key;
-    }
-
-    private function rankKey(Model $member): string
-    {
-        $key = $member->getAttribute(OrderedRelation::RANK_KEY);
-
-        $this->assertIsString($key);
 
         return $key;
     }

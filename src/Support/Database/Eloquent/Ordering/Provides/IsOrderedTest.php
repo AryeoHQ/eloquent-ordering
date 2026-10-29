@@ -10,6 +10,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Process;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -30,6 +31,8 @@ use Tests\Fixtures\Support\Albums\Album;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Boards\Board;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Events\ModelEvents;
+use Tests\Fixtures\Support\Events\ModelUpdated;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Photos\Photo;
@@ -104,6 +107,17 @@ class IsOrderedTest extends TestCase
         return Shape::crossed([
             'a move that writes' => [Placement::first(), 1],
             'a move that keeps the order' => [Placement::last(), 2],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function refusals(): iterable
+    {
+        return Shape::crossed([
+            'a saving listener of the member' => [fn (Shape $shape, Model $parent): string => $shape->memberClass(), 'saving'],
+            'an updating listener of the parent' => [fn (Shape $shape, Model $parent): string => $parent::class, 'updating'],
         ]);
     }
 
@@ -1677,6 +1691,143 @@ class IsOrderedTest extends TestCase
         } finally {
             $this->finishRace([], $source, $destination);
         }
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_replays_the_model_events_of_a_member_and_its_parent_for_a_move_within_the_parent(Shape $shape): void
+    {
+        [$parent, [, , $moved]] = $shape->with(3);
+        $this->travel(1)->minutes();
+        [$member, $order] = [ModelEvents::row($moved), ModelEvents::row($parent)];
+        $events = ModelEvents::record();
+
+        $moved->move(Placement::first(), expected: null);
+
+        $this->assertSame([
+            ...ModelEvents::replay($moved, $member, ModelEvents::row($moved)),
+            ...ModelEvents::replay($parent, $order, ModelEvents::row($parent)),
+        ], $events->fired);
+        $this->assertArrayHasKey(OrderedRelation::RANK_KEY, $events->fired[0][4]);
+        $this->assertArrayHasKey($shape->column(), $events->fired[4][4]);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_replays_the_model_events_of_a_member_and_both_parents_for_a_move_between_parents(Shape $shape): void
+    {
+        [$source, [, $moved]] = $shape->with(2);
+        [$destination] = $shape->with(1);
+        $this->travel(1)->minutes();
+        $rows = array_map(ModelEvents::row(...), [$moved, $source, $destination]);
+        $events = ModelEvents::record();
+
+        $moved->move(Placement::last()->in($destination), expected: null);
+
+        $this->assertSame([
+            ...ModelEvents::replay($moved, $rows[0], ModelEvents::row($moved)),
+            ...ModelEvents::replay($source, $rows[1], ModelEvents::row($source)),
+            ...ModelEvents::replay($destination, $rows[2], ModelEvents::row($destination)),
+        ], $events->fired);
+        $this->assertSame([$shape->foreignKey() => $destination->getKey()], array_intersect_key($events->fired[0][4], [$shape->foreignKey() => true]));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_replays_the_model_events_of_a_member_whose_rank_key_a_soft_delete_clears(Shape $shape): void
+    {
+        [, [, $deleted]] = $shape->with(3);
+        $this->travel(1)->minutes();
+        $rankKey = $this->storedRankKey($shape, $deleted);
+        $events = ModelEvents::record();
+
+        $deleted->delete();
+
+        $this->assertSame(ModelEvents::replay($deleted, [OrderedRelation::RANK_KEY => $rankKey], [OrderedRelation::RANK_KEY => null]), $events->of($deleted));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_dispatches_the_updated_event_class_of_a_replayed_member_and_parent(Shape $shape): void
+    {
+        [$parent, [, $moved]] = $shape->with(2);
+        $updated = [];
+
+        Event::listen(ModelUpdated::class, function (ModelUpdated $event) use (&$updated): void {
+            $updated[] = [$event->model::class, $event->model->getKey()];
+        });
+
+        $moved->move(Placement::first(), expected: null);
+
+        $this->assertSame([[$moved::class, $moved->getKey()], [$parent::class, $parent->getKey()]], $updated);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_advances_the_updated_at_of_a_moved_member_and_not_of_its_parents(Shape $shape): void
+    {
+        [$source, [, $moved]] = $shape->with(2);
+        [$destination] = $shape->with(1);
+        $parents = fn (): array => [ModelEvents::row($source)['updated_at'], ModelEvents::row($destination)['updated_at']];
+        $before = $parents();
+
+        $this->travel(1)->minutes();
+        $moved->move(Placement::first(), expected: null);
+
+        $this->assertSame(now()->toDateTimeString(), ModelEvents::row($moved)['updated_at']);
+
+        $this->travel(1)->minutes();
+        $moved->move(Placement::last()->in($destination), expected: null);
+
+        $this->assertSame(now()->toDateTimeString(), ModelEvents::row($moved)['updated_at']);
+        $this->assertSame(now()->toDateTimeString(), $moved->getRawOriginal('updated_at'));
+        $this->assertFalse($moved->isDirty());
+        $this->assertSame($before, $parents());
+    }
+
+    /**
+     * @param  Closure(Shape, Model): string  $class
+     */
+    #[DataProvider('refusals')]
+    #[Test]
+    public function it_refuses_a_listener_that_changes_a_replayed_row(Shape $shape, Closure $class, string $event): void
+    {
+        [$parent, [$first, $moved]] = $shape->with(2);
+        $state = [$moved->getAttributes(), $moved->getRawOriginal(), $parent->getAttributes()];
+        $stored = [$shape->storedRevision($parent), $shape->rankKeys($parent)];
+
+        Event::listen(sprintf('eloquent.%s: %s', $event, $class($shape, $parent)), function (Model $model): void {
+            $model->setAttribute('updated_at', '2001-02-03 04:05:06');
+        });
+
+        try {
+            $moved->move(Placement::first(), expected: null);
+            $this->fail('A listener changed a replayed row.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString(sprintf('changed [updated_at] of [%s:', $class($shape, $parent)), $exception->getMessage());
+        }
+
+        $this->assertSame($stored, [$shape->storedRevision($parent), $shape->rankKeys($parent)]);
+        $this->assertSame($state, [$moved->getAttributes(), $moved->getRawOriginal(), $parent->getAttributes()]);
+        $this->assertOrder($shape, [$first->getKey(), $moved->getKey()], $parent);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_runs_none_of_its_own_listeners_for_a_replayed_member(Shape $shape): void
+    {
+        [, [, $moved]] = $shape->with(2);
+        [$destination] = $shape->with(1);
+        $events = ModelEvents::record();
+        DB::enableQueryLog();
+
+        $moved->move(Placement::first(), expected: null);
+        $moved->move(Placement::last()->in($destination), expected: null);
+
+        $locks = array_filter(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => $this->locksParent($shape, $query));
+
+        $this->assertCount(8, $events->of($moved));
+        $this->assertCount(3, $locks);
     }
 
     private function key(Model $member): int|string

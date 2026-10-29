@@ -12,6 +12,7 @@ use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Events\ModelUpdated;
 
 /**
  * @property string $id
@@ -29,6 +30,8 @@ class ListingCustomer extends Pivot implements Ordered
     use SoftDeletes;
 
     protected $table = 'listing_customer';
+
+    protected $dispatchesEvents = ['updated' => ModelUpdated::class];
 
     /**
      * @return BelongsTo<Listing, $this>

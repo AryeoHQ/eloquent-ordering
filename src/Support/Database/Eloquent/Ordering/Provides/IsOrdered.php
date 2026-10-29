@@ -16,6 +16,7 @@ use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Exceptions\ContendedOrder;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
+use Support\Database\Eloquent\Ordering\OrderWrite;
 use Support\Database\Eloquent\Ordering\Placement;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
 
@@ -45,6 +46,10 @@ trait IsOrdered
     public static function bootIsOrdered(): void
     {
         static::saving(static function (self $item): void {
+            if (OrderWrite::replays($item)) {
+                return;
+            }
+
             $uncommitted = $item->reparented !== null;
             $item->restoredInto = null;
             $item->reparented = null;
@@ -109,11 +114,15 @@ trait IsOrdered
         });
 
         static::registerModelEvent('trashed', static function (self $item): void {
-            $item->newQueryWithoutScopes()->whereKey($item->getKey())->toBase()->update([OrderedRelation::RANK_KEY => null]);
-            $item->setAttribute(OrderedRelation::RANK_KEY, null)->syncOriginalAttribute(OrderedRelation::RANK_KEY);
+            $written = OrderWrite::update($item, [$item->getKey()], [OrderedRelation::RANK_KEY => null]);
+            $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
         });
 
         static::saved(static function (self $item): void {
+            if (OrderWrite::replays($item)) {
+                return;
+            }
+
             $restored = $item->restoredInto;
             $reparented = $item->reparented;
             $item->restoredInto = null;
@@ -187,7 +196,7 @@ trait IsOrdered
     {
         throw_unless($this->exists, LogicException::class, sprintf('[%s] must be saved before it moves.', static::class));
 
-        return $this->getConnection()->transaction(function () use ($placement, $expected): OrderChange {
+        return OrderWrite::run($this, function () use ($placement, $expected): OrderChange {
             $destination = $placement->parent === null ? null : OrderedRelation::in($placement->parent, $this);
             $original = $this->getRawOriginal();
             [$source, , , $stored] = $this->lockCurrentOrderedRelations(static fn (): null|OrderedRelation => $destination);
@@ -310,9 +319,10 @@ trait IsOrdered
             $stored = $this->storedOrderedAttributes(OrderedRelation::membershipColumns($this));
             $current = $stored === null ? null : $this->resolveOrderedRelation($stored);
             $next = $resolveNext === null ? null : $resolveNext($stored);
+            $locked = [];
 
             try {
-                return $this->getConnection()->transaction(function () use ($stored, $current, $next, $moved): array {
+                return $this->getConnection()->transaction(function () use ($stored, $current, $next, $moved, &$locked): array {
                     $locked = OrderedRelation::lockAll([$current, $next]);
 
                     throw_unless($this->storedOrderedAttributes(OrderedRelation::membershipColumns($this)) === $stored, $moved);
@@ -321,6 +331,7 @@ trait IsOrdered
                 });
             } catch (RuntimeException $exception) {
                 throw_unless($exception === $moved, $exception);
+                OrderWrite::released($locked);
             }
         }
 
@@ -366,7 +377,7 @@ trait IsOrdered
         $result = null;
 
         try {
-            return $this->getConnection()->transaction(function () use ($write, $halted, &$result): null|bool|int {
+            return OrderWrite::run($this, function () use ($write, $halted, &$result): null|bool|int {
                 $result = $write();
 
                 throw_if($result === false, $halted);

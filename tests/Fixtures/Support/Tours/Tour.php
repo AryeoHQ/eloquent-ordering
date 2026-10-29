@@ -14,6 +14,7 @@ use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\Customerable;
+use Tests\Fixtures\Support\Events\ModelUpdated;
 use Tests\Fixtures\Support\Scenes\Scene;
 
 /**
@@ -31,6 +32,8 @@ class Tour extends Model implements OrdersRelations, Revisioned
     use HasOrderedRelations;
 
     protected $guarded = [];
+
+    protected $dispatchesEvents = ['updated' => ModelUpdated::class];
 
     /**
      * @return MorphMany<Scene, $this>

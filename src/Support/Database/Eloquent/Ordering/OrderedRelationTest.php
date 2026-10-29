@@ -25,6 +25,7 @@ use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
@@ -412,6 +413,77 @@ class OrderedRelationTest extends TestCase
 
         $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($parent));
         $this->assertSame($shape->storedRevision($parent), $change->revision);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_replays_the_model_events_of_each_member_a_reorder_rewrites_and_of_the_parent(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $this->travel(1)->minutes();
+        $rows = array_map(ModelEvents::row(...), [$first, $second, $third, $parent]);
+        $events = ModelEvents::record();
+
+        $shape->orderedRelation($parent)->reorder([$this->key($third), $this->key($second), $this->key($first)], expected: null);
+
+        $this->assertSame($rows[1], ModelEvents::row($second));
+        $this->assertSame([
+            ...ModelEvents::replay($third, $rows[2], ModelEvents::row($third)),
+            ...ModelEvents::replay($first, $rows[0], ModelEvents::row($first)),
+            ...ModelEvents::replay($parent, $rows[3], ModelEvents::row($parent)),
+        ], $events->fired);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_replays_the_model_events_of_each_member_a_rebalance_rewrites_once(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $shape->crowd($first, $second);
+        DB::table($shape->memberTable())->where('id', $third->getKey())->update([OrderedRelation::RANK_KEY => 'a5']);
+        $this->travel(1)->minutes();
+        $rows = array_map(ModelEvents::row(...), [$first, $second, $third, $parent]);
+        $events = ModelEvents::record();
+
+        $third->move(Placement::after($this->key($first)), expected: null);
+
+        $this->assertLessThan(OrderedRelation::MAX_KEY_LENGTH, $shape->longestRankKey($parent));
+        $this->assertSame([
+            ...ModelEvents::replay($first, $rows[0], ModelEvents::row($first)),
+            ...ModelEvents::replay($second, $rows[1], ModelEvents::row($second)),
+            ...ModelEvents::replay($third, $rows[2], ModelEvents::row($third)),
+            ...ModelEvents::replay($parent, $rows[3], ModelEvents::row($parent)),
+        ], $events->fired);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_advances_the_updated_at_of_each_member_a_reorder_rewrites_and_not_of_the_parent(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $stamps = fn (): array => array_map(fn (Model $model): mixed => ModelEvents::row($model)['updated_at'], [$first, $second, $third, $parent]);
+        $before = $stamps();
+        $this->travel(1)->minutes();
+
+        $shape->orderedRelation($parent)->reorder([$this->key($third), $this->key($second), $this->key($first)], expected: null);
+
+        $this->assertSame([now()->toDateTimeString(), $before[1], now()->toDateTimeString(), $before[3]], $stamps());
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_advances_the_updated_at_of_each_member_a_rebalance_rewrites_and_not_of_the_parent(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $shape->crowd($first, $second);
+        $stamps = fn (): array => array_map(fn (Model $model): mixed => ModelEvents::row($model)['updated_at'], [$first, $second, $third, $parent]);
+        $before = $stamps();
+        $this->travel(1)->minutes();
+
+        $shape->add($parent, Placement::after($this->key($first)));
+
+        $this->assertLessThan(OrderedRelation::MAX_KEY_LENGTH, $shape->longestRankKey($parent));
+        $this->assertSame([now()->toDateTimeString(), now()->toDateTimeString(), $before[2], $before[3]], $stamps());
     }
 
     /**

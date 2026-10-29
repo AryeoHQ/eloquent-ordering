@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
+use Tests\Fixtures\Support\Events\ModelUpdated;
 use Tests\Fixtures\Support\Sections\Section;
 
 /**
@@ -30,6 +31,8 @@ class Asset extends Model implements Ordered
     public const string VISIBLE_SCOPE = 'visible';
 
     protected $guarded = [];
+
+    protected $dispatchesEvents = ['updated' => ModelUpdated::class];
 
     /**
      * @return BelongsTo<Section, $this>

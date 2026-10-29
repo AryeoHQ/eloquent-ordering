@@ -177,6 +177,14 @@ abstract class Shape
         return $this->rows($parent)->orderBy('id')->pluck('rank_key', 'id')->all();
     }
 
+    public function crowd(Model $lower, Model $upper): void
+    {
+        $prefix = 'a0'.str_repeat('V', OrderedRelation::MAX_KEY_LENGTH - 3);
+
+        DB::table($this->memberTable())->where('id', $lower->getKey())->update(['rank_key' => $prefix.'V']);
+        DB::table($this->memberTable())->where('id', $upper->getKey())->update(['rank_key' => $prefix.'W']);
+    }
+
     public function longestRankKey(Model $parent): int
     {
         return (int) $this->rows($parent)->max(DB::raw('length(rank_key)'));

@@ -13,6 +13,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
+use Tests\Fixtures\Support\Events\ModelUpdated;
 use Tests\Fixtures\Support\Tours\Tour;
 
 /**
@@ -32,6 +33,8 @@ class Customerable extends MorphPivot implements Ordered
     use SoftDeletes;
 
     protected $table = 'customerables';
+
+    protected $dispatchesEvents = ['updated' => ModelUpdated::class];
 
     /**
      * @return MorphTo<Model, $this>

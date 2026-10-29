@@ -295,7 +295,20 @@ Every write that changes an order first locks the parent rows with `SELECT … F
 
 A `move()` re-reads the stored foreign key under the lock. If another transaction moved the item meanwhile, `move()` starts again against the new parent. After 5 such attempts it throws `ContendedOrder`.
 
-`move()`, `reorder()`, and every rebalance write through the query builder. They fire no model events and leave `updated_at` alone.
+## Model events
+
+The package writes items through the query builder, and the trigger writes the parent. After the last statement of a write, inside its transaction, the package replays Eloquent's update events for each row that it changed:
+
+- an item whose `rank_key` or foreign key a `move()`, a `reorder()`, a rebalance, or the soft delete listener wrote;
+- a parent whose order revision the write raised: a `move()`, a `reorder()`, a create or `attach()`, a delete or `detach()`, a `restore()`, and a save that changes the parent.
+
+Each replay fires `saving`, `updating`, `updated`, and `saved` on a fresh instance of the row's model. The instance holds the row read before the write as its original, and the row read after the write as its attributes. `getDirty()` therefore describes the write, and from `updated` on so does `getChanges()`. Observers, `Event::listen('eloquent.updated: …')` listeners, and `$dispatchesEvents` classes all receive the replay. Items replay first, then parents in lock order. One write replays each row once. A row that the caller saves through Eloquent fires its own events and never replays.
+
+The package's item writes also set `updated_at` when the item model uses timestamps. No write touches a parent's `updated_at`, because that change would raise the parent's own revision and fail a concurrent `If-Match`.
+
+- **A halt rolls the write back.** A `saving` or `updating` listener that returns `false` for a replayed instance halts the whole write. The transaction rolls back, no `Reordered` or `Rebalanced` dispatches, and the call throws `WriteHalted`. `save()` and `delete()` throw too, because the halted model is not the one the caller saved.
+- **A replayed row cannot change.** A `saving` or `updating` listener that changes an attribute of a replayed instance throws `LogicException`, and the write rolls back.
+- After a halt or a refusal, the caller's instance and each parent instance that the write locked keep the state that they had before the write.
 
 ## The `Reordered` event
 
@@ -320,6 +333,23 @@ Event::listen(Reordered::class, function (Reordered $event): void {
 | `restore()` | One when the stored row was trashed, and the item enters last. None when the relation excludes the restored row, or when another request already restored or force deleted the row. A restore of a row that another request already restored, and that also changes the parent, counts as a save that changes the parent. |
 | A move or reorder that keeps the order | None. |
 | A stale move, a halted write, or a rollback | None. |
+| Any write that rebalances | Unchanged. `Rebalanced` dispatches first, and the rebalance adds no `PositionChange`. |
+
+## The `Rebalanced` event
+
+A key longer than 64 characters makes the write rebalance the relation first. The rebalance rewrites the rank key of every row in that parent's order. `Rebalanced` announces it.
+
+```php
+use Support\Database\Eloquent\Ordering\Events\Rebalanced;
+
+Event::listen(Rebalanced::class, function (Rebalanced $event): void {
+    $event->relation;   // the OrderedRelation
+    $event->revision;   // the order revision after the write
+    $event->ids;        // the id of each row whose rank key the rebalance rewrote
+});
+```
+
+`Rebalanced` implements `ShouldDispatchAfterCommit`. It dispatches once per rebalanced relation per write, directly before that relation's `Reordered`, and carries the revision of that `Reordered`. It also dispatches when the write dispatches no `Reordered`, such as a create that the relation excludes. `ids` includes a row that the relation excludes. A rollback or a halt dispatches nothing.
 
 ## A bulk write bypasses Eloquent, and the trigger still counts
 
@@ -341,6 +371,8 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 - **Revision steps follow the statement count.** A move adds 1 to each affected parent. A reorder that changes `k` keys adds `k + 1`.
 - **`restore()` places the item last.** It assigns a new rank key under the parent lock, as a create does, and dispatches one `Reordered`. It discards a key that a bulk soft delete kept, because another member can hold that key now. A restore of a row that another request already restored, or force deleted, changes nothing and dispatches nothing, unless it also changes the parent of a restored row.
 - **An unsupported bulk write leaves stale keys.** A soft delete through a query keeps its rank key. A restore through a query keeps that stale key, and fails with `23505` when a live member holds it.
+- **A reorder or a rebalance of `n` members fires `n` sets of model events.** Each rewritten row replays `saving`, `updating`, `updated`, and `saved`. A listener that must ignore ordering-only changes can read `getChanges()`, or correlate with `Rebalanced`.
+- **A halted `restore()` keeps `deleted_at` null in memory.** `SoftDeletes::restore()` clears it before it calls `save()`, where the package's write starts. Every other attribute keeps its state.
 - **`reorder()` and a rebalance refresh no item instance in memory.** An instance keeps the `rank_key` it was read with, and a `Revisioned` item keeps its own revision. Reload the item.
 - **`attach([a, b])` and `detach([a, b])` dispatch one `Reordered` per pivot.** Each pivot row is one order write, and no batch API exists.
 - **The inverse side of a `MorphToMany` cannot be ordered.** Order it from the side that names the morph type. A `morphedByMany` relation throws `LogicException`.
@@ -363,4 +395,5 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 | `MembershipMismatch` (`InvalidArgumentException`) | `reorder()` does not list each current member exactly once. |
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
 | `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
-| `LogicException` | A relation is misdeclared, a model is unsaved, an item has no parent, or an item and its parent use different connections. |
+| `WriteHalted` (`RuntimeException`) | A `saving` or `updating` listener returned `false` for a replayed instance. The message names the model, its key, and the event. The write rolled back. |
+| `LogicException` | A relation is misdeclared, a model is unsaved, an item has no parent, an item and its parent use different connections, or a listener changed an attribute of a replayed instance. |

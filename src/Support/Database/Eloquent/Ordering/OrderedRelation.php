@@ -210,7 +210,7 @@ final class OrderedRelation
      */
     public function reorder(array $ids, null|int $expected): OrderChange
     {
-        return $this->parent->getConnection()->transaction(function () use ($ids, $expected): OrderChange {
+        return OrderWrite::run($this->parent, function () use ($ids, $expected): OrderChange {
             self::lockAll([$this]);
             $this->compareConcurrencyRevision($expected);
 
@@ -722,26 +722,29 @@ final class OrderedRelation
     {
         $keys = $this->rankKeys($this->indexedRows());
 
-        $this->rewrite($keys, array_combine(array_keys($keys), FractionalIndex::keysBetween(null, null, count($keys))));
+        OrderWrite::rebalanced($this, $this->rewrite($keys, array_combine(array_keys($keys), FractionalIndex::keysBetween(null, null, count($keys)))));
     }
 
     /**
      * @param  array<int|string, string>  $current
      * @param  array<int|string, string>  $next
+     * @return list<int|string>
      */
-    private function rewrite(array $current, array $next): void
+    private function rewrite(array $current, array $next): array
     {
         $changed = array_filter($next, static fn (string $key, int|string $id): bool => ($current[$id] ?? null) !== $key, ARRAY_FILTER_USE_BOTH);
 
         if ($changed === []) {
-            return;
+            return [];
         }
 
-        $this->itemRows(array_keys($changed))->update([self::RANK_KEY => null]);
+        OrderWrite::update($this->keys->item, array_keys($changed), [self::RANK_KEY => null]);
 
         foreach ($changed as $id => $key) {
-            $this->itemRows([$id])->update([self::RANK_KEY => $key]);
+            OrderWrite::update($this->keys->item, [$id], [self::RANK_KEY => $key]);
         }
+
+        return array_keys($changed);
     }
 
     /**
@@ -808,6 +811,7 @@ final class OrderedRelation
 
     private function announce(OrderChange $change): OrderChange
     {
+        OrderWrite::announcing($change);
         event(new Reordered($change));
 
         return $change;
@@ -843,8 +847,8 @@ final class OrderedRelation
      */
     private function write(Model $item, array $attributes): void
     {
-        $item->newQueryWithoutScopes()->whereKey($item->getKey())->toBase()->update($attributes);
-        $item->forceFill($attributes)->syncOriginalAttributes(array_keys($attributes));
+        $written = OrderWrite::update($item, [$item->getKey()], $attributes);
+        $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
 
         if ($item instanceof Revisioned) {
             $item->refreshConcurrencyRevisions();
@@ -928,17 +932,13 @@ final class OrderedRelation
         return $this->members()->whereIn($this->keys->item->getQualifiedKeyName(), $ids);
     }
 
-    /**
-     * @param  list<int|string>  $ids
-     */
-    private function itemRows(array $ids): Builder
-    {
-        return $this->keys->item->newQueryWithoutScopes()->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $ids);
-    }
-
     private function lock(): void
     {
-        $this->fillParent($this->parentRow()->lock('for no key update')->value($this->column()));
+        /** @var array<string, mixed> $row */
+        $row = (array) ($this->parentRow()->lock('for no key update')->first() ?? []);
+
+        OrderWrite::locked($this, $row);
+        $this->fillParent($row[$this->column()] ?? null);
     }
 
     private function parentRow(): Builder

@@ -26,15 +26,19 @@ use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
+use Support\Database\Eloquent\Ordering\Placement;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Clips\Clip;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\Customerable;
+use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
+use Tests\Fixtures\Support\Shapes\PivotShape;
+use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\Fixtures\Support\Videos\Video;
@@ -283,6 +287,106 @@ class HasOrderedRelationsTest extends TestCase
 
             return $parent;
         }, TourRevision::CustomersOrder, 'customers()'];
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function eloquentWrites(): iterable
+    {
+        yield from Shape::crossed([
+            'a create' => [static function (Shape $shape): array {
+                $parent = $shape->createParent();
+
+                return [[$parent], fn (): Model => $shape->add($parent), ['saving', 'saved']];
+            }],
+            'a soft delete' => [static function (Shape $shape): array {
+                [$parent, [, $member]] = $shape->with(2);
+
+                return [[$parent], fn (): mixed => $member->delete(), ['saving', 'updating', 'updated', 'saved']];
+            }],
+            'a force delete' => [static function (Shape $shape): array {
+                [$parent, [, $member]] = $shape->with(2);
+                assert(method_exists($member, 'forceDelete'));
+
+                return [[$parent], fn (): mixed => $member->forceDelete(), []];
+            }],
+            'a restore' => [static function (Shape $shape): array {
+                [$parent, [, $member]] = $shape->with(2);
+                $member->delete();
+                assert(method_exists($member, 'restore'));
+
+                return [[$parent], fn (): mixed => $member->restore(), ['saving', 'updating', 'updated', 'saved']];
+            }],
+            'a save that changes the parent' => [static function (Shape $shape): array {
+                [$source, [, $moved]] = $shape->with(2);
+                [$destination] = $shape->with(1);
+                $shape->associate($moved, $destination);
+
+                return [[$source, $destination], fn (): bool => $moved->save(), ['saving', 'updating', 'updated', 'saved']];
+            }],
+        ]);
+
+        foreach (PivotShape::pivots() as $name => [$shape]) {
+            yield "{$name}, an attach" => [$shape, static function (Shape $shape): array {
+                assert($shape instanceof PivotShape);
+                $parent = $shape->createParent();
+                $shape->customers($parent)->attach(Customer::create());
+
+                return [[$parent], function () use ($shape, $parent): void {
+                    $shape->customers($parent)->attach(Customer::create());
+                }, ['saving', 'saved']];
+            }];
+
+            yield "{$name}, a detach" => [$shape, static function (Shape $shape): array {
+                assert($shape instanceof PivotShape);
+                $parent = $shape->createParent();
+                [$first, $second] = [Customer::create(), Customer::create()];
+                $shape->customers($parent)->attach([$first->id, $second->id]);
+
+                return [[$parent], fn (): int => $shape->customers($parent)->detach($second), ['saving', 'updating', 'updated', 'saved']];
+            }];
+        }
+    }
+
+    /**
+     * @param  Closure(Shape): array{list<Model>, Closure(): mixed, list<string>}  $prepare
+     */
+    #[DataProvider('eloquentWrites')]
+    #[Test]
+    public function it_replays_the_model_events_of_each_parent_whose_order_an_eloquent_write_changes(Shape $shape, Closure $prepare): void
+    {
+        [$parents, $write, $member] = $prepare($shape);
+        $rows = array_map(ModelEvents::row(...), $parents);
+        $events = ModelEvents::record();
+
+        $write();
+
+        $this->assertSame(
+            array_merge(...array_map(fn (Model $parent, array $row): array => ModelEvents::replay($parent, $row, ModelEvents::row($parent)), $parents, $rows)),
+            $events->ofClass($parents[0]::class),
+        );
+        $this->assertSame($member, array_column($events->ofClass($shape->memberClass()), 0));
+    }
+
+    #[Test]
+    public function it_replays_the_model_events_of_a_parent_that_is_itself_an_ordered_item(): void
+    {
+        $video = $this->addVideo(Section::create());
+        [$first, $moved] = [$this->addClip($video), $this->addClip($video)];
+        $this->travel(1)->minutes();
+        $rows = [ModelEvents::row($moved), ModelEvents::row($video)];
+        $events = ModelEvents::record();
+        DB::enableQueryLog();
+
+        $moved->move(Placement::first(), expected: null);
+
+        $this->assertSame([
+            ...ModelEvents::replay($moved, $rows[0], ModelEvents::row($moved)),
+            ...ModelEvents::replay($video, $rows[1], ModelEvents::row($video)),
+        ], $events->fired);
+        $this->assertSame([], array_values(array_filter(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => str_contains($query, 'from "sections"'))));
+        $this->assertSame([$moved->id, $first->id], $video->orderedRelation(VideoRevision::ClipsOrder)->query()->pluck('id')->all());
     }
 
     #[Test]
@@ -757,5 +861,14 @@ class HasOrderedRelationsTest extends TestCase
         $video->save();
 
         return $video;
+    }
+
+    private function addClip(Video $video): Clip
+    {
+        $clip = new Clip;
+        $clip->video()->associate($video);
+        $clip->save();
+
+        return $clip;
     }
 }

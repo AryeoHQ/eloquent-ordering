@@ -12,6 +12,7 @@ use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Events\ModelUpdated;
 use Tests\Fixtures\Support\Videos\Video;
 
 /**
@@ -29,6 +30,8 @@ class Section extends Model implements OrdersRelations, Revisioned
     use HasOrderedRelations;
 
     protected $guarded = [];
+
+    protected $dispatchesEvents = ['updated' => ModelUpdated::class];
 
     /**
      * @return HasMany<Asset, $this>
