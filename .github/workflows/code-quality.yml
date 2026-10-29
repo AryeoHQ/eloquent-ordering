@@ -110,8 +110,11 @@ jobs:
           extensions: pdo_pgsql
           build_deps: libpq-dev
 
+      - name: Apply the Laravel and Testbench constraints
+        run: php-ci composer require "laravel/framework:${{ matrix.laravel }}" "orchestra/testbench:${{ matrix.testbench }}" --no-interaction --no-update
+
       - name: Install Composer dependencies
-        run: php-ci composer install --no-interaction
+        run: php-ci composer update --no-interaction
 
       - name: List installed Composer dependencies
         run: php-ci composer show -D
