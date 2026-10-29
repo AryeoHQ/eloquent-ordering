@@ -18,6 +18,7 @@ use Tests\Fixtures\Support\Photos\Photo;
 use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Shapes\Shape;
+use Tests\Fixtures\Support\Shapes\UuidMorphManyShape;
 use Tests\Fixtures\Support\Videos\Video;
 use Tests\TestCase;
 
@@ -58,6 +59,10 @@ class OrderedCollectionTest extends TestCase
         $items = [];
 
         foreach (Shape::all() as [$shape]) {
+            if ($shape instanceof UuidMorphManyShape) {
+                continue;
+            }
+
             foreach ([$shape->with(2), $shape->with(2)] as [, $members]) {
                 foreach ($members as $member) {
                     $items[] = $shape->find($this->key($member));

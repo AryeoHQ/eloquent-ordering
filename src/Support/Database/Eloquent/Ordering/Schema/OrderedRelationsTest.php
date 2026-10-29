@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Ordering\Schema;
 
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
@@ -12,10 +13,12 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Concurrency\Schema\ConcurrencyRevisions;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Galleries\Gallery;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
+use Tests\Fixtures\Support\Shapes\UuidMorphManyShape;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\TestCase;
@@ -34,6 +37,15 @@ class OrderedRelationsTest extends TestCase
         yield 'a pivot' => ['listing_customer', ['deleted_at', 'listing_id', 'rank_key']];
         yield 'a morph of two parent types' => ['scenes', ['deleted_at', 'rank_key', 'sceneable_id', 'sceneable_type']];
         yield 'a morph pivot' => ['customerables', ['customerable_id', 'customerable_type', 'deleted_at', 'rank_key']];
+        yield 'a uuid morph' => ['slides', ['deleted_at', 'rank_key', 'slideable_id', 'slideable_type']];
+    }
+
+    /**
+     * @return iterable<string, array{UuidMorphManyShape}>
+     */
+    public static function archetype(): iterable
+    {
+        yield UuidMorphManyShape::NAME => [new UuidMorphManyShape];
     }
 
     /**
@@ -232,6 +244,26 @@ class OrderedRelationsTest extends TestCase
         $this->assertSame(ListingRevision::ScenesOrder->value, TourRevision::ScenesOrder->value);
         $this->assertSame(1, $this->scenesRevision($tour));
         $this->assertSame(1, $this->scenesRevision($listing));
+    }
+
+    #[DataProvider('archetype')]
+    #[Test]
+    public function it_increments_the_order_revision_of_a_uuid_parent_that_a_row_names_by_its_morph_alias(UuidMorphManyShape $shape): void
+    {
+        $gallery = $shape->createParent();
+        $slide = $shape->add($gallery);
+
+        $this->assertTrue(Relation::requiresMorphMap());
+        $this->assertSame(Gallery::MORPH_ALIAS, DB::table('slides')->where('id', $slide->getKey())->value('slideable_type'));
+        $this->assertSame(2, $shape->storedRevision($gallery));
+
+        DB::table('slides')->insert(['id' => Str::uuid7()->toString(), 'slideable_type' => Gallery::class, 'slideable_id' => $gallery->id, 'rank_key' => 'a1']);
+
+        $this->assertSame(2, $shape->storedRevision($gallery));
+
+        DB::table('slides')->insert(['id' => Str::uuid7()->toString(), 'slideable_type' => Gallery::MORPH_ALIAS, 'slideable_id' => $gallery->id, 'rank_key' => 'a2']);
+
+        $this->assertSame(3, $shape->storedRevision($gallery));
     }
 
     private function scenesRevision(Tour|Listing $parent): int

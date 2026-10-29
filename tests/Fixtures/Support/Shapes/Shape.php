@@ -27,6 +27,7 @@ abstract class Shape
         yield 'morph many' => [new MorphManyShape];
         yield 'belongs to many' => [new BelongsToManyShape];
         yield 'morph to many' => [new MorphToManyShape];
+        yield UuidMorphManyShape::NAME => [new UuidMorphManyShape];
     }
 
     /**

@@ -45,7 +45,7 @@ use Support\Database\Eloquent\Concurrency\Schema\ConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
 
 Schema::create('sections', function (Blueprint $table): void {
-    $table->id();
+    $table->uuid('id')->primary();
     $table->string('name')->nullable();
     $table->concurrencyRevision();
     $table->namedConcurrencyRevision(SectionRevision::AssetsOrder->value);
@@ -55,8 +55,8 @@ Schema::create('sections', function (Blueprint $table): void {
 ConcurrencyRevisions::createTrigger('sections');
 
 Schema::create('assets', function (Blueprint $table): void {
-    $table->id();
-    $table->foreignId('section_id')->constrained();
+    $table->uuid('id')->primary();
+    $table->foreignUuid('section_id')->index()->constrained();
     $table->rankKey();
     $table->string('title')->nullable();
     $table->timestamps();
@@ -87,6 +87,7 @@ class Section extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
     use HasOrderedRelations;
+    use HasUuids;
 
     /** @return HasMany<Asset, $this> */
     public function assets(): HasMany
@@ -112,6 +113,7 @@ use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
 #[OrderedIn(Section::class)]
 class Asset extends Model implements Ordered
 {
+    use HasUuids;
     use IsOrdered;
     use SoftDeletes;
 }
@@ -149,8 +151,6 @@ $asset->orderingRelation();                                // the OrderedRelatio
 ```
 
 `orderedRelation()` throws `LogicException` when the parent declares no ordered relation for the revision. `orderingRelation()` throws `LogicException` when the item has no parent.
-
-If your project uses Rector with `AddInterfaceByTrait`, map `HasOrderedRelations` to `OrdersRelations` and `IsOrdered` to `Ordered`.
 
 ## Supported shapes
 
@@ -229,6 +229,8 @@ $assets->concurrencyRevision();          // the stored order revision, read on t
 
 **A row the relation excludes keeps its rank key.** A `where()` on the relation method excludes rows, and so does a soft delete of a pivot's related model. Such a row has no `position` and cannot be an anchor. It still holds its key in the unique index, so every new key and every rebalance avoids that key, and the row keeps its place.
 
+**Soft delete a related model's pivots with it.** An application that soft deletes a pivot's related model, such as a customer, must also soft delete that model's ordered pivots through Eloquent. Otherwise the relation drops the pivot while the order revision and `Reordered` stay silent, and a cached `ETag` goes stale.
+
 ## Placing a new item
 
 Associate the parent, then save. The item goes last by default.
@@ -281,7 +283,7 @@ Both outcomes leave the data unchanged. A move that keeps the order writes nothi
 
 After a move between parents, `$asset->orderingRelation()` returns the destination.
 
-A save through Eloquent that changes the parent, such as `$asset->update(['section_id' => $other->id])`, moves the item to the end of the new parent without an `expected` check, so use `move()` when the caller needs one. A save that leaves every parent, such as one that sets a nullable foreign key to `null`, clears the item's rank key.
+A save through Eloquent that changes the parent, such as `$asset->update(['section_id' => $other->id])`, moves the item to the end of the new parent without an `expected` check, so use `move()` when the caller needs one. Such a save is no substitute for ORD-08, which requires an API to return 422 for an update that would move an item to another ordered collection. A save that leaves every parent, such as one that sets a nullable foreign key to `null`, clears the item's rank key.
 
 ## Reordering a parent
 
@@ -418,4 +420,4 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
 | `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
 | `WriteHalted` (`RuntimeException`) | A `saving` or `updating` listener returned `false` for a replayed instance. The message names the model, its key, and the event. The write rolled back. |
-| `LogicException` | A relation is misdeclared, a model is unsaved, an item has no parent, an item and its parent use different connections, or a listener changed an attribute of a replayed instance. |
+| `LogicException` | A relation is misdeclared, a model is unsaved, an item has no parent, an item and its parent use different connections, a listener changed an attribute of a replayed instance, `withPositions()` ran on a query that `OrderedRelation::query()` did not return, or `loadPositions()` met a model that is not `Ordered`. |

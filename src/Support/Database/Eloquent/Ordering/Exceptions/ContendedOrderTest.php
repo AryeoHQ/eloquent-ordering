@@ -42,8 +42,11 @@ class ContendedOrderTest extends TestCase
 
             throw_if(++$reads > 10, RuntimeException::class, 'The member was read past five attempts.');
 
+            $row = DB::table($shape->memberTable())->where('id', $moved->getKey())->first();
+            $this->assertIsObject($row);
+
             DB::table($shape->memberTable())->where('id', $moved->getKey())->update([
-                $shape->foreignKey() => DB::raw(sprintf('case when "%s" = %d then %d else %d end', $shape->foreignKey(), $source->getKey(), $other->getKey(), $source->getKey())),
+                $shape->foreignKey() => $row->{$shape->foreignKey()} === $source->getKey() ? $other->getKey() : $source->getKey(),
             ]);
         });
 
