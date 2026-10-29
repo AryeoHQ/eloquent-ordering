@@ -687,6 +687,58 @@ class IsOrderedTest extends TestCase
         $this->assertSoftDeleted($member);
     }
 
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_places_a_member_whose_foreign_key_an_update_changes_last_in_its_new_parent(Shape $shape): void
+    {
+        [$source, [$moved, $staying]] = $shape->with(2);
+        [$destination, [$removed, $member]] = $shape->with(2);
+        $removed->forceDelete();
+
+        $this->assertTrue($moved->update([$shape->foreignKey() => $destination->getKey()]));
+
+        $this->assertSame(2, $moved->getAttribute('position'));
+        $this->assertSame($this->storedRankKey($shape, $moved), $this->rankKey($moved));
+        $this->assertFalse($moved->isDirty());
+        $this->assertOrder($shape, [$member->getKey(), $moved->getKey()], $destination);
+        $this->assertOrder($shape, [$staying->getKey()], $source);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_moves_a_member_by_an_update_into_a_parent_whose_member_holds_its_rank_key(Shape $shape): void
+    {
+        [$source, [$moved]] = $shape->with(1);
+        [$destination, [$holder]] = $shape->with(1);
+
+        $this->assertSame($this->storedRankKey($shape, $holder), $this->storedRankKey($shape, $moved));
+        $this->assertTrue($moved->update([$shape->foreignKey() => $destination->getKey()]));
+
+        $this->assertOrder($shape, [$holder->getKey(), $moved->getKey()], $destination);
+        $this->assertOrder($shape, [], $source);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_writes_both_order_revisions_into_the_parents_it_holds_after_a_reparenting_save(Shape $shape): void
+    {
+        [$source, [$moved]] = $shape->with(1);
+        [$destination] = $shape->with(1);
+        $revisions = [$shape->storedRevision($source), $shape->storedRevision($destination)];
+
+        $shape->associate($moved, $destination);
+        $this->assertTrue($moved->save());
+
+        $this->assertGreaterThan($revisions[0], $shape->storedRevision($source));
+        $this->assertGreaterThan($revisions[1], $shape->storedRevision($destination));
+        $this->assertSame($shape->storedRevision($source), $source->concurrencyRevision($shape->revision()));
+        $this->assertSame($shape->storedRevision($destination), $destination->concurrencyRevision($shape->revision()));
+        $this->assertFalse($source->isDirty());
+        $this->assertFalse($destination->isDirty());
+        $this->assertSame($destination, $moved->orderingRelation()->parent);
+        $this->assertSame(2, $moved->getAttribute('position'));
+    }
+
     /**
      * @param  list<int>  $expected
      */

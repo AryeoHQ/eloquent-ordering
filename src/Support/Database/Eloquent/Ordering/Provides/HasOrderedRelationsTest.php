@@ -4,17 +4,23 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Ordering\Provides;
 
+use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\MorphMany;
+use Illuminate\Database\Eloquent\Relations\MorphPivot;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Facades\DB;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversTrait;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use ReflectionClass;
+use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
@@ -26,9 +32,11 @@ use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\Customerable;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
+use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Tours\Tour;
+use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\Fixtures\Support\Videos\Video;
 use Tests\Fixtures\Support\Videos\VideoRevision;
 use Tests\TestCase;
@@ -37,6 +45,148 @@ use Tests\TestCase;
 #[CoversTrait(HasOrderedRelations::class)]
 class HasOrderedRelationsTest extends TestCase
 {
+    /**
+     * @return iterable<string, array{Closure(): (Model&OrdersRelations), NamesConcurrencyRevision, string}>
+     */
+    public static function softDeleteColumns(): iterable
+    {
+        yield 'has many' => [static function (): Model&OrdersRelations {
+            $item = new class extends Model implements Ordered
+            {
+                use IsOrdered;
+                use SoftDeletes;
+
+                public const string DELETED_AT = 'removed_at';
+
+                protected $table = 'assets';
+            };
+
+            $parent = new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+            {
+                use HasConcurrencyRevisions;
+                use HasOrderedRelations;
+
+                /** @var class-string<Model&Ordered> */
+                public string $itemClass = Asset::class;
+
+                protected $table = 'sections';
+
+                /**
+                 * @return HasMany<Model&Ordered, $this>
+                 */
+                public function assets(): HasMany
+                {
+                    return $this->hasMany($this->itemClass, 'section_id');
+                }
+            };
+            $parent->itemClass = $item::class;
+
+            return $parent;
+        }, SectionRevision::AssetsOrder, 'assets()'];
+
+        yield 'morph many' => [static function (): Model&OrdersRelations {
+            $item = new class extends Model implements Ordered
+            {
+                use IsOrdered;
+                use SoftDeletes;
+
+                public const string DELETED_AT = 'removed_at';
+
+                protected $table = 'scenes';
+            };
+
+            $parent = new #[OrdersRelation(TourRevision::ScenesOrder, relation: 'scenes')] class extends Model implements OrdersRelations, Revisioned
+            {
+                use HasConcurrencyRevisions;
+                use HasOrderedRelations;
+
+                /** @var class-string<Model&Ordered> */
+                public string $itemClass = Scene::class;
+
+                protected $table = 'tours';
+
+                /**
+                 * @return MorphMany<Model&Ordered, $this>
+                 */
+                public function scenes(): MorphMany
+                {
+                    return $this->morphMany($this->itemClass, 'sceneable');
+                }
+            };
+            $parent->itemClass = $item::class;
+
+            return $parent;
+        }, TourRevision::ScenesOrder, 'scenes()'];
+
+        yield 'belongs to many' => [static function (): Model&OrdersRelations {
+            $pivot = new class extends Pivot implements Ordered
+            {
+                use IsOrdered;
+                use SoftDeletes;
+
+                public const string DELETED_AT = 'removed_at';
+
+                protected $table = 'listing_customer';
+            };
+
+            $parent = new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+            {
+                use HasConcurrencyRevisions;
+                use HasOrderedRelations;
+
+                /** @var class-string<Pivot&Ordered> */
+                public string $pivotClass = ListingCustomer::class;
+
+                protected $table = 'listings';
+
+                /**
+                 * @return BelongsToMany<Customer, $this, Pivot&Ordered>
+                 */
+                public function customers(): BelongsToMany
+                {
+                    return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')->using($this->pivotClass);
+                }
+            };
+            $parent->pivotClass = $pivot::class;
+
+            return $parent;
+        }, ListingRevision::CustomersOrder, 'customers()'];
+
+        yield 'morph to many' => [static function (): Model&OrdersRelations {
+            $pivot = new class extends MorphPivot implements Ordered
+            {
+                use IsOrdered;
+                use SoftDeletes;
+
+                public const string DELETED_AT = 'removed_at';
+
+                protected $table = 'customerables';
+            };
+
+            $parent = new #[OrdersRelation(TourRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+            {
+                use HasConcurrencyRevisions;
+                use HasOrderedRelations;
+
+                /** @var class-string<MorphPivot&Ordered> */
+                public string $pivotClass = Customerable::class;
+
+                protected $table = 'tours';
+
+                /**
+                 * @return MorphToMany<Customer, $this, MorphPivot&Ordered>
+                 */
+                public function customers(): MorphToMany
+                {
+                    return $this->morphToMany(Customer::class, 'customerable')->using($this->pivotClass);
+                }
+            };
+            $parent->pivotClass = $pivot::class;
+
+            return $parent;
+        }, TourRevision::CustomersOrder, 'customers()'];
+    }
+
     #[Test]
     public function it_returns_the_ordered_relation_of_a_revision(): void
     {
@@ -431,6 +581,56 @@ class HasOrderedRelationsTest extends TestCase
             $this->assertStringContainsString($parent::class, $exception->getMessage());
             $this->assertStringContainsString('customers()', $exception->getMessage());
             $this->assertStringContainsString('legacy_id', $exception->getMessage());
+        }
+    }
+
+    /**
+     * @param  Closure(): (Model&OrdersRelations)  $parent
+     */
+    #[DataProvider('softDeleteColumns')]
+    #[Test]
+    public function it_rejects_an_item_that_soft_deletes_through_a_column_other_than_deleted_at(Closure $parent, NamesConcurrencyRevision $revision, string $relation): void
+    {
+        $parent = $parent();
+
+        foreach (['first', 'second'] as $call) {
+            try {
+                $parent->orderedRelation($revision);
+                $this->fail(sprintf('The %s call accepted an item that soft deletes through [removed_at].', $call));
+            } catch (LogicException $exception) {
+                $this->assertStringContainsString($parent::class, $exception->getMessage());
+                $this->assertStringContainsString($relation, $exception->getMessage());
+                $this->assertStringContainsString('removed_at', $exception->getMessage());
+            }
+        }
+    }
+
+    #[Test]
+    public function it_rejects_a_misdeclared_relation_on_every_call(): void
+    {
+        $parent = new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_legacy_id', 'legacy_id');
+            }
+        };
+
+        foreach (['first', 'second', 'third'] as $call) {
+            try {
+                $parent->orderedRelation(SectionRevision::AssetsOrder);
+                $this->fail(sprintf('The %s call accepted a HasMany relation with a custom owner key.', $call));
+            } catch (LogicException $exception) {
+                $this->assertStringContainsString('legacy_id', $exception->getMessage());
+            }
         }
     }
 

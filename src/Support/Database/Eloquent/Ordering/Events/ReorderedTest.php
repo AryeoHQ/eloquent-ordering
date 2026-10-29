@@ -82,6 +82,19 @@ class ReorderedTest extends TestCase
                 },
                 2,
             ],
+            'a save that changes the parent' => [
+                function (Shape $shape): Closure {
+                    [, [, $moved]] = $shape->with(2);
+                    [$destination] = $shape->with(1);
+
+                    return function () use ($shape, $moved, $destination): mixed {
+                        $shape->associate($moved, $destination);
+
+                        return $moved->save();
+                    };
+                },
+                2,
+            ],
             'a reorder' => [
                 function (Shape $shape): Closure {
                     [$parent, $members] = $shape->with(3);
@@ -243,6 +256,35 @@ class ReorderedTest extends TestCase
         $this->assertSame($change, $this->dispatched[1]->change);
         $this->assertSame($source, $this->dispatched[0]->change->relation->parent);
         $this->assertSame($destination, $this->dispatched[1]->change->relation->parent);
+        $this->assertSame([$this->baseline, $this->baseline], $this->levels);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_dispatches_one_event_for_each_parent_of_a_save_that_changes_the_parent(Shape $shape): void
+    {
+        [$source, [$first, $moved, $third]] = $shape->with(3);
+        [$destination, [$member]] = $shape->with(1);
+        $this->forget();
+
+        $shape->associate($moved, $destination);
+        $moved->save();
+
+        $this->assertCount(2, $this->dispatched);
+
+        [$left, $entered] = [$this->dispatched[0]->change, $this->dispatched[1]->change];
+
+        $this->assertSame($source, $left->relation->parent);
+        $this->assertSame([$first->getKey(), $third->getKey()], $left->order);
+        $this->assertSame([['id' => $this->key($moved), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $left->changed));
+        $this->assertSame($shape->storedRevision($source), $left->revision);
+        $this->assertNull($left->source);
+
+        $this->assertSame($destination, $entered->relation->parent);
+        $this->assertSame([$member->getKey(), $moved->getKey()], $entered->order);
+        $this->assertSame([['id' => $this->key($moved), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $entered->changed));
+        $this->assertSame($shape->storedRevision($destination), $entered->revision);
+        $this->assertSame($left, $entered->source);
         $this->assertSame([$this->baseline, $this->baseline], $this->levels);
     }
 

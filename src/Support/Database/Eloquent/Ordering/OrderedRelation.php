@@ -42,6 +42,15 @@ final class OrderedRelation
 
     private const string KEY_NAME = 'id';
 
+    /** @var array<class-string, array<class-string, list<object>>> */
+    private static array $attributes = [];
+
+    /** @var array<string, bool> */
+    private static array $declaredRelations = [];
+
+    /** @var array<string, true> */
+    private static array $validatedRelations = [];
+
     private readonly string $relationName;
 
     private readonly RelationKeys $keys;
@@ -251,6 +260,15 @@ final class OrderedRelation
         ]);
         $this->refreshWith($source);
 
+        return $this->entered($item, $source, $previous);
+    }
+
+    /**
+     * @internal
+     */
+    public function entered(Model&Ordered $item, self $source, int $previous): OrderChange
+    {
+        $id = self::keyOf($item);
         $left = $source->announce($source->change([$id => $previous]));
 
         return $this->announce($this->change([$id => null], $left));
@@ -409,15 +427,20 @@ final class OrderedRelation
      */
     private static function attributes(Model $model, string $attribute): array
     {
-        $instances = [];
+        if (! array_key_exists($attribute, self::$attributes[$model::class] ?? [])) {
+            $instances = [];
 
-        for ($class = new ReflectionClass($model); $class !== false; $class = $class->getParentClass()) {
-            foreach ($class->getAttributes($attribute) as $reflection) {
-                $instances[] = $reflection->newInstance();
+            for ($class = new ReflectionClass($model); $class !== false; $class = $class->getParentClass()) {
+                foreach ($class->getAttributes($attribute) as $reflection) {
+                    $instances[] = $reflection->newInstance();
+                }
             }
+
+            self::$attributes[$model::class][$attribute] = $instances;
         }
 
-        return $instances;
+        /** @var list<TAttribute> */
+        return self::$attributes[$model::class][$attribute];
     }
 
     /**
@@ -427,7 +450,7 @@ final class OrderedRelation
     {
         $message = sprintf('[%s::%s()] must return a HasMany, MorphMany, BelongsToMany, or MorphToMany relation to an Ordered model.', $parent::class, $name);
 
-        throw_unless(self::declaresOrderableRelation($parent, $name), LogicException::class, $message);
+        throw_unless(self::$declaredRelations[$parent::class.'::'.$name] ??= self::declaresOrderableRelation($parent, $name), LogicException::class, $message);
 
         $relation = $parent->{$name}();
 
@@ -447,9 +470,39 @@ final class OrderedRelation
 
         throw_unless(is_a(self::itemClass($relation), Ordered::class, true), LogicException::class, $message);
 
-        self::requireIdKeys($parent, $name, $relation);
+        $validated = $parent::class.'::'.$name.':'.self::itemClass($relation);
+
+        if (! array_key_exists($validated, self::$validatedRelations)) {
+            self::requireIdKeys($parent, $name, $relation);
+            self::requireSoftDeleteColumn($parent, $name, $relation);
+
+            self::$validatedRelations[$validated] = true;
+        }
 
         return $relation;
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     */
+    private static function requireSoftDeleteColumn(Model $parent, string $name, HasMany|MorphMany|BelongsToMany $relation): void
+    {
+        $item = self::describe($relation)->item;
+
+        if (! in_array(SoftDeletes::class, class_uses_recursive($item), true) || ! method_exists($item, 'getDeletedAtColumn')) {
+            return;
+        }
+
+        $column = $item->getDeletedAtColumn();
+
+        throw_unless($column === OrderedRelations::DELETED_AT, LogicException::class, sprintf(
+            '[%s::%s()] orders [%s], which soft deletes through [%s]. Ordered relations require the soft delete column [%s], because the order trigger and the rank key queries name it.',
+            $parent::class,
+            $name,
+            $item::class,
+            $column,
+            OrderedRelations::DELETED_AT,
+        ));
     }
 
     /**

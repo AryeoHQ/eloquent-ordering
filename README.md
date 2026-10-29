@@ -100,6 +100,8 @@ The relation method must be public and must declare its return type: `HasMany`, 
 
 **Keys must be named `id`.** The named revision trigger of eloquent-concurrency finds the parent by a column named `id`. The parent's primary key, the item's primary key, and the relation's owner key must therefore all be `id`. For a pivot relation, the parent key and the pivot's primary key count. A relation such as `hasMany(Asset::class, 'section_legacy_id', 'legacy_id')` throws `LogicException` when the relation resolves, because the trigger would raise the revision of another parent.
 
+**A soft-deleting item must use `deleted_at`.** An item whose `DELETED_AT` names another column throws `LogicException` when the relation resolves, because the order trigger and the rank key queries watch `deleted_at`.
+
 **4. Declare the item.** The item implements `Ordered` and uses `IsOrdered`. `#[OrderedIn]` is repeatable. It names each parent class.
 
 ```php
@@ -257,6 +259,8 @@ Both outcomes leave the data unchanged. A move that keeps the order writes nothi
 
 After a move between parents, `$asset->orderingRelation()` returns the destination.
 
+A save through Eloquent that changes the parent, such as `$asset->update(['section_id' => $other->id])`, moves the item to the end of the new parent without an `expected` check, so use `move()` when the caller needs one.
+
 ## Reordering a parent
 
 `reorder()` sets the whole order at once. List every current member exactly once.
@@ -289,7 +293,7 @@ Every write that changes an order first locks the parent rows with `SELECT … F
 - A delete, `move()`, and `reorder()` lock too.
 - A write that touches two parents locks them in `(morph class, key)` order. Two opposite moves between the same parents therefore never deadlock.
 
-A `move()` re-reads the stored foreign key under the lock. If another transaction moved the item meanwhile, `move()` starts again against the new parent.
+A `move()` re-reads the stored foreign key under the lock. If another transaction moved the item meanwhile, `move()` starts again against the new parent. After 5 such attempts it throws `ContendedOrder`.
 
 `move()`, `reorder()`, and every rebalance write through the query builder. They fire no model events and leave `updated_at` alone.
 
@@ -309,6 +313,7 @@ Event::listen(Reordered::class, function (Reordered $event): void {
 |---|---|
 | `move()` inside one parent | One. |
 | `move()` between parents | Two: the source first, then the destination. The destination's `change->source` holds the source change. |
+| A save through Eloquent that changes the parent | Two, with the same shapes as a `move()` between parents. |
 | `reorder()` | One. |
 | A create, including a pivot `attach()` | One. |
 | A delete, soft or force, including a pivot `detach()` | One. |
@@ -337,7 +342,6 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 - **`restore()` places the item last.** It assigns a new rank key under the parent lock, as a create does, and dispatches one `Reordered`. It discards a key that a bulk soft delete kept, because another member can hold that key now. A restore of a row that another request already restored, or force deleted, changes nothing and dispatches nothing.
 - **An unsupported bulk write leaves stale keys.** A soft delete through a query keeps its rank key. A restore through a query keeps that stale key, and fails with `23505` when a live member holds it.
 - **`reorder()` and a rebalance refresh no item instance in memory.** An instance keeps the `rank_key` it was read with, and a `Revisioned` item keeps its own revision. Reload the item.
-- **A foreign-key change saved through Eloquent keeps the old rank key.** It can collide in the new parent, and it dispatches nothing. Use `move()`.
 - **`attach([a, b])` and `detach([a, b])` dispatch one `Reordered` per pivot.** Each pivot row is one order write, and no batch API exists.
 - **The inverse side of a `MorphToMany` cannot be ordered.** Order it from the side that names the morph type. A `morphedByMany` relation throws `LogicException`.
 - **An item's class must match the relation's class exactly.** A subclass of the related model does not resolve. For a pivot relation, the `using()` class must be the item class.
@@ -358,4 +362,5 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 | `StaleConcurrencyRevision` (`RuntimeException`, from eloquent-concurrency) | `expected` does not match the stored order revision. |
 | `MembershipMismatch` (`InvalidArgumentException`) | `reorder()` does not list each current member exactly once. |
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
+| `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
 | `LogicException` | A relation is misdeclared, a model is unsaved, or an item has no parent. |
