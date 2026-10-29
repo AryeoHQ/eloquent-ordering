@@ -4,21 +4,15 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "55b72e12e5b880269511e28a03925aea",
+    "content-hash": "c445ea2adc7873cb0d895764c76210c3",
     "packages": [
         {
             "name": "aryeo/eloquent-concurrency",
-            "version": "dev-main",
-            "source": {
-                "type": "git",
-                "url": "git@github.com:AryeoHQ/eloquent-concurrency.git",
-                "reference": "0087eafaefdc254c1bccba386503bea6d7a0d91e"
-            },
+            "version": "0.0.2",
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/AryeoHQ/eloquent-concurrency/zipball/0087eafaefdc254c1bccba386503bea6d7a0d91e",
-                "reference": "0087eafaefdc254c1bccba386503bea6d7a0d91e",
-                "shasum": ""
+                "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/direct-dists/aryeo/eloquent-concurrency/eloquent-concurrency-0.0.2.zip",
+                "reference": "7d013f8dedb73badbbb30a0d28aea5e87550735a"
             },
             "require": {
                 "aryeo/tooling-laravel": "0.0.43",
@@ -30,7 +24,6 @@
                 "orchestra/testbench-core": "^10.7 || ^11",
                 "phpunit/phpunit": "^12.4.1 || ^13"
             },
-            "default-branch": true,
             "type": "library",
             "extra": {
                 "laravel": {
@@ -94,12 +87,7 @@
                     "email": "justinsel@zillowgroup.com"
                 }
             ],
-            "description": "Database-maintained concurrency revisions for Eloquent models",
-            "support": {
-                "source": "https://github.com/AryeoHQ/eloquent-concurrency/tree/0.0.1",
-                "issues": "https://github.com/AryeoHQ/eloquent-concurrency/issues"
-            },
-            "time": "2026-10-28T12:05:31+00:00"
+            "description": "Database-maintained concurrency revisions for Eloquent models"
         },
         {
             "name": "aryeo/tooling-laravel",
@@ -11219,9 +11207,7 @@
     ],
     "aliases": [],
     "minimum-stability": "stable",
-    "stability-flags": {
-        "aryeo/eloquent-concurrency": 20
-    },
+    "stability-flags": {},
     "prefer-stable": false,
     "prefer-lowest": false,
     "platform": {
