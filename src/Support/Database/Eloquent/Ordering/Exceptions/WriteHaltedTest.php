@@ -13,12 +13,14 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Ordering\Events\Rebalanced;
 use Support\Database\Eloquent\Ordering\Events\Reordered;
+use Support\Database\Eloquent\Ordering\OrderWrite;
 use Support\Database\Eloquent\Ordering\Placement;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\TestCase;
 
+#[CoversClass(OrderWrite::class)]
 #[CoversClass(WriteHalted::class)]
 class WriteHaltedTest extends TestCase
 {

@@ -45,6 +45,7 @@ use Throwable;
 #[CoversClass(MembershipMismatch::class)]
 #[CoversClass(OrderChange::class)]
 #[CoversClass(OrderedRelation::class)]
+#[CoversClass(OrderWrite::class)]
 class OrderedRelationTest extends TestCase
 {
     /**
