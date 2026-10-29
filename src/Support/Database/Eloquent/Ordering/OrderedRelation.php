@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering;
 
 use Closure;
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
@@ -16,6 +17,8 @@ use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\Query\Builder;
+use Illuminate\Database\Query\Expression;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
 use LogicException;
 use ReflectionClass;
@@ -39,6 +42,8 @@ final class OrderedRelation
     public const string RANK_KEY = 'rank_key';
 
     public const int MAX_KEY_LENGTH = 64;
+
+    public const string POSITION = 'position';
 
     private const string KEY_NAME = 'id';
 
@@ -190,6 +195,44 @@ final class OrderedRelation
     }
 
     /**
+     * @internal
+     *
+     * @param  array<array-key, Model>  $items
+     */
+    public static function loadPositions(array $items): void
+    {
+        $groups = [];
+
+        foreach ($items as $item) {
+            throw_unless($item instanceof Ordered, LogicException::class, sprintf('[%s] is not ordered, so it has no position.', $item::class));
+
+            if (! $item->exists) {
+                continue;
+            }
+
+            $membership = self::membershipNamedBy($item, $item->getAttributes());
+
+            if ($membership === null) {
+                self::fillPosition($item, null);
+
+                continue;
+            }
+
+            $group = implode(':', [$item::class, $item->getTable(), (string) $item->getConnectionName(), $membership['parent']::class, (string) $membership['revision']->value]);
+            $groups[$group] ??= [new self($membership['parent'], $membership['revision']), []];
+            $groups[$group][1][] = $item;
+        }
+
+        foreach ($groups as [$relation, $members]) {
+            $positions = $relation->positionsOf($members);
+
+            foreach ($members as $member) {
+                self::fillPosition($member, $positions[(string) self::keyOf($member)] ?? null);
+            }
+        }
+    }
+
+    /**
      * @return HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>
      */
     public function query(): Relation
@@ -199,6 +242,18 @@ final class OrderedRelation
         if ($relation instanceof BelongsToMany) {
             $relation->withPivot($this->keys->item->getKeyName());
         }
+
+        $selectPositions = $this->selectPositions(...);
+        $positioned = false;
+
+        $relation->getQuery()->macro('withPositions', function (EloquentBuilder $query) use ($selectPositions, $relation, &$positioned): EloquentBuilder {
+            if (! $positioned) {
+                $selectPositions($relation);
+                $positioned = true;
+            }
+
+            return $query;
+        });
 
         return $relation
             ->orderBy($this->keys->item->qualifyColumn(self::RANK_KEY))
@@ -658,6 +713,11 @@ final class OrderedRelation
         return is_string($key) ? $key : null;
     }
 
+    private static function fillPosition(Model $item, mixed $position): void
+    {
+        $item->forceFill([self::POSITION => $position])->syncOriginalAttributes([self::POSITION]);
+    }
+
     private static function keyOf(Model $item): int|string
     {
         $key = $item->getKey();
@@ -907,6 +967,70 @@ final class OrderedRelation
     private function members(): Builder
     {
         return $this->scopedRelation()->toBase();
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     */
+    private function selectPositions(HasMany|MorphMany|BelongsToMany $relation): void
+    {
+        $table = $this->keys->item->getTable();
+        $numbered = $this->numbered($this->members(), [$this->keys->item->qualifyColumn('*')]);
+        $query = $relation->getBaseQuery();
+
+        if (! $relation instanceof BelongsToMany) {
+            $query->fromSub($numbered, $table);
+
+            return;
+        }
+
+        $join = array_find($query->joins ?? [], static fn (JoinClause $join): bool => $join->table === $table)
+            ?? throw new LogicException(sprintf('[%s] does not join the pivot table [%s].', $relation::class, $table));
+
+        $join->table = new Expression(sprintf('(%s) as %s', $numbered->toSql(), $query->getGrammar()->wrapTable($table)));
+        $query->setBindings([...$numbered->getBindings(), ...$query->getRawBindings()['join']], 'join');
+        $relation->withPivot(self::POSITION);
+    }
+
+    /**
+     * @param  list<Model>  $items
+     * @return array<string, mixed>
+     */
+    private function positionsOf(array $items): array
+    {
+        $foreignKey = $this->keys->foreignKey;
+        $members = Relation::noConstraints(fn (): Builder => $this->scopedRelation()->toBase())
+            ->whereIn($this->keys->item->qualifyColumn($foreignKey), array_values(array_unique(array_map(static fn (Model $item): mixed => $item->getAttribute($foreignKey), $items))));
+
+        if ($this->keys->morphType !== null) {
+            $members->where($this->keys->item->qualifyColumn($this->keys->morphType), $this->keys->morphClass);
+        }
+
+        $table = $this->keys->item->getTable();
+
+        /** @var array<string, mixed> */
+        return $members->newQuery()
+            ->fromSub($this->numbered($members, [$this->keys->item->getQualifiedKeyName()]), $table)
+            ->whereIn($this->keys->item->getQualifiedKeyName(), array_map(self::keyOf(...), $items))
+            ->pluck(self::POSITION, $this->keys->item->getKeyName())
+            ->all();
+    }
+
+    /**
+     * @param  list<string>  $columns
+     */
+    private function numbered(Builder $members, array $columns): Builder
+    {
+        $grammar = $members->getGrammar();
+        $rankKey = $grammar->wrap($this->keys->item->qualifyColumn(self::RANK_KEY));
+
+        return $members->select($columns)->selectRaw(sprintf(
+            'case when %1$s is not null then row_number() over (partition by %2$s order by %1$s, %3$s) end as %4$s',
+            $rankKey,
+            $grammar->wrap($this->keys->item->qualifyColumn($this->keys->foreignKey)),
+            $grammar->wrap($this->keys->item->getQualifiedKeyName()),
+            $grammar->wrap(self::POSITION),
+        ));
     }
 
     private function indexedRows(): Builder

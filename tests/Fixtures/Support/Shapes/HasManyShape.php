@@ -76,6 +76,13 @@ final class HasManyShape extends Shape
         return new Asset(['visible' => ! $hidden]);
     }
 
+    public function item(Model $result): Asset
+    {
+        assert($result instanceof Asset);
+
+        return $result;
+    }
+
     protected function memberKey(Model $result): int
     {
         assert($result instanceof Asset);

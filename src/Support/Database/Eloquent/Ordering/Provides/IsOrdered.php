@@ -97,6 +97,7 @@ trait IsOrdered
         });
 
         static::creating(static function (self $item): void {
+            $item->forgetPosition();
             $item->setAttribute(OrderedRelation::RANK_KEY, $item->orderingRelation()->keyAt($item->placement ?? Placement::last()));
         });
 
@@ -131,6 +132,10 @@ trait IsOrdered
             $item->refreshLockedOrderedRelations();
             $restored?->placed($item);
 
+            if ($restored !== null || $reparented !== null) {
+                $item->forgetPosition();
+            }
+
             if ($reparented === null) {
                 return;
             }
@@ -155,6 +160,7 @@ trait IsOrdered
         static::deleted(static function (self $item): void {
             $vacated = $item->vacatedPosition;
             $item->vacatedPosition = null;
+            $item->forgetPosition();
 
             foreach ($item->refreshLockedOrderedRelations() as $relation) {
                 if ($vacated !== null) {
@@ -223,6 +229,7 @@ trait IsOrdered
 
             $this->followMovedParent([$original, $stored], $change->relation->parent);
             $this->resolvedOrderedRelation = $change->relation;
+            $this->forgetPosition();
 
             return $change;
         });
@@ -239,9 +246,16 @@ trait IsOrdered
      */
     protected function position(): Attribute
     {
-        return Attribute::make(get: fn (): null|int => $this->exists
-            ? $this->resolveOrderedRelation($this->getAttributes())?->position($this)
-            : null);
+        return Attribute::make(get: fn (mixed $value): null|int => match (true) {
+            ! $this->exists => null,
+            array_key_exists(OrderedRelation::POSITION, $this->attributes) => $value === null ? null : intval($value),
+            default => $this->resolveOrderedRelation($this->getAttributes())?->position($this),
+        });
+    }
+
+    private function forgetPosition(): void
+    {
+        unset($this->attributes[OrderedRelation::POSITION], $this->original[OrderedRelation::POSITION]);
     }
 
     /**

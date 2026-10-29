@@ -51,13 +51,18 @@ abstract class PivotShape extends Shape
         return new $class(['customer_id' => Customer::create(['visible' => ! $hidden])->id]);
     }
 
-    protected function memberKey(Model $result): int|string
+    public function item(Model $result): Model&Ordered
     {
         $pivot = $result->getRelation('pivot');
 
-        assert($pivot instanceof Pivot);
+        assert($pivot instanceof Pivot && $pivot instanceof Ordered);
 
-        $key = $pivot->getKey();
+        return $pivot;
+    }
+
+    protected function memberKey(Model $result): int|string
+    {
+        $key = $this->item($result)->getKey();
 
         assert(is_string($key));
 

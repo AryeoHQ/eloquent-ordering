@@ -72,6 +72,13 @@ final class MorphManyShape extends Shape
         return new Scene(['visible' => ! $hidden]);
     }
 
+    public function item(Model $result): Scene
+    {
+        assert($result instanceof Scene);
+
+        return $result;
+    }
+
     protected function memberKey(Model $result): string
     {
         assert($result instanceof Scene);

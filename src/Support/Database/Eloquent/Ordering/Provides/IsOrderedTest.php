@@ -25,6 +25,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\OrderChange;
+use Support\Database\Eloquent\Ordering\OrderedCollection;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
 use Tests\Fixtures\Support\Albums\Album;
@@ -153,6 +154,144 @@ class IsOrderedTest extends TestCase
     public static function arrivals(): iterable
     {
         return Reparenting::arrivals();
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function reorderingWrites(): iterable
+    {
+        return Shape::crossed([
+            'a move' => [static function (Shape $shape): array {
+                [, [, , $member]] = $shape->with(3);
+
+                return [$member, fn (Model&Ordered $member): mixed => $member->move(Placement::first(), expected: null), 3, 1];
+            }],
+            'a save that changes the parent' => [static function (Shape $shape): array {
+                [, [$member]] = $shape->with(2);
+                [$destination] = $shape->with(1);
+
+                return [$member, fn (Model&Ordered $member): mixed => $member->update([$shape->foreignKey() => $destination->getKey()]), 1, 2];
+            }],
+            'a soft delete' => [static function (Shape $shape): array {
+                [, [, $member]] = $shape->with(2);
+
+                return [$member, fn (Model&Ordered $member): mixed => $member->delete(), 2, null];
+            }],
+            'a restore' => [static function (Shape $shape): array {
+                [, [$member]] = $shape->with(3);
+                $member->delete();
+
+                return [$member, static function (Model&Ordered $member): mixed {
+                    assert(method_exists($member, 'restore'));
+
+                    return $member->restore();
+                }, null, 3];
+            }],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function positionedWrites(): iterable
+    {
+        return Shape::crossed([
+            'a move' => [fn (Shape $shape, Model&Ordered $member, Model $destination): mixed => $member->move(Placement::first(), expected: null)],
+            'a move between parents' => [fn (Shape $shape, Model&Ordered $member, Model $destination): mixed => $member->move(Placement::first()->in($destination), expected: null)],
+            'a save that changes the parent' => [fn (Shape $shape, Model&Ordered $member, Model $destination): mixed => $member->update([$shape->foreignKey() => $destination->getKey()])],
+        ]);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_reads_a_selected_position_without_a_query_and_counts_one_it_did_not_select(Shape $shape): void
+    {
+        [$parent, [, $second]] = $shape->with(3);
+        $selected = $shape->orderedRelation($parent)->query()->withPositions()->get();
+        $unselected = $shape->find($this->key($second));
+        DB::enableQueryLog();
+
+        $this->assertSame([1, 2, 3], $selected->map(fn (Model $result): mixed => $shape->item($result)->getAttribute('position'))->all());
+        $this->assertSame([], DB::getQueryLog());
+        $this->assertSame(2, $unselected->getAttribute('position'));
+        $this->assertNotSame([], DB::getQueryLog());
+    }
+
+    #[DataProvider('reorderingWrites')]
+    #[Test]
+    public function it_counts_the_position_again_after_a_write_that_changes_its_order(Shape $shape, Closure $case): void
+    {
+        [$member, $write, $before, $after] = $case($shape);
+        (new OrderedCollection([$member]))->loadPositions();
+        DB::enableQueryLog();
+
+        $this->assertSame($before, $member->getAttribute('position'));
+        $this->assertSame([], DB::getQueryLog());
+
+        $write($member);
+
+        $this->assertArrayNotHasKey(OrderedRelation::POSITION, $member->getAttributes());
+        $this->assertSame($after, $member->getAttribute('position'));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_saves_a_member_with_a_selected_position_without_writing_it(Shape $shape): void
+    {
+        [$parent] = $shape->with(2);
+        $member = $shape->item($shape->orderedRelation($parent)->query()->withPositions()->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 2));
+        DB::enableQueryLog();
+
+        $member->setAttribute('title', 'Dusk');
+
+        $this->assertTrue($member->save());
+        $this->assertFalse($member->isDirty());
+        $this->assertSame(2, $member->getAttribute('position'));
+        $this->assertSame('Dusk', DB::table($shape->memberTable())->where('id', $member->getKey())->value('title'));
+        $this->assertCount(1, $this->writes());
+        $this->assertStringNotContainsString('position', $this->writes()[0]);
+    }
+
+    #[DataProvider('positionedWrites')]
+    #[Test]
+    public function it_replays_no_position_for_a_member_with_a_selected_position(Shape $shape, Closure $write): void
+    {
+        [$parent] = $shape->with(3);
+        [$destination] = $shape->with(1);
+        $member = $shape->item($shape->orderedRelation($parent)->query()->withPositions()->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 3));
+        $events = ModelEvents::record();
+        DB::enableQueryLog();
+
+        $write($shape, $member, $destination);
+
+        $this->assertNotSame([], $events->fired);
+
+        foreach ($events->fired as [, , , $original, $changed]) {
+            $this->assertArrayNotHasKey(OrderedRelation::POSITION, $original);
+            $this->assertArrayNotHasKey(OrderedRelation::POSITION, $changed);
+        }
+
+        $this->assertStringNotContainsString('"position"', implode(' ', $this->writes()));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_writes_no_selected_position_for_a_copy_of_a_member(Shape $shape): void
+    {
+        [, [$member]] = $shape->with(1);
+        $positioned = $shape->find($this->key($member));
+        (new OrderedCollection([$positioned]))->loadPositions();
+
+        $copy = $positioned->replicate();
+
+        if ($shape instanceof PivotShape) {
+            $copy->setAttribute('customer_id', Customer::create()->id);
+        }
+
+        $this->assertTrue($copy->save());
+        $this->assertArrayNotHasKey(OrderedRelation::POSITION, $copy->getAttributes());
+        $this->assertSame(2, $copy->getAttribute('position'));
     }
 
     #[DataProvider('shapes')]

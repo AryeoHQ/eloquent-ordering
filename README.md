@@ -119,6 +119,28 @@ class Asset extends Model implements Ordered
 
 `IsOrdered` hides `rank_key` from serialization and adds a read-only `position` attribute (1-based, `null` until the item has a place). A model must never write `rank_key` itself. The traits do that.
 
+Three readers fill `position`. Each one counts the rows that the parent's relation returns, as `OrderChange::$order` lists them. A trashed row, a row that the relation excludes, and a row without a rank key have no position.
+
+- **The accessor.** `$asset->position` returns a position that a query or `loadPositions()` selected, and runs no query. Without a selected value, it counts with queries.
+- **`withPositions()`** numbers the query that `query()` returns, in one query. The caller's filters, order, limit, and offset apply after the numbering, in either call order. A filter therefore hides rows without renumbering the rest, and page 3 of 15 still starts at position 31. For a pivot relation, the pivot carries `position`. On any other query, `withPositions()` throws `LogicException`.
+- **`loadPositions()`** sets `position` on each item of an `OrderedCollection`. It runs one query per item class and relation, so the items can come from several parents and classes. An item with no position gets `null`, and an item that is not `Ordered` throws `LogicException`.
+
+```php
+$assets = $section->orderedRelation(SectionRevision::AssetsOrder)
+    ->query()
+    ->withPositions()
+    ->where('title', 'like', 'Dusk%')
+    ->paginate(15);
+
+$results = Asset::query()->where('title', 'like', 'Dusk%')->get()
+    ->concat(Scene::query()->where('title', 'like', 'Dusk%')->get())
+    ->loadPositions();
+```
+
+Declare `#[CollectedBy(OrderedCollection::class)]` on an item to make its queries return an `OrderedCollection`. Wrap other items, such as the pivots of a relation's results, in `new OrderedCollection($items)`.
+
+A selected `position` is never dirty, and no save writes it. `move()`, a save that changes the parent, a delete, and `restore()` drop it from that instance, so the accessor counts again. A write by another request does not change it.
+
 The parent resolves a relation with `orderedRelation()`, and the item with `orderingRelation()`:
 
 ```php
@@ -380,7 +402,7 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 - **The parent key, the owner key, and the item key must be named `id`.** Any other name throws `LogicException`.
 - **One parent orders an item class in one relation only.** Declaring two relations for one class, or two relations under one revision, throws `LogicException`.
 - **A key longer than 64 characters triggers a rebalance.** The rebalance rewrites every member of the parent, and adds `n + 1` to the revision.
-- **Listing positions costs queries.** The `position` attribute runs a query per item. Use `query()` order, or `OrderChange::$order`, to list a whole relation.
+- **The accessor's fallback costs queries.** Without a selected value, `position` counts with queries for each item. Number a list with `withPositions()` or `loadPositions()` instead.
 - **A create or delete reads the whole order.** It builds `OrderChange::$order`, which lists every member, so the cost grows with the relation.
 - **`Placement::in()` does not work on a create.** Associate the parent instead.
 - **A move between parent classes unsets the item's loaded relation** for the old parent. It does not set the new one.

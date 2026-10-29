@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Facades\DB;
+use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
@@ -30,6 +31,7 @@ use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
+use Tests\Fixtures\Support\Shapes\HasManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\TestCase;
@@ -82,6 +84,135 @@ class OrderedRelationTest extends TestCase
             'the only member' => [1, fn (array $ids): array => $ids, true],
             'an empty order' => [0, fn (array $ids): array => [], true],
         ]);
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function positionedQueries(): iterable
+    {
+        return Shape::crossed([
+            'a filter after withPositions()' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->withPositions()->whereIn($column, $ids)->get()],
+            'a filter before withPositions()' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->whereIn($column, $ids)->withPositions()->get()],
+            'withPositions() twice' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->withPositions()->whereIn($column, $ids)->withPositions()->get()],
+        ]);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_numbers_every_member_in_one_query_as_the_accessor_and_the_order_change_do(Shape $shape): void
+    {
+        [$parent, $members] = $shape->with(4);
+        $shape->add($parent, hidden: true);
+        $change = $members[2]->move(Placement::first(), expected: null);
+        DB::enableQueryLog();
+
+        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->withPositions()->get());
+
+        $this->assertCount(1, DB::getQueryLog());
+        $this->assertSame(array_combine($change->order, range(1, count($change->order))), $positions);
+        $this->assertSame($positions, array_map(fn (int|string $id): mixed => $shape->find($id)->getAttribute('position'), array_combine(array_keys($positions), array_keys($positions))));
+    }
+
+    #[DataProvider('positionedQueries')]
+    #[Test]
+    public function it_numbers_the_members_a_filter_keeps_by_their_place_among_every_member(Shape $shape, Closure $query): void
+    {
+        [$parent, [, $second, , $fourth]] = $shape->with(4);
+
+        $positions = $shape->selectedPositions($query($shape->orderedRelation($parent), $shape->memberTable().'.id', [$second->getKey(), $fourth->getKey()]));
+
+        $this->assertSame([$second->getKey() => 2, $fourth->getKey() => 4], $positions);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_keeps_the_position_of_each_member_on_a_later_page(Shape $shape): void
+    {
+        [$parent, $members] = $shape->with(5);
+
+        $page = $shape->orderedRelation($parent)->query()->withPositions()->paginate(2, page: 2);
+
+        $this->assertSame(5, $page->total());
+        $this->assertSame([$members[2]->getKey() => 3, $members[3]->getKey() => 4], $shape->selectedPositions($page->items()));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_numbers_no_trashed_member(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $second->delete();
+
+        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->withPositions()->get());
+
+        $this->assertSame([$first->getKey() => 1, $third->getKey() => 2], $positions);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_numbers_no_pivot_whose_customer_is_trashed(PivotShape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        Customer::query()->findOrFail($second->getAttribute('customer_id'))->delete();
+
+        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->withPositions()->get());
+
+        $this->assertSame([$first->getKey() => 1, $third->getKey() => 2], $positions);
+        $this->assertNull($shape->find($this->key($second))->getAttribute('position'));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_gives_no_position_to_a_member_without_a_rank_key(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        DB::table($shape->memberTable())->where('id', $first->getKey())->update([OrderedRelation::RANK_KEY => null]);
+
+        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->withPositions()->get());
+
+        $this->assertSame([$second->getKey() => 1, $third->getKey() => 2, $first->getKey() => null], $positions);
+        $this->assertNull($shape->find($this->key($first))->getAttribute('position'));
+    }
+
+    #[Test]
+    public function it_numbers_no_row_its_relation_excludes(): void
+    {
+        $section = Section::create();
+        $first = $this->addAsset($section, 'Shown');
+        $this->addAsset($section, 'Excluded');
+        $last = $this->addAsset($section, 'Shown');
+
+        $parent = (new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('title', 'Shown');
+            }
+        })->newQuery()->findOrFail($section->id);
+
+        $positions = (new HasManyShape)->selectedPositions($parent->orderedRelation(SectionRevision::AssetsOrder)->query()->withPositions()->get());
+
+        $this->assertSame([$first->id => 1, $last->id => 2], $positions);
+    }
+
+    #[Test]
+    public function it_numbers_only_the_query_of_an_ordered_relation(): void
+    {
+        try {
+            Section::create()->assets()->withPositions();
+            $this->fail('A relation that no ordered relation returned was numbered.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString('[withPositions()] numbers only a query that', $exception->getMessage());
+        }
     }
 
     #[DataProvider('shapes')]

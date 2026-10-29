@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Customers;
 
+use Illuminate\Database\Eloquent\Attributes\CollectedBy;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -12,6 +13,7 @@ use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
+use Support\Database\Eloquent\Ordering\OrderedCollection;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
 use Tests\Fixtures\Support\Events\ModelUpdated;
 use Tests\Fixtures\Support\Tours\Tour;
@@ -25,6 +27,7 @@ use Tests\Fixtures\Support\Tours\Tour;
  * @property string|null $title
  * @property-read int|null $position
  */
+#[CollectedBy(OrderedCollection::class)]
 #[OrderedIn(Tour::class)]
 class Customerable extends MorphPivot implements Ordered
 {

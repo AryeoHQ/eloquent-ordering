@@ -4,12 +4,14 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Listings;
 
+use Illuminate\Database\Eloquent\Attributes\CollectedBy;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
+use Support\Database\Eloquent\Ordering\OrderedCollection;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Events\ModelUpdated;
@@ -22,6 +24,7 @@ use Tests\Fixtures\Support\Events\ModelUpdated;
  * @property string|null $title
  * @property-read int|null $position
  */
+#[CollectedBy(OrderedCollection::class)]
 #[OrderedIn(Listing::class)]
 class ListingCustomer extends Pivot implements Ordered
 {

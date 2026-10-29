@@ -72,6 +72,8 @@ abstract class Shape
 
     abstract protected function make(bool $hidden): Model&Ordered;
 
+    abstract public function item(Model $result): Model&Ordered;
+
     abstract protected function memberKey(Model $result): int|string;
 
     /**
@@ -140,6 +142,25 @@ abstract class Shape
     public function members(Model&OrdersRelations $parent): array
     {
         return $this->orderedRelation($parent)->query()->get()->map(fn (Model $result): int|string => $this->memberKey($result))->values()->all();
+    }
+
+    /**
+     * @param  iterable<Model>  $results
+     * @return array<int|string, mixed>
+     */
+    public function selectedPositions(iterable $results): array
+    {
+        $positions = [];
+
+        foreach ($results as $result) {
+            $attributes = $this->item($result)->getAttributes();
+
+            assert(array_key_exists(OrderedRelation::POSITION, $attributes));
+
+            $positions[$this->memberKey($result)] = $attributes[OrderedRelation::POSITION];
+        }
+
+        return $positions;
     }
 
     /**
