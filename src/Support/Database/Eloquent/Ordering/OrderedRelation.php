@@ -77,33 +77,25 @@ final class OrderedRelation
      */
     public static function of(Model&Ordered $item, array $attributes, array $held = []): null|self
     {
-        $memberships = array_values(array_filter(
-            self::memberships($item),
-            static fn (array $membership): bool => $membership['keys']->names($attributes),
-        ));
+        $membership = self::membershipNamedBy($item, $attributes);
 
-        if ($memberships === []) {
+        if ($membership === null) {
             return null;
         }
 
-        throw_if(count($memberships) > 1, LogicException::class, sprintf(
-            '[%s:%s] belongs to more than one parent that orders it.',
-            $item::class,
-            $item->getKey(),
-        ));
-
-        ['parent' => $parent, 'revision' => $revision, 'keys' => $keys] = $memberships[0];
-        $key = $attributes[$keys->foreignKey];
+        ['parent' => $parent, 'revision' => $revision, 'keys' => $keys] = $membership;
 
         foreach ([...$held, ...$item instanceof Pivot ? [$item->pivotParent] : []] as $model) {
             $candidate = self::asParent($model);
 
-            if ($candidate !== null && $candidate::class === $parent::class && self::sameKey($candidate->getAttribute($keys->ownerKey), $key)) {
+            if ($candidate !== null && self::isNamed($membership, $attributes, $candidate)) {
+                self::requireConnectionOf($item, $candidate);
+
                 return new self($candidate, $revision);
             }
         }
 
-        $loaded = self::asParent($parent->newQueryWithoutScopes()->where($keys->ownerKey, $key)->first()) ?? throw new LogicException(sprintf(
+        $loaded = self::asParent($parent->newQueryWithoutScopes()->where($keys->ownerKey, $attributes[$keys->foreignKey])->first()) ?? throw new LogicException(sprintf(
             '[%s:%s] names a [%s] that does not exist.',
             $item::class,
             $item->getKey(),
@@ -127,7 +119,21 @@ final class OrderedRelation
             throw new LogicException(sprintf('[%s] is not ordered in [%s].', $item::class, $parent::class));
         }
 
+        self::requireConnectionOf($item, $candidate);
+
         return new self($candidate, $membership['revision']);
+    }
+
+    /**
+     * @internal
+     *
+     * @param  array<string, mixed>  $attributes
+     */
+    public static function names(Model&Ordered $item, array $attributes, Model $parent): bool
+    {
+        $membership = self::membershipNamedBy($item, $attributes);
+
+        return $membership !== null && self::isNamed($membership, $attributes, $parent);
     }
 
     /**
@@ -279,7 +285,11 @@ final class OrderedRelation
      */
     public function placed(Model&Ordered $item): void
     {
-        $this->announce($this->change([self::keyOf($item) => null]));
+        $change = $this->change([self::keyOf($item) => null]);
+
+        if ($change->changed[0]->position !== null) {
+            $this->announce($change);
+        }
     }
 
     /**
@@ -384,6 +394,51 @@ final class OrderedRelation
         }
 
         return $memberships;
+    }
+
+    /**
+     * @param  array<string, mixed>  $attributes
+     * @return null|array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}
+     */
+    private static function membershipNamedBy(Model&Ordered $item, array $attributes): null|array
+    {
+        $memberships = array_values(array_filter(
+            self::memberships($item),
+            static fn (array $membership): bool => $membership['keys']->names($attributes),
+        ));
+
+        throw_if(count($memberships) > 1, LogicException::class, sprintf(
+            '[%s:%s] belongs to more than one parent that orders it.',
+            $item::class,
+            $item->getKey(),
+        ));
+
+        return $memberships[0] ?? null;
+    }
+
+    /**
+     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}  $membership
+     * @param  array<string, mixed>  $attributes
+     */
+    private static function isNamed(array $membership, array $attributes, Model $parent): bool
+    {
+        return $parent::class === $membership['parent']::class
+            && self::sameKey($parent->getAttribute($membership['keys']->ownerKey), $attributes[$membership['keys']->foreignKey]);
+    }
+
+    private static function requireConnectionOf(Model $item, Model $parent): void
+    {
+        $connection = $item->getConnection()->getName();
+
+        throw_unless($parent->getConnection()->getName() === $connection, LogicException::class, sprintf(
+            '[%s:%s] on the [%s] connection cannot be ordered in [%s:%s] on the [%s] connection.',
+            $item::class,
+            $item->getKey(),
+            $connection,
+            $parent::class,
+            $parent->getKey(),
+            $parent->getConnection()->getName(),
+        ));
     }
 
     /**

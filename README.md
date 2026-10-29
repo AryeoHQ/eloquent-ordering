@@ -238,7 +238,7 @@ $change = $asset->move(Placement::before($otherId), expected: 4);              /
 $change = $asset->move(Placement::last()->in($destination), expected: 4);      // to another parent
 ```
 
-`Placement::in($parent)` names the destination parent. The destination must be saved and must order the item's class.
+`Placement::in($parent)` names the destination parent. The destination must be saved, must order the item's class, and must use the item's connection.
 
 `expected` is the order revision of the **destination**: the parent that the placement's anchor refers to. It is the value a caller read before the move. Inside one parent, the source and the destination are the same parent. A move between parents does not compare the source.
 
@@ -315,9 +315,9 @@ Event::listen(Reordered::class, function (Reordered $event): void {
 | `move()` between parents | Two: the source first, then the destination. The destination's `change->source` holds the source change. |
 | A save through Eloquent that changes the parent | Two, with the same shapes as a `move()` between parents. One for the source alone when the item leaves every parent. One for the destination alone when the item had no position before the save. None when the destination relation excludes the item. |
 | `reorder()` | One. |
-| A create, including a pivot `attach()` | One. |
+| A create, including a pivot `attach()` | One. None when the relation excludes the new row. |
 | A delete, soft or force, including a pivot `detach()` | One. |
-| `restore()` | One when the stored row was trashed, and the item enters last. None when another request already restored or force deleted the row. A restore of a row that another request already restored, and that also changes the parent, counts as a save that changes the parent. |
+| `restore()` | One when the stored row was trashed, and the item enters last. None when the relation excludes the restored row, or when another request already restored or force deleted the row. A restore of a row that another request already restored, and that also changes the parent, counts as a save that changes the parent. |
 | A move or reorder that keeps the order | None. |
 | A stale move, a halted write, or a rollback | None. |
 
@@ -363,4 +363,4 @@ The rule covers application code. The query-builder writes inside `move()`, `reo
 | `MembershipMismatch` (`InvalidArgumentException`) | `reorder()` does not list each current member exactly once. |
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
 | `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
-| `LogicException` | A relation is misdeclared, a model is unsaved, or an item has no parent. |
+| `LogicException` | A relation is misdeclared, a model is unsaved, an item has no parent, or an item and its parent use different connections. |

@@ -8,6 +8,7 @@ use Closure;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use LogicException;
 use RuntimeException;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
@@ -51,11 +52,23 @@ trait IsOrdered
             if (! $item->exists) {
                 $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
             } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
-                $next = OrderedRelation::of($item, $item->getAttributes(), $item->heldOrderedParents());
-                [$current, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations($next);
+                [$current, $item->lockedOrderedRelations, $next, $membership] = $item->lockCurrentOrderedRelations(
+                    static fn (null|array $stored): null|OrderedRelation => OrderedRelation::of(
+                        $item,
+                        $stored === null ? $item->getAttributes() : [...$stored, ...array_intersect_key($item->getDirty(), $stored)],
+                        $item->heldOrderedParents(),
+                    ),
+                );
+
+                if ($membership !== null) {
+                    $clean = array_diff_key($membership, $item->getDirty());
+                    $item->forceFill($clean)->syncOriginalAttributes(array_keys($clean));
+                }
+
+                $softDeletes = in_array(SoftDeletes::class, class_uses_recursive($item), true);
                 $kept = $uncommitted ? $item->getRawOriginal(OrderedRelation::RANK_KEY) : $item->getAttribute(OrderedRelation::RANK_KEY);
 
-                if ($item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
+                if ($softDeletes && $item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
                     $stored = $item->storedOrderedAttributes([OrderedRelation::RANK_KEY, OrderedRelations::DELETED_AT]);
 
                     if ($stored === null) {
@@ -72,7 +85,7 @@ trait IsOrdered
                     $kept = $stored[OrderedRelation::RANK_KEY];
                 }
 
-                if ($item->getAttribute(OrderedRelations::DELETED_AT) === null) {
+                if (! $softDeletes || $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
                     $item->followOrderedParent($current, $next, $kept);
                 }
             }
@@ -125,7 +138,7 @@ trait IsOrdered
                 } else {
                     $destination->entered($item, $source, $previous);
                 }
-            } elseif ($destination !== null && $destination->position($item) !== null) {
+            } elseif ($destination !== null) {
                 $destination->placed($item);
             }
         });
@@ -176,9 +189,10 @@ trait IsOrdered
 
         return $this->getConnection()->transaction(function () use ($placement, $expected): OrderChange {
             $destination = $placement->parent === null ? null : OrderedRelation::in($placement->parent, $this);
-            [$source] = $this->lockCurrentOrderedRelations($destination);
+            $original = $this->getRawOriginal();
+            [$source, , , $stored] = $this->lockCurrentOrderedRelations(static fn (): null|OrderedRelation => $destination);
 
-            if ($source === null) {
+            if ($source === null || $stored === null) {
                 throw new LogicException(sprintf('[%s:%s] has no parent that orders it.', static::class, $this->getKey()));
             }
 
@@ -194,24 +208,11 @@ trait IsOrdered
 
             $change = ($destination ?? $source)->move($this, $placement, $source);
 
-            if ($change->source !== null) {
-                foreach ($this->getRelations() as $name => $related) {
-                    if ($related !== $source->parent) {
-                        continue;
-                    }
-
-                    if ($related::class === $change->relation->parent::class) {
-                        $this->setRelation($name, $change->relation->parent);
-                    } else {
-                        $this->unsetRelation($name);
-                    }
-                }
-
-                if ($this instanceof Pivot && $this->pivotParent === $source->parent) {
-                    $this->pivotParent = $change->relation->parent;
-                }
+            if ($change->source === null && array_diff_assoc($stored, $original) !== []) {
+                $this->forceFill($stored)->syncOriginalAttributes(array_keys($stored));
             }
 
+            $this->followMovedParent([$original, $stored], $change->relation->parent);
             $this->resolvedOrderedRelation = $change->relation;
 
             return $change;
@@ -261,6 +262,32 @@ trait IsOrdered
     }
 
     /**
+     * @param  list<array<string, mixed>>  $left
+     */
+    private function followMovedParent(array $left, Model $parent): void
+    {
+        $follows = fn (mixed $model): bool => $model instanceof Model
+            && ! $model->is($parent)
+            && array_any($left, fn (array $attributes): bool => OrderedRelation::names($this, $attributes, $model));
+
+        foreach ($this->getRelations() as $name => $related) {
+            if (! $follows($related)) {
+                continue;
+            }
+
+            if ($related::class === $parent::class) {
+                $this->setRelation($name, $parent);
+            } else {
+                $this->unsetRelation($name);
+            }
+        }
+
+        if ($this instanceof Pivot && $follows($this->pivotParent)) {
+            $this->pivotParent = $parent;
+        }
+    }
+
+    /**
      * @return list<Model>
      */
     private function heldOrderedParents(): array
@@ -272,15 +299,17 @@ trait IsOrdered
     }
 
     /**
-     * @return array{null|OrderedRelation, list<OrderedRelation>}
+     * @param  null|(Closure(null|array<string, mixed>): (null|OrderedRelation))  $resolveNext
+     * @return array{null|OrderedRelation, list<OrderedRelation>, null|OrderedRelation, null|array<string, mixed>}
      */
-    private function lockCurrentOrderedRelations(null|OrderedRelation $next = null): array
+    private function lockCurrentOrderedRelations(null|Closure $resolveNext = null): array
     {
         $moved = new RuntimeException;
 
         for ($attempt = 1; $attempt <= self::ORDER_LOCK_ATTEMPTS; $attempt++) {
             $stored = $this->storedOrderedAttributes(OrderedRelation::membershipColumns($this));
             $current = $stored === null ? null : $this->resolveOrderedRelation($stored);
+            $next = $resolveNext === null ? null : $resolveNext($stored);
 
             try {
                 return $this->getConnection()->transaction(function () use ($stored, $current, $next, $moved): array {
@@ -288,7 +317,7 @@ trait IsOrdered
 
                     throw_unless($this->storedOrderedAttributes(OrderedRelation::membershipColumns($this)) === $stored, $moved);
 
-                    return [$current, $locked];
+                    return [$current, $locked, $next, $stored];
                 });
             } catch (RuntimeException $exception) {
                 throw_unless($exception === $moved, $exception);

@@ -346,6 +346,37 @@ class ReorderedTest extends TestCase
         $this->assertSame([], $this->dispatched);
     }
 
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_dispatches_no_event_for_an_attach_the_relation_excludes(PivotShape $shape): void
+    {
+        [$parent] = $shape->with(1);
+        $customer = Customer::create();
+        $customer->delete();
+        $this->forget();
+
+        $shape->customers($parent)->attach($customer);
+
+        $this->assertNotNull(DB::table($shape->memberTable())->where('customer_id', $customer->id)->value(OrderedRelation::RANK_KEY));
+        $this->assertSame([], $this->dispatched);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_dispatches_no_event_for_a_restore_the_relation_excludes(PivotShape $shape): void
+    {
+        [, [, $excluded]] = $shape->with(2);
+        $excluded->delete();
+        Customer::query()->findOrFail($excluded->getAttribute('customer_id'))->delete();
+        assert(method_exists($excluded, 'restore'));
+        $this->forget();
+
+        $this->assertTrue($excluded->restore());
+
+        $this->assertNotNull(DB::table($shape->memberTable())->where('id', $excluded->getKey())->value(OrderedRelation::RANK_KEY));
+        $this->assertSame([], $this->dispatched);
+    }
+
     /**
      * @param  Closure(): array{Model&OrdersRelations&Revisioned, Model&Ordered, list<Model&Ordered>, array<string, mixed>}  $reparent
      */

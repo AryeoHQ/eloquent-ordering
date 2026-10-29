@@ -97,6 +97,26 @@ class IsOrderedTest extends TestCase
     }
 
     /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function staleMoves(): iterable
+    {
+        return Shape::crossed([
+            'a move that writes' => [Placement::first(), 1],
+            'a move that keeps the order' => [Placement::last(), 2],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(Video, Section): mixed}>
+     */
+    public static function writesWithoutSoftDeletes(): iterable
+    {
+        yield 'a save that changes the parent' => [fn (Video $video, Section $destination): mixed => $video->section()->associate($destination)];
+        yield 'a save that writes the rank key' => [fn (Video $video, Section $destination): mixed => $video->setAttribute('rank_key', 'Zz')];
+    }
+
+    /**
      * @return iterable<string, array{int}>
      */
     public static function lockedSections(): iterable
@@ -853,6 +873,79 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
+    public function it_keeps_a_member_in_the_parent_it_moved_to_for_a_stale_restore_after_another_request_restored_and_moved_it(Shape $shape): void
+    {
+        [$source, [$member]] = $shape->with(1);
+        [$destination, [$holder]] = $shape->with(1);
+        $member->delete();
+        $stale = $shape->find($this->key($member));
+        assert(method_exists($member, 'restore') && method_exists($stale, 'restore'));
+        $member->restore();
+        $member->move(Placement::last()->in($destination), expected: null);
+        $keys = $shape->rankKeys($destination);
+        $revisions = [$shape->storedRevision($source), $shape->storedRevision($destination)];
+
+        $this->assertTrue($stale->restore());
+
+        $this->assertSame($keys, $shape->rankKeys($destination));
+        $this->assertSame($revisions, [$shape->storedRevision($source), $shape->storedRevision($destination)]);
+        $this->assertSame($destination->getKey(), $stale->getAttribute($shape->foreignKey()));
+        $this->assertSame($destination->getKey(), $stale->getRawOriginal($shape->foreignKey()));
+        $this->assertTrue($destination->is($stale->orderingRelation()->parent));
+        $this->assertSame(2, $stale->getAttribute('position'));
+        $this->assertFalse($stale->isDirty());
+        $this->assertOrder($shape, [$holder->getKey(), $member->getKey()], $destination);
+        $this->assertOrder($shape, [], $source);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_writes_the_rank_key_of_a_stale_member_into_the_parent_it_moved_to(Shape $shape): void
+    {
+        [$source, [$member]] = $shape->with(1);
+        [$destination, [$holder]] = $shape->with(1);
+        $stale = $shape->find($this->key($member));
+        $member->move(Placement::last()->in($destination), expected: null);
+        $revision = $shape->storedRevision($source);
+
+        $this->assertTrue($stale->setAttribute('rank_key', 'Zz')->save());
+
+        $this->assertSame('Zz', $this->storedRankKey($shape, $member));
+        $this->assertSame($destination->getKey(), $stale->getAttribute($shape->foreignKey()));
+        $this->assertTrue($destination->is($stale->orderingRelation()->parent));
+        $this->assertFalse($stale->isDirty());
+        $this->assertOrder($shape, [$member->getKey(), $holder->getKey()], $destination);
+        $this->assertSame($revision, $shape->storedRevision($source));
+    }
+
+    /**
+     * @param  Closure(Video, Section): mixed  $write
+     */
+    #[DataProvider('writesWithoutSoftDeletes')]
+    #[Test]
+    public function it_saves_a_reloaded_member_without_soft_deletes_while_missing_attributes_are_prevented(Closure $write): void
+    {
+        $source = Section::create();
+        $destination = Section::create();
+        $video = $this->addVideo($source);
+
+        Model::preventAccessingMissingAttributes();
+
+        try {
+            $reloaded = Video::query()->findOrFail($video->id);
+            $write($reloaded, $destination);
+
+            $this->assertTrue($reloaded->save());
+            $this->assertSame(['section_id' => $reloaded->section_id, 'rank_key' => $reloaded->rank_key], (array) DB::table('videos')->where('id', $video->id)->first(['section_id', 'rank_key']));
+            $this->assertSame(1, $reloaded->position);
+            $this->assertFalse($reloaded->isDirty());
+        } finally {
+            Model::preventAccessingMissingAttributes(false);
+        }
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
     public function it_keeps_the_rank_key_of_a_member_that_a_save_returns_to_its_parent_after_a_halted_reparent(Shape $shape): void
     {
         [$source, [$moved, $staying]] = $shape->with(2);
@@ -1075,6 +1168,63 @@ class IsOrderedTest extends TestCase
         $this->assertOrder($shape, [$moved->getKey(), $member->getKey()], $elsewhere);
     }
 
+    #[DataProvider('staleMoves')]
+    #[Test]
+    public function it_follows_the_parent_a_member_moved_to_when_a_stale_instance_moves_within_it(Shape $shape, Placement $placement, int $position): void
+    {
+        [$source, [$member]] = $shape->with(1);
+        [$destination, [$holder]] = $shape->with(1);
+        $stale = $shape->find($this->key($member))->load($shape->parentRelation());
+        $shape->find($this->key($member))->move(Placement::last()->in($destination), expected: null);
+        $stale->setAttribute('title', 'Dusk');
+
+        $change = $stale->move($placement, expected: null);
+
+        $this->assertTrue($destination->is($change->relation->parent));
+        $this->assertSame($destination->getKey(), $stale->getAttribute($shape->foreignKey()));
+        $this->assertSame($destination->getKey(), $stale->getRawOriginal($shape->foreignKey()));
+        $this->assertSame(['title' => 'Dusk'], $stale->getDirty());
+        $this->assertSame($change->relation->parent, $stale->getRelation($shape->parentRelation()));
+        $this->assertSame($change->relation->parent, $stale->orderingRelation()->parent);
+        $this->assertSame($position, $stale->getAttribute('position'));
+        $this->assertOrder($shape, $position === 1 ? [$member->getKey(), $holder->getKey()] : [$holder->getKey(), $member->getKey()], $destination);
+        $this->assertOrder($shape, [], $source);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_accepts_the_revision_that_a_stale_instance_moving_within_the_parent_it_moved_to_returns(Shape $shape): void
+    {
+        [, [$member]] = $shape->with(1);
+        [$destination, [$holder]] = $shape->with(1);
+        $stale = $shape->find($this->key($member));
+        $shape->find($this->key($member))->move(Placement::last()->in($destination), expected: null);
+
+        $change = $stale->move(Placement::first(), expected: null);
+        $stale->move(Placement::last(), $change->revision);
+
+        $this->assertOrder($shape, [$holder->getKey(), $member->getKey()], $destination);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_points_the_loaded_parent_of_a_stale_instance_at_the_parent_it_moves_to(Shape $shape): void
+    {
+        [$source, [$member]] = $shape->with(1);
+        $elsewhere = $shape->createParent();
+        [$destination, [$holder]] = $shape->with(1);
+        $stale = $shape->find($this->key($member))->load($shape->parentRelation());
+        $shape->find($this->key($member))->move(Placement::last()->in($elsewhere), expected: null);
+
+        $stale->move(Placement::first()->in($destination), expected: null);
+
+        $this->assertSame($destination, $stale->getRelation($shape->parentRelation()));
+        $this->assertSame($destination, $stale->orderingRelation()->parent);
+        $this->assertOrder($shape, [$member->getKey(), $holder->getKey()], $destination);
+        $this->assertOrder($shape, [], $elsewhere);
+        $this->assertOrder($shape, [], $source);
+    }
+
     #[DataProvider('shapes')]
     #[Test]
     public function it_rejects_a_move_of_a_member_deleted_since_it_was_read(Shape $shape): void
@@ -1096,6 +1246,32 @@ class IsOrderedTest extends TestCase
         $stranger = $shape->stranger();
 
         $this->assertRejected($shape, LogicException::class, fn (): OrderChange => $member->move(Placement::first()->in($stranger), expected: null), $parent);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_rejects_a_move_to_a_destination_on_another_connection(Shape $shape): void
+    {
+        config()->set('database.connections.other', config('database.connections.pgsql'));
+        [$source, [$moved]] = $shape->with(1);
+        [$destination] = $shape->with(1);
+        $elsewhere = (clone $destination)->setConnection('other');
+
+        $this->assertRejected($shape, LogicException::class, fn (): OrderChange => $moved->move(Placement::last()->in($elsewhere), expected: null), $source, $destination);
+        $this->assertSame($source->getKey(), $moved->getAttribute($shape->foreignKey()));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_rejects_a_save_into_a_parent_it_holds_on_another_connection(Shape $shape): void
+    {
+        config()->set('database.connections.other', config('database.connections.pgsql'));
+        [$source, [$moved]] = $shape->with(1);
+        [$destination] = $shape->with(1);
+        $shape->associate($moved, (clone $destination)->setConnection('other'));
+
+        $this->assertRejected($shape, LogicException::class, fn (): bool => $moved->save(), $source, $destination);
+        $this->assertSame($source->getKey(), DB::table($shape->memberTable())->where('id', $moved->getKey())->value($shape->foreignKey()));
     }
 
     #[DataProvider('shapes')]
