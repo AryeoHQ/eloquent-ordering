@@ -16,7 +16,7 @@
     "require": {
         "php": "^8.5",
         "laravel/framework": "^12.37 || ^13",
-        "aryeo/eloquent-concurrency": "^0.0.3",
+        "aryeo/eloquent-concurrency": "0.0.4",
         "aryeo/tooling-laravel": "0.0.43"
     },
     "require-dev": {

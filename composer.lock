@@ -4,15 +4,15 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "3cc998a799cd18f4c387a2ea5fc2efdc",
+    "content-hash": "4ab27d892d260bc5bd49b3d64415f278",
     "packages": [
         {
             "name": "aryeo/eloquent-concurrency",
-            "version": "0.0.3",
+            "version": "0.0.4",
             "dist": {
                 "type": "zip",
-                "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/direct-dists/aryeo/eloquent-concurrency/eloquent-concurrency-0.0.3.zip",
-                "reference": "c3139fef8bd075dfc967e5012075c7cd41a95436"
+                "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/direct-dists/aryeo/eloquent-concurrency/eloquent-concurrency-0.0.4.zip",
+                "reference": "f0d10cd8b3207abdff5bea61afbadc6fb31a4e70"
             },
             "require": {
                 "aryeo/tooling-laravel": "0.0.43",
