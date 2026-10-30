@@ -31,10 +31,12 @@ return new class extends Migration
         );
 
         OrderedRelations::createTrigger('listing_customer', 'listings', 'listing_id', ListingRevision::CustomersOrder->value);
+        OrderedRelations::createRelatedTrigger('customers', 'listings', 'listing_customer', 'customer_id', 'listing_id', ListingRevision::CustomersOrder->value);
     }
 
     public function down(): void
     {
+        OrderedRelations::dropTrigger('customers', ListingRevision::CustomersOrder->value);
         Schema::dropIfExists('listing_customer');
     }
 };

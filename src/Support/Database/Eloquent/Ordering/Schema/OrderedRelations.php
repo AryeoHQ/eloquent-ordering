@@ -54,6 +54,32 @@ final class OrderedRelations
         );
     }
 
+    /**
+     * @param  list<string>  $membership
+     */
+    public static function createRelatedTrigger(string $table, string $parent, string $pivot, string $relatedKey, string $foreignKey, string $revision, array $membership = []): void
+    {
+        ConcurrencyRevisions::createNamedTrigger(
+            NamedRevisionTrigger::on($table)
+                ->increments($parent, $revision)
+                ->throughPivot($pivot, $relatedKey, $foreignKey)
+                ->whenColumnsChange(...self::softDeleteColumn($table), ...$membership),
+        );
+    }
+
+    /**
+     * @param  list<string>  $membership
+     */
+    public static function createRelatedMorphTrigger(string $table, string $parent, string $pivot, string $relatedKey, string $morphName, string $morphType, string $revision, array $membership = []): void
+    {
+        ConcurrencyRevisions::createNamedTrigger(
+            NamedRevisionTrigger::on($table)
+                ->increments($parent, $revision)
+                ->throughMorphPivot($pivot, $relatedKey, $morphName, $morphType)
+                ->whenColumnsChange(...self::softDeleteColumn($table), ...$membership),
+        );
+    }
+
     public static function dropTrigger(string $table, string $revision): void
     {
         ConcurrencyRevisions::dropNamedTrigger($table, $revision);
@@ -64,6 +90,14 @@ final class OrderedRelations
      */
     private static function watchedColumns(string $table): array
     {
-        return [OrderedRelation::RANK_KEY, ...Schema::hasColumn($table, self::DELETED_AT) ? [self::DELETED_AT] : []];
+        return [OrderedRelation::RANK_KEY, ...self::softDeleteColumn($table)];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function softDeleteColumn(string $table): array
+    {
+        return Schema::hasColumn($table, self::DELETED_AT) ? [self::DELETED_AT] : [];
     }
 }

@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Tours\Tour;
@@ -20,6 +21,7 @@ use Tests\Fixtures\Support\Tours\Tour;
  */
 class Customer extends Model
 {
+    use OrdersThroughPivots;
     use SoftDeletes;
 
     public const string VISIBLE_SCOPE = 'visible';

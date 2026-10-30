@@ -5,11 +5,28 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering\Providers;
 
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\MorphToMany;
+use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Event;
 use Illuminate\Support\ServiceProvider;
 use LogicException;
+use ReflectionClass;
+use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
+use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
+use Support\Database\Eloquent\Ordering\Contracts\Ordered;
+use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
+use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Support\Database\Eloquent\Ordering\Schema\Macros;
+use WeakMap;
 
+/**
+ * @phpstan-type PivotParent array{class-string<Model>, OrdersRelation, non-empty-list<string>}
+ * @phpstan-type ReachedParents list<array{OrderedRelation, list<array{Model&Ordered, null|int}>}>
+ */
 class Provider extends ServiceProvider
 {
     public function boot(): void
@@ -19,5 +36,186 @@ class Provider extends ServiceProvider
         Builder::macro('withPositions', function (): Builder {
             throw new LogicException(sprintf('[withPositions()] numbers only a query that [%s::query()] returns.', OrderedRelation::class));
         });
+
+        $this->app->booted(static function (): void {
+            foreach (self::pivotParents() as $related => $parents) {
+                self::raisePivotParentsOf($related, $parents);
+            }
+        });
+    }
+
+    /**
+     * @return array<class-string<Model>, list<PivotParent>>
+     */
+    private static function pivotParents(): array
+    {
+        $reached = [];
+
+        foreach (Arr::wrap(config('concurrency.models')) as $class) {
+            if (! is_string($class) || ! is_a($class, Model::class, true) || ! is_a($class, OrdersRelations::class, true)) {
+                continue;
+            }
+
+            $parent = new $class;
+
+            for ($reflection = new ReflectionClass($class); $reflection !== false; $reflection = $reflection->getParentClass()) {
+                foreach ($reflection->getAttributes(OrdersRelation::class) as $attribute) {
+                    $declaration = $attribute->newInstance();
+                    $relation = method_exists($parent, $declaration->relation) ? $parent->{$declaration->relation}() : null;
+
+                    if (! $relation instanceof BelongsToMany || ($relation instanceof MorphToMany && $relation->getInverse())) {
+                        continue;
+                    }
+
+                    $related = $relation->getRelated();
+
+                    throw_unless(in_array(OrdersThroughPivots::class, class_uses_recursive($related), true), LogicException::class, sprintf(
+                        '[%s::%s()] orders the pivots of [%s], so [%s] must use [%s].',
+                        $class,
+                        $declaration->relation,
+                        $related::class,
+                        $related::class,
+                        OrdersThroughPivots::class,
+                    ));
+
+                    $columns = [...self::softDeleteColumnOf($related), ...$declaration->membershipOf($related->getTable())];
+
+                    if ($columns !== []) {
+                        $reached[$related::class][] = [$class, $declaration, $columns];
+                    }
+                }
+            }
+        }
+
+        return $reached;
+    }
+
+    /**
+     * @param  class-string<Model>  $related
+     * @param  list<PivotParent>  $parents
+     */
+    private static function raisePivotParentsOf(string $related, array $parents): void
+    {
+        /** @var WeakMap<Model, array<int, ReachedParents>> $held */
+        $held = new WeakMap;
+
+        Event::listen("eloquent.deleting: {$related}", static function (Model $model) use ($parents, $held): void {
+            $held[$model] = method_exists($model, 'isForceDeleting') && $model->isForceDeleting() === false ? self::lockPivotParents($model, $parents) : [];
+        });
+
+        Event::listen("eloquent.trashed: {$related}", static function (Model $model) use ($parents, $held): void {
+            $positions = $held[$model] ?? [];
+            unset($held[$model]);
+
+            self::raiseHeldPivotParents($model, $parents, $positions);
+        });
+
+        Event::listen("eloquent.updating: {$related}", static function (Model $model) use ($parents, $held): void {
+            $held[$model] = self::lockPivotParents($model, array_filter($parents, static fn (array $parent): bool => $model->isDirty($parent[2])));
+        });
+
+        Event::listen("eloquent.updated: {$related}", static function (Model $model) use ($parents, $held): void {
+            $positions = $held[$model] ?? [];
+            unset($held[$model]);
+
+            self::raiseHeldPivotParents($model, array_filter($parents, static fn (array $parent): bool => $model->wasChanged($parent[2])), $positions);
+        });
+    }
+
+    /**
+     * @param  array<int, PivotParent>  $parents
+     * @return array<int, ReachedParents>
+     */
+    private static function lockPivotParents(Model $related, array $parents): array
+    {
+        $reached = array_map(static fn (array $parent): array => self::pivotsOf($related, $parent), $parents);
+
+        OrderedRelation::lockAll(array_merge([], ...array_map(
+            static fn (array $pivots): array => array_map(static fn (array $reach): OrderedRelation => $reach[0], $pivots),
+            array_values($reached),
+        )));
+
+        return array_map(static fn (array $pivots): array => array_map(
+            static fn (array $reach): array => [$reach[0], array_map(static fn (Model&Ordered $pivot): array => [$pivot, $reach[0]->memberPosition($pivot)], $reach[1])],
+            $pivots,
+        ), $reached);
+    }
+
+    /**
+     * @param  array<int, PivotParent>  $parents
+     * @param  array<int, ReachedParents>  $positions
+     */
+    private static function raiseHeldPivotParents(Model $related, array $parents, array $positions): void
+    {
+        $reached = [];
+
+        foreach ($parents as $index => $parent) {
+            array_push($reached, ...$positions[$index] ?? array_map(static fn (array $reach): array => [$reach[0], []], self::pivotsOf($related, $parent)));
+        }
+
+        OrderedRelation::raiseAll(array_map(static fn (array $reach): OrderedRelation => $reach[0], $reached));
+
+        foreach ($reached as [$relation, $pivots]) {
+            foreach ($pivots as [$pivot, $previous]) {
+                $relation->refiltered($pivot, $previous);
+            }
+        }
+    }
+
+    /**
+     * @param  PivotParent  $parent
+     * @return list<array{OrderedRelation, list<Model&Ordered>}>
+     */
+    private static function pivotsOf(Model $related, array $parent): array
+    {
+        [$class, $declaration] = $parent;
+        $template = (new $class)->setConnection($related->getConnectionName());
+        $relation = $template->{$declaration->relation}();
+        assert($relation instanceof BelongsToMany);
+
+        $pivotClass = $relation->getPivotClass();
+        $query = (new $pivotClass)->setTable($relation->getTable())->setConnection($related->getConnectionName())->newQueryWithoutScopes()->useWritePdo()
+            ->where($relation->getRelatedPivotKeyName(), $related->getAttribute($relation->getRelatedKeyName()));
+
+        if ($relation instanceof MorphToMany) {
+            $query->where($relation->getMorphType(), $relation->getMorphClass());
+        }
+
+        $pivots = [];
+
+        foreach ($query->get() as $pivot) {
+            $positioned = $pivot instanceof Ordered && $pivot->getAttribute(OrderedRelation::RANK_KEY) !== null;
+            $pivots[self::keyOf($pivot->getAttribute($relation->getForeignPivotKeyName()))][] = $positioned ? $pivot : null;
+        }
+
+        if ($pivots === []) {
+            return [];
+        }
+
+        $reached = [];
+        $ownerKey = $relation->getParentKeyName();
+
+        foreach ($template->newQueryWithoutScopes()->useWritePdo()->whereIn($ownerKey, array_keys($pivots))->orderBy($ownerKey)->get() as $model) {
+            if ($model instanceof OrdersRelations && $model instanceof Revisioned) {
+                $reached[] = [new OrderedRelation($model, $declaration->revision), array_values(array_filter($pivots[self::keyOf($model->getAttribute($ownerKey))] ?? []))];
+            }
+        }
+
+        return $reached;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function softDeleteColumnOf(Model $related): array
+    {
+        $column = in_array(SoftDeletes::class, class_uses_recursive($related), true) && method_exists($related, 'getDeletedAtColumn') ? $related->getDeletedAtColumn() : null;
+
+        return is_string($column) ? [$column] : [];
+    }
+
+    private static function keyOf(mixed $key): string
+    {
+        return is_int($key) || is_string($key) ? (string) $key : '';
     }
 }
