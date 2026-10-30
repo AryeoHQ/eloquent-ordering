@@ -5,17 +5,21 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering;
 
 use Closure;
+use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Database\Query\Builder;
+use Illuminate\Database\Query\Expression;
 use Illuminate\Support\Facades\DB;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
@@ -264,7 +268,7 @@ class OrderedRelationTest extends TestCase
         $this->addAsset($section, 'Excluded');
         $last = $this->addAsset($section, 'Shown');
 
-        $parent = (new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        $parent = (new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['assets.title'])] class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
             use HasOrderedRelations;
@@ -572,7 +576,7 @@ class OrderedRelationTest extends TestCase
         $excluded = $this->addAsset($section, 'Excluded');
         $last = $this->addAsset($section, 'Shown');
 
-        $parent = (new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        $parent = (new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['assets.title'])] class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
             use HasOrderedRelations;
@@ -754,6 +758,263 @@ class OrderedRelationTest extends TestCase
 
         $this->assertLessThan(OrderedRelation::MAX_KEY_LENGTH, $shape->longestRankKey($parent));
         $this->assertSame([now()->toDateTimeString(), now()->toDateTimeString(), $before[2], $before[3]], $stamps());
+    }
+
+    /**
+     * @param  Closure(): (Model&OrdersRelations&Revisioned)  $parent
+     */
+    #[DataProvider('uninspectableMemberships')]
+    #[Test]
+    public function it_refuses_a_relation_whose_membership_filter_it_cannot_verify(Closure $parent, NamesConcurrencyRevision $revision, string $message): void
+    {
+        try {
+            $parent()->orderedRelation($revision);
+            $this->fail('A relation whose membership filter cannot be verified was resolved.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString($message, $exception->getMessage());
+        }
+    }
+
+    /**
+     * @param  Closure(): (Model&OrdersRelations&Revisioned)  $parent
+     */
+    #[DataProvider('inspectableMemberships')]
+    #[Test]
+    public function it_resolves_a_relation_whose_membership_filter_it_verifies(Closure $parent, NamesConcurrencyRevision $revision): void
+    {
+        $this->assertSame($revision, $parent()->orderedRelation($revision)->revision);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision, string}>
+     */
+    public static function uninspectableMemberships(): iterable
+    {
+        yield 'a raw clause' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->whereRaw('"assets"."title" = ?', ['Shown']);
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] filters its members through a clause of type [raw]'];
+
+        yield 'an exists clause' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->whereExists(static function (Builder $query): void {
+                    $query->from('videos')->whereColumn('videos.section_id', 'assets.section_id');
+                });
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] filters its members through a clause of type [Exists]'];
+
+        yield 'an expression column' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where(new Expression('lower("assets"."title")'), 'shown');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] filters its members by an expression'];
+
+        yield 'a top-level or' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->orWhere('assets.title', 'Shown');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] joins a filter to its members with [or]'];
+
+        yield 'an undeclared item column' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('title', 'Shown');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] filters its members by [assets.title], which its membership does not declare.'];
+
+        yield 'an undeclared parent column' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['assets.title'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('assets.title', $this->getAttribute('name'));
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] filters its members by [sections.name], which its membership does not declare.'];
+
+        yield 'an unqualified pivot column' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')->using(ListingCustomer::class)->where('title', 'Shown');
+            }
+        }, ListingRevision::CustomersOrder, '::customers()] filters its members by the unqualified column [title]'];
+
+        yield 'an unqualified declaration' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['title'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('assets.title', 'Shown');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [title], which names no table of the relation.'];
+
+        yield 'a declaration on another table' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['videos.title'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [videos.title], which names no table of the relation.'];
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision}>
+     */
+    public static function inspectableMemberships(): iterable
+    {
+        yield 'basic, null, in and column clauses on declared item columns' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['assets.title', 'assets.visible', 'assets.created_at', 'assets.updated_at'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')
+                    ->where('title', 'Shown')
+                    ->whereNotNull('assets.title')
+                    ->whereIn('assets.visible', [true])
+                    ->whereColumn('assets.created_at', '<=', 'assets.updated_at');
+            }
+        }, SectionRevision::AssetsOrder];
+
+        yield 'an or inside a nested clause' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['assets.title'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where(static function (EloquentBuilder $query): void {
+                    $query->where('assets.title', 'Shown')->orWhereNull('assets.title');
+                });
+            }
+        }, SectionRevision::AssetsOrder];
+
+        yield 'a declared parent column' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['assets.title', 'sections.name'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('assets.title', $this->getAttribute('name'));
+            }
+        }, SectionRevision::AssetsOrder];
+
+        yield 'a declared pivot column and a declared related column' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers', membership: ['listing_customer.title', 'customers.name'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')
+                    ->using(ListingCustomer::class)
+                    ->wherePivotNull('deleted_at')
+                    ->wherePivot('title', 'Shown')
+                    ->where('customers.name', 'Ada');
+            }
+        }, ListingRevision::CustomersOrder];
     }
 
     /**

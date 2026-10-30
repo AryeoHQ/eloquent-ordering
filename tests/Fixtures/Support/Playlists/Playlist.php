@@ -19,7 +19,7 @@ use Tests\Fixtures\Support\Tracks\Track;
  * @property int $concurrency_revision
  * @property int $tracks_order_concurrency_revision
  */
-#[OrdersRelation(PlaylistRevision::TracksOrder, relation: 'tracks')]
+#[OrdersRelation(PlaylistRevision::TracksOrder, relation: 'tracks', membership: ['tracks.kind', 'playlists.kind'])]
 class Playlist extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;

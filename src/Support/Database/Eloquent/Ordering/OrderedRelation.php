@@ -37,6 +37,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
+use Throwable;
 
 final class OrderedRelation
 {
@@ -48,6 +49,8 @@ final class OrderedRelation
 
     private const string KEY_NAME = 'id';
 
+    private const string PROBE = "\0ordered-relation-membership-probe";
+
     /** @var array<class-string, array<class-string, list<object>>> */
     private static array $attributes = [];
 
@@ -57,9 +60,18 @@ final class OrderedRelation
     /** @var array<string, true> */
     private static array $validatedRelations = [];
 
+    /** @var array<string, true> */
+    private static array $verifiedMemberships = [];
+
+    /** @var array<string, list<string>> */
+    private static array $parentTableColumns = [];
+
     private readonly string $relationName;
 
     private readonly RelationKeys $keys;
+
+    /** @var list<string> */
+    private readonly array $parentColumns;
 
     /** @var list<int|string> */
     private array $rebalanced = [];
@@ -68,7 +80,8 @@ final class OrderedRelation
         public readonly Model&OrdersRelations&Revisioned $parent,
         public readonly NamesConcurrencyRevision $revision,
     ) {
-        $declaration = self::declarations($parent)[(string) $revision->value] ?? throw new LogicException(sprintf(
+        $declarations = self::declarations($parent);
+        $declaration = $declarations[(string) $revision->value] ?? throw new LogicException(sprintf(
             '[%s] declares no ordered relation for the [%s] revision.',
             $parent::class,
             $revision->value,
@@ -76,6 +89,9 @@ final class OrderedRelation
 
         $this->relationName = $declaration['declaration']->relation;
         $this->keys = self::describe($declaration['relation']);
+        $this->parentColumns = array_values(array_unique(array_merge(
+            ...array_map(static fn (array $declared): array => $declared['declaration']->membershipOf($parent->getTable()), array_values($declarations)),
+        )));
     }
 
     /**
@@ -207,9 +223,49 @@ final class OrderedRelation
      *
      * @return list<string>
      */
+    public static function declaredColumns(Model&Ordered $item): array
+    {
+        return array_values(array_unique(array_merge(
+            ...array_map(static fn (array $membership): array => $membership['columns'], self::memberships($item)),
+        )));
+    }
+
+    /**
+     * @internal
+     *
+     * @return list<string>
+     */
     public static function watchedColumns(Model&Ordered $item): array
     {
-        return [self::RANK_KEY, ...self::membershipColumns($item), OrderedRelations::DELETED_AT];
+        return [self::RANK_KEY, ...self::membershipColumns($item), ...self::declaredColumns($item), OrderedRelations::DELETED_AT];
+    }
+
+    /**
+     * @internal
+     *
+     * @return list<array{NamesConcurrencyRevision, list<int|string>}>
+     */
+    public static function membersBeforeRefilter(Model&OrdersRelations&Revisioned $parent): array
+    {
+        if (! $parent->exists) {
+            return [];
+        }
+
+        $stored = null;
+        $relations = [];
+
+        foreach (self::attributes($parent, OrdersRelation::class) as $declaration) {
+            $columns = $declaration->membershipOf($parent->getTable());
+
+            if ($columns !== [] && $parent->isDirty($columns)) {
+                $stored ??= (clone $parent)->setRawAttributes($parent->getRawOriginal(), sync: true);
+                $relations[] = new self($stored, $declaration->revision);
+            }
+        }
+
+        self::lockAll($relations);
+
+        return array_map(static fn (self $relation): array => [$relation->revision, $relation->memberIds()], $relations);
     }
 
     /**
@@ -441,6 +497,55 @@ final class OrderedRelation
     /**
      * @internal
      */
+    public function refiltered(Model&Ordered $item, null|int $previous): void
+    {
+        if ($this->memberPosition($item) !== $previous) {
+            $this->announce($this->change([self::keyOf($item) => $previous]));
+        }
+    }
+
+    /**
+     * @internal
+     *
+     * @param  list<int|string>  $before
+     */
+    public function refilteredFrom(array $before): void
+    {
+        $after = $this->memberIds();
+        $kept = array_flip($after);
+        $previous = array_flip($before);
+        $moved = [];
+
+        foreach ($before as $index => $id) {
+            if (! array_key_exists($id, $kept)) {
+                $moved[$id] = $index + 1;
+            }
+        }
+
+        foreach ($after as $id) {
+            if (! array_key_exists($id, $previous)) {
+                $moved[$id] = null;
+            }
+        }
+
+        if ($moved !== []) {
+            $this->announce($this->change($moved, order: $after));
+        }
+    }
+
+    /**
+     * @internal
+     */
+    public function memberPosition(Model $item): null|int
+    {
+        $position = self::positionsOf([$this], [$item])[(string) self::keyOf($item)] ?? null;
+
+        return is_int($position) || is_string($position) ? (int) $position : null;
+    }
+
+    /**
+     * @internal
+     */
     public function is(self $other): bool
     {
         return $this->revision === $other->revision
@@ -505,7 +610,7 @@ final class OrderedRelation
     }
 
     /**
-     * @return list<array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}>
+     * @return list<array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}>
      */
     private static function memberships(Model&Ordered $item): array
     {
@@ -531,10 +636,13 @@ final class OrderedRelation
                 $item::class,
             ));
 
+            $keys = self::describe($declaration['relation']);
+
             $memberships[] = [
                 'parent' => $parent,
                 'revision' => $declaration['declaration']->revision,
-                'keys' => self::describe($declaration['relation']),
+                'keys' => $keys,
+                'columns' => $declaration['declaration']->membershipOf($keys->item->getTable()),
             ];
         }
 
@@ -543,7 +651,7 @@ final class OrderedRelation
 
     /**
      * @param  array<string, mixed>  $attributes
-     * @return null|array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}
+     * @return null|array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}
      */
     private static function membershipNamedBy(Model&Ordered $item, array $attributes): null|array
     {
@@ -562,7 +670,7 @@ final class OrderedRelation
     }
 
     /**
-     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}  $membership
+     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
      * @param  array<string, mixed>  $attributes
      */
     private static function isNamed(array $membership, array $attributes, Model $parent): bool
@@ -572,7 +680,7 @@ final class OrderedRelation
     }
 
     /**
-     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}  $membership
+     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
      */
     private static function parentClassOf(array $membership): string
     {
@@ -580,7 +688,7 @@ final class OrderedRelation
     }
 
     /**
-     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys}  $membership
+     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
      */
     private static function parentNamedBy(array $membership, mixed $ownerKey): string
     {
@@ -628,11 +736,152 @@ final class OrderedRelation
                 $declaration->relation,
             ));
 
+            self::requireVerifiableMembership($parent, $declaration, $relation);
+
             $declarations[$declaration->name()] = ['declaration' => $declaration, 'relation' => $relation];
             $relations[$item] = $declaration->relation;
         }
 
         return $declarations;
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     */
+    private static function requireVerifiableMembership(Model $parent, OrdersRelation $declaration, HasMany|MorphMany|BelongsToMany $relation): void
+    {
+        $name = sprintf('%s::%s()', $parent::class, $declaration->relation);
+
+        if (array_key_exists($name, self::$verifiedMemberships)) {
+            return;
+        }
+
+        $keys = self::describe($relation);
+        $item = $keys->item;
+        $related = $relation instanceof BelongsToMany ? $relation->getRelated() : null;
+        $tables = array_values(array_unique([$item->getTable(), $parent->getTable(), ...$related === null ? [] : [$related->getTable()]]));
+
+        foreach ($declaration->membership as $column) {
+            $table = explode('.', $column)[0];
+
+            throw_unless(substr_count($column, '.') === 1 && in_array($table, $tables, true), LogicException::class, sprintf(
+                '[%s] declares the membership column [%s], which names no table of the relation. Qualify it by [%s].',
+                $name,
+                $column,
+                implode('], [', $tables),
+            ));
+        }
+
+        $implicit = [
+            ...array_map($item->qualifyColumn(...), [...$keys->columns(), OrderedRelations::DELETED_AT]),
+            ...$related !== null && method_exists($related, 'getQualifiedDeletedAtColumn') ? [$related->getQualifiedDeletedAtColumn()] : [],
+        ];
+        $wheres = $relation->getBaseQuery()->wheres;
+
+        foreach ([...self::filteredColumns($name, $wheres, $item->getTable(), $related !== null), ...self::parentColumnsRead($parent, $declaration->relation, $keys->ownerKey)] as $column) {
+            throw_unless(in_array($column, [...$implicit, ...$declaration->membership], true), LogicException::class, sprintf(
+                '[%s] filters its members by [%s], which its membership does not declare.',
+                $name,
+                $column,
+            ));
+        }
+
+        self::$verifiedMemberships[$name] = true;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $wheres
+     * @return list<string>
+     */
+    private static function filteredColumns(string $name, array $wheres, string $itemTable, bool $pivot, bool $nested = false): array
+    {
+        $columns = [];
+
+        foreach ($wheres as $where) {
+            assert(is_array($where));
+
+            throw_if(! $nested && str_starts_with(strtolower(is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and'), 'or'), LogicException::class, sprintf(
+                '[%s] joins a filter to its members with [or], so the filter reaches the rows of other parents.',
+                $name,
+            ));
+
+            $type = $where['type'] ?? null;
+
+            if ($type === 'Nested' && ($where['query'] ?? null) instanceof Builder) {
+                $columns = [...$columns, ...self::filteredColumns($name, $where['query']->wheres, $itemTable, $pivot, nested: true)];
+
+                continue;
+            }
+
+            $named = match ($type) {
+                'Basic', 'Null', 'NotNull', 'In', 'NotIn' => [$where['column'] ?? null],
+                'Column' => [$where['first'] ?? null, $where['second'] ?? null],
+                default => throw new LogicException(sprintf(
+                    '[%s] filters its members through a clause of type [%s], which a membership declaration cannot verify.',
+                    $name,
+                    is_string($type) ? $type : get_debug_type($type),
+                )),
+            };
+
+            foreach ($named as $column) {
+                throw_unless(is_string($column), LogicException::class, sprintf('[%s] filters its members by an expression, which a membership declaration cannot verify.', $name));
+
+                if (str_contains($column, '.')) {
+                    $columns[] = implode('.', array_slice(explode('.', $column), -2));
+
+                    continue;
+                }
+
+                throw_if($pivot, LogicException::class, sprintf(
+                    '[%s] filters its members by the unqualified column [%s]. Qualify it by the pivot table or the related table.',
+                    $name,
+                    $column,
+                ));
+
+                $columns[] = $itemTable.'.'.$column;
+            }
+        }
+
+        return $columns;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function parentColumnsRead(Model $parent, string $relation, string $ownerKey): array
+    {
+        $build = static function (Model $variant) use ($relation): null|array {
+            try {
+                $query = $variant->{$relation}();
+                assert($query instanceof Relation);
+                $base = $query->toBase();
+
+                return [$base->toSql(), $base->getBindings()];
+            } catch (Throwable) {
+                return null;
+            }
+        };
+
+        $connection = $parent->getConnection();
+        $table = $parent->getTable();
+        $columns = self::$parentTableColumns[$connection->getName().':'.$table] ??= $connection->getSchemaBuilder()->getColumnListing($table);
+        $expected = $build(clone $parent);
+        $read = [];
+
+        foreach ($columns as $column) {
+            if ($column === $ownerKey || $column === $parent->getKeyName()) {
+                continue;
+            }
+
+            $variant = clone $parent;
+            $variant->setRawAttributes([...$parent->getAttributes(), $column => self::PROBE]);
+
+            if ($build($variant) !== $expected) {
+                $read[] = $parent->qualifyColumn($column);
+            }
+        }
+
+        return $read;
     }
 
     /**
@@ -1010,10 +1259,11 @@ final class OrderedRelation
 
     /**
      * @param  array<int|string, null|int>  $moved
+     * @param  null|list<int|string>  $order
      */
-    private function change(array $moved, null|OrderChange $source = null): OrderChange
+    private function change(array $moved, null|OrderChange $source = null, null|array $order = null): OrderChange
     {
-        $ids = array_keys($this->rankKeys($this->members()));
+        $ids = $order ?? $this->memberIds();
         $positions = array_flip($ids);
 
         return new OrderChange(
@@ -1058,6 +1308,14 @@ final class OrderedRelation
         }
 
         $this->fillParent($this->parentRow()->useWritePdo()->value($column));
+    }
+
+    /**
+     * @return list<int|string>
+     */
+    private function memberIds(): array
+    {
+        return array_keys($this->rankKeys($this->members()));
     }
 
     /**
@@ -1219,6 +1477,12 @@ final class OrderedRelation
     {
         /** @var array<string, mixed> $row */
         $row = (array) ($this->parentRow()->lock('for no key update')->first() ?? []);
+        $declared = array_diff_key(array_intersect_key($row, array_flip($this->parentColumns)), $this->parent->getDirty());
+
+        if ($declared !== []) {
+            $this->parent->setRawAttributes(array_replace($this->parent->getAttributes(), $declared));
+            $this->parent->syncOriginalAttributes(array_keys($declared));
+        }
 
         $this->fillParent($row[$this->column()] ?? null);
     }

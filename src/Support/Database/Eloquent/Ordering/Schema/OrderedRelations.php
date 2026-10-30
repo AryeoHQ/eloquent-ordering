@@ -13,25 +13,44 @@ final class OrderedRelations
 {
     public const string DELETED_AT = 'deleted_at';
 
-    public static function createTrigger(string $table, string $parent, string $foreignKey, string $revision): void
+    /**
+     * @param  list<string>  $membership
+     */
+    public static function createTrigger(string $table, string $parent, string $foreignKey, string $revision, array $membership = []): void
     {
         ConcurrencyRevisions::createNamedTrigger(
             NamedRevisionTrigger::on($table)
                 ->increments($parent, $revision)
                 ->through($foreignKey)
-                ->whenColumnsChange(...self::watchedColumns($table))
+                ->whenColumnsChange(...self::watchedColumns($table), ...$membership)
                 ->whenRowsInsertedOrDeleted(),
         );
     }
 
-    public static function createMorphTrigger(string $table, string $parent, string $morphName, string $morphType, string $revision): void
+    /**
+     * @param  list<string>  $membership
+     */
+    public static function createMorphTrigger(string $table, string $parent, string $morphName, string $morphType, string $revision, array $membership = []): void
     {
         ConcurrencyRevisions::createNamedTrigger(
             NamedRevisionTrigger::on($table)
                 ->increments($parent, $revision)
                 ->throughMorph($morphName, $morphType)
-                ->whenColumnsChange(...self::watchedColumns($table))
+                ->whenColumnsChange(...self::watchedColumns($table), ...$membership)
                 ->whenRowsInsertedOrDeleted(),
+        );
+    }
+
+    /**
+     * @param  list<string>  $membership
+     */
+    public static function createParentTrigger(string $table, string $revision, array $membership): void
+    {
+        ConcurrencyRevisions::createNamedTrigger(
+            NamedRevisionTrigger::on($table)
+                ->increments($table, $revision)
+                ->onParent()
+                ->whenColumnsChange(...$membership),
         );
     }
 

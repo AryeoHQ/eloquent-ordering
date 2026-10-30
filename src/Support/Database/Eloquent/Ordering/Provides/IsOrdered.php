@@ -49,6 +49,9 @@ trait IsOrdered
     /** @var null|array<string, mixed> */
     private null|array $storedOrderedRow = null;
 
+    /** @var null|array{OrderedRelation, null|int} */
+    private null|array $refilteredPosition = null;
+
     public static function bootIsOrdered(): void
     {
         static::saving(static function (self $item): void {
@@ -60,6 +63,7 @@ trait IsOrdered
             $item->restoredInto = null;
             $item->reparented = null;
             $item->storedOrderedRow = null;
+            $item->refilteredPosition = null;
             $item->lockedOrderedRelations = [];
 
             if (! $item->exists) {
@@ -74,9 +78,11 @@ trait IsOrdered
                 );
 
                 $softDeletes = in_array(SoftDeletes::class, class_uses_recursive($item), true);
+                $declared = OrderedRelation::declaredColumns($item);
                 $item->storedOrderedRow = $stored = $item->storedOrderedAttributes([
                     OrderedRelation::RANK_KEY,
                     ...OrderedRelation::membershipColumns($item),
+                    ...$declared,
                     ...$softDeletes ? [OrderedRelations::DELETED_AT] : [],
                 ]);
 
@@ -104,6 +110,10 @@ trait IsOrdered
 
                 if (! $softDeletes || $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
                     $item->followOrderedParent($current, $next, $kept);
+                }
+
+                if ($item->reparented === null && $current !== null && $declared !== [] && $item->isDirty($declared)) {
+                    $item->refilteredPosition = [$current, $current->memberPosition($item)];
                 }
             }
         });
@@ -152,14 +162,20 @@ trait IsOrdered
             $restored = $item->restoredInto;
             $reparented = $item->reparented;
             $stored = $item->storedOrderedRow;
+            $refiltered = $item->refilteredPosition;
             $relations = $item->lockedOrderedRelations;
             $item->restoredInto = null;
             $item->reparented = null;
             $item->storedOrderedRow = null;
+            $item->refilteredPosition = null;
             $item->lockedOrderedRelations = [];
 
             if ($stored !== null && $item->storedOrderedAttributes(array_keys($stored)) !== $stored) {
                 OrderedRelation::raiseAll($relations);
+            }
+
+            if ($refiltered !== null) {
+                $refiltered[0]->refiltered($item, $refiltered[1]);
             }
 
             $restored?->placed($item);

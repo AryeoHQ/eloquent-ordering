@@ -33,7 +33,8 @@ return new class extends Migration
             $table->unique(['playlist_id', 'rank_key']);
         });
 
-        OrderedRelations::createTrigger('tracks', 'playlists', 'playlist_id', PlaylistRevision::TracksOrder->value);
+        OrderedRelations::createTrigger('tracks', 'playlists', 'playlist_id', PlaylistRevision::TracksOrder->value, membership: ['kind']);
+        OrderedRelations::createParentTrigger('playlists', PlaylistRevision::TracksOrder->value, membership: ['kind']);
     }
 
     public function down(): void

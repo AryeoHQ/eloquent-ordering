@@ -17,11 +17,13 @@ use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Galleries\Gallery;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingRevision;
+use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\UuidMorphManyShape;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
+use Tests\Fixtures\Support\Tracks\Track;
 use Tests\TestCase;
 
 #[CoversClass(OrderedRelations::class)]
@@ -31,6 +33,8 @@ class OrderedRelationsTest extends TestCase
     private const string ASSETS_ORDER = 'assets_order_concurrency_revision';
 
     private const string SCENES_ORDER = 'scenes_order_concurrency_revision';
+
+    private const string TRACKS_ORDER = 'tracks_order_concurrency_revision';
 
     /**
      * @return iterable<string, array{string, list<string>}>
@@ -77,6 +81,50 @@ class OrderedRelationsTest extends TestCase
         $this->assertNotSame([], $sets);
         $this->assertSame([$columns], array_values(array_unique($sets, SORT_REGULAR)));
         $this->assertSame(count($sets), 3 * count($this->triggers($table, ConcurrencyRevisions::NAMED_CHECK_FUNCTION, deferred: true)));
+    }
+
+    #[Test]
+    public function it_installs_an_item_recorder_that_watches_the_membership_columns(): void
+    {
+        $this->assertSame([['item', ['kind', 'playlist_id', 'rank_key']]], $this->recorders('tracks'));
+    }
+
+    #[Test]
+    public function it_installs_a_parent_recorder_that_watches_the_membership_columns(): void
+    {
+        $this->assertSame([['parent', ['kind']]], $this->recorders('playlists'));
+        $this->assertCount(1, $this->triggers('playlists', ConcurrencyRevisions::NAMED_CHECK_FUNCTION, deferred: true));
+    }
+
+    #[Test]
+    public function it_installs_the_membership_columns_of_a_morph_item_recorder(): void
+    {
+        OrderedRelations::dropTrigger('scenes', TourRevision::ScenesOrder->value);
+        OrderedRelations::createMorphTrigger('scenes', 'tours', 'sceneable', (new Tour)->getMorphClass(), TourRevision::ScenesOrder->value, membership: ['title']);
+
+        $this->assertSame([['item', ['deleted_at', 'rank_key', 'sceneable_id', 'sceneable_type', 'title']]], $this->recorders('scenes'));
+    }
+
+    #[Test]
+    public function it_refuses_the_commit_of_a_membership_change_that_no_order_revision_raise_follows(): void
+    {
+        $playlist = Playlist::create(['kind' => 'audio']);
+        $track = new Track(['kind' => 'audio']);
+        $track->playlist()->associate($playlist);
+        $track->save();
+        $itemChange = fn (): int => DB::table('tracks')->where('id', $track->id)->update(['kind' => 'video']);
+        $parentChange = fn (): int => DB::table('playlists')->where('id', $playlist->id)->update(['kind' => 'video', 'concurrency_revision' => DB::raw('"concurrency_revision" + 1')]);
+
+        $this->assertRefused($itemChange);
+        $this->assertRefused($parentChange);
+        $this->runDeferredChecks(function () use ($itemChange, $parentChange, $playlist): void {
+            $itemChange();
+            $this->raise($playlist, self::TRACKS_ORDER);
+            $parentChange();
+            $this->raise($playlist, self::TRACKS_ORDER);
+        });
+
+        $this->assertSame(4, $this->storedRevision($playlist, self::TRACKS_ORDER));
     }
 
     #[Test]
@@ -308,6 +356,24 @@ class OrderedRelationsTest extends TestCase
             "select encode(t.tgargs, 'escape') as arguments from pg_trigger t join pg_proc p on p.oid = t.tgfoid where t.tgrelid = to_regclass(?) and p.proname = ? and t.tgdeferrable = ? and t.tginitdeferred = ?",
             [$table, $function, $deferred, $deferred],
         );
+    }
+
+    /**
+     * @return list<array{string, list<string>}>
+     */
+    private function recorders(string $table): array
+    {
+        return array_map(function (mixed $trigger): array {
+            $this->assertIsObject($trigger);
+            $this->assertIsString($trigger->arguments);
+
+            $arguments = explode('\000', $trigger->arguments);
+            $watched = json_decode($arguments[4] ?? '', true, flags: JSON_THROW_ON_ERROR);
+            $this->assertIsArray($watched);
+            sort($watched);
+
+            return [$arguments[0], array_values(array_filter($watched, is_string(...)))];
+        }, array_values(array_unique($this->triggers($table, ConcurrencyRevisions::NAMED_FUNCTION), SORT_REGULAR)));
     }
 
     private function raise(Model $parent, string $column): void

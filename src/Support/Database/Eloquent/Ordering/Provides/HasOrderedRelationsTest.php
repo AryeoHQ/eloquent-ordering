@@ -14,6 +14,7 @@ use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversTrait;
@@ -26,7 +27,9 @@ use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
+use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Placement;
+use Support\Database\Eloquent\Ordering\PositionChange;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Clips\Clip;
 use Tests\Fixtures\Support\Customers\Customer;
@@ -34,6 +37,8 @@ use Tests\Fixtures\Support\Customers\Customerable;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
+use Tests\Fixtures\Support\Playlists\Playlist;
+use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
@@ -41,6 +46,7 @@ use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
+use Tests\Fixtures\Support\Tracks\Track;
 use Tests\Fixtures\Support\Videos\Video;
 use Tests\Fixtures\Support\Videos\VideoRevision;
 use Tests\TestCase;
@@ -49,6 +55,9 @@ use Tests\TestCase;
 #[CoversTrait(HasOrderedRelations::class)]
 class HasOrderedRelationsTest extends TestCase
 {
+    /** @var list<array{mixed, list<int|string>, list<array{int|string, null|int, null|int}>, int}> */
+    private array $reorders = [];
+
     /**
      * @return iterable<string, array{Closure(): (Model&OrdersRelations), NamesConcurrencyRevision, string}>
      */
@@ -857,6 +866,85 @@ class HasOrderedRelationsTest extends TestCase
         }
     }
 
+    #[Test]
+    public function it_raises_the_order_revision_and_reports_each_leave_and_enter_for_a_membership_change_of_the_parent(): void
+    {
+        [$playlist, [$firstAudio, $firstVideo, $secondAudio, $secondVideo, $thirdAudio]] = $this->playlist('audio', ['audio', 'video', 'audio', 'video', 'audio']);
+        $keys = $this->trackKeys($playlist);
+        $revision = $this->tracksRevision($playlist);
+        $this->recordReorders();
+
+        $playlist->kind = 'video';
+        $this->runDeferredChecks(fn (): bool => $playlist->save());
+
+        $this->assertSame($revision + 1, $this->tracksRevision($playlist));
+        $this->assertSame($revision + 1, $playlist->concurrencyRevision(PlaylistRevision::TracksOrder));
+        $this->assertSame($keys, $this->trackKeys($playlist));
+        $this->assertSame([[
+            $playlist->id,
+            [$firstVideo->id, $secondVideo->id],
+            [[$firstAudio->id, null, 1], [$secondAudio->id, null, 2], [$thirdAudio->id, null, 3], [$firstVideo->id, 1, null], [$secondVideo->id, 2, null]],
+            $revision + 1,
+        ]], $this->reorders);
+    }
+
+    #[Test]
+    public function it_raises_the_order_revision_without_a_report_for_a_membership_change_of_the_parent_that_keeps_every_member(): void
+    {
+        [$playlist] = $this->playlist('audio', ['podcast']);
+        $revision = $this->tracksRevision($playlist);
+        $this->recordReorders();
+
+        $playlist->kind = 'video';
+        $this->runDeferredChecks(fn (): bool => $playlist->save());
+
+        $this->assertSame($revision + 1, $this->tracksRevision($playlist));
+        $this->assertSame([], $this->reorders);
+    }
+
+    #[Test]
+    public function it_raises_the_order_revision_in_the_update_that_makes_a_membership_change_of_the_parent(): void
+    {
+        [$playlist] = $this->playlist('audio', ['audio', 'video']);
+        $revision = $playlist->concurrencyRevision(PlaylistRevision::TracksOrder);
+        $events = ModelEvents::record();
+        DB::enableQueryLog();
+
+        $playlist->update(['kind' => 'video']);
+
+        $updates = array_values(array_filter(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => str_starts_with($query, 'update ')));
+        $column = $playlist->concurrencyRevisionColumn(PlaylistRevision::TracksOrder);
+        $previous = array_intersect_key($events->ofClass(Playlist::class)[3][3] ?? [], [$column => true, 'kind' => true]);
+        ksort($previous);
+
+        $this->assertCount(1, $updates);
+        $this->assertStringStartsWith('update "playlists" set ', $updates[0]);
+        $this->assertStringContainsString('"kind" = ?', $updates[0]);
+        $this->assertStringContainsString(sprintf('"%1$s" = "%1$s" + 1', $column), $updates[0]);
+        $this->assertSame(['saving', 'updating', 'updated', 'saved'], array_column($events->ofClass(Playlist::class), 0));
+        $this->assertSame(['kind' => 'audio', $column => $revision], $previous);
+        $this->assertSame($revision + 1, $playlist->concurrencyRevision(PlaylistRevision::TracksOrder));
+    }
+
+    #[Test]
+    public function it_locks_the_parent_before_it_reads_the_members_for_a_membership_change_of_the_parent(): void
+    {
+        [$playlist] = $this->playlist('audio', ['audio', 'video']);
+        DB::enableQueryLog();
+
+        $playlist->update(['kind' => 'video']);
+
+        $queries = array_column(DB::getQueryLog(), 'query');
+        $lock = array_find_key($queries, fn (string $query): bool => str_contains($query, 'from "playlists"') && str_ends_with($query, 'for no key update'));
+        $write = array_find_key($queries, fn (string $query): bool => str_starts_with($query, 'update "playlists"'));
+        $reads = array_keys(array_filter($queries, fn (string $query): bool => str_contains($query, 'from "tracks"')));
+
+        $this->assertIsInt($lock);
+        $this->assertIsInt($write);
+        $this->assertCount(2, $reads);
+        $this->assertTrue($lock < $reads[0] && $reads[0] < $write && $write < $reads[1]);
+    }
+
     private function addVideo(Section $section): Video
     {
         $video = new Video;
@@ -873,5 +961,49 @@ class HasOrderedRelationsTest extends TestCase
         $clip->save();
 
         return $clip;
+    }
+
+    /**
+     * @param  list<string>  $kinds
+     * @return array{Playlist, list<Track>}
+     */
+    private function playlist(string $kind, array $kinds): array
+    {
+        $playlist = Playlist::create(['kind' => $kind]);
+
+        return [$playlist, array_map(function (string $kind) use ($playlist): Track {
+            $track = new Track(['kind' => $kind]);
+            $track->playlist()->associate($playlist);
+            $track->save();
+
+            return $track;
+        }, $kinds)];
+    }
+
+    private function tracksRevision(Playlist $playlist): int
+    {
+        return (int) DB::table('playlists')->where('id', $playlist->id)->value('tracks_order_concurrency_revision');
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function trackKeys(Playlist $playlist): array
+    {
+        /** @var array<int, string> */
+        return DB::table('tracks')->where('playlist_id', $playlist->id)->orderBy('id')->pluck('rank_key', 'id')->all();
+    }
+
+    private function recordReorders(): void
+    {
+        Event::listen(Reordered::class, function (Reordered $event): void {
+            $change = $event->change;
+            $this->reorders[] = [
+                $change->relation->parent->getKey(),
+                $change->order,
+                array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $change->changed),
+                $change->revision,
+            ];
+        });
     }
 }
