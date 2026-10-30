@@ -52,6 +52,9 @@ trait IsOrdered
     /** @var null|array{OrderedRelation, null|int} */
     private null|array $refilteredPosition = null;
 
+    /** @var null|array{mixed} */
+    private null|array $assignedRankKey = null;
+
     public static function bootIsOrdered(): void
     {
         static::saving(static function (self $item): void {
@@ -59,72 +62,23 @@ trait IsOrdered
                 return;
             }
 
-            $uncommitted = $item->reparented !== null;
-            $item->restoredInto = null;
-            $item->reparented = null;
-            $item->storedOrderedRow = null;
-            $item->refilteredPosition = null;
-            $item->lockedOrderedRelations = [];
-
-            if (! $item->exists) {
-                $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
-            } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
-                [$current, $item->lockedOrderedRelations, $next, $membership] = $item->lockCurrentOrderedRelations(
-                    static fn (null|array $stored): null|OrderedRelation => OrderedRelation::of(
-                        $item,
-                        $stored === null ? $item->getAttributes() : [...$stored, ...array_intersect_key($item->getDirty(), $stored)],
-                        $item->heldOrderedParents(),
-                    ),
-                );
-
-                $softDeletes = in_array(SoftDeletes::class, class_uses_recursive($item), true);
-                $declared = OrderedRelation::declaredColumns($item);
-                $item->storedOrderedRow = $stored = $item->storedOrderedAttributes([
-                    OrderedRelation::RANK_KEY,
-                    ...OrderedRelation::membershipColumns($item),
-                    ...$declared,
-                    ...$softDeletes ? [OrderedRelations::DELETED_AT] : [],
-                ]);
-
-                if ($membership !== null) {
-                    $clean = array_diff_key($membership, $item->getDirty());
-                    $item->forceFill($clean)->syncOriginalAttributes(array_keys($clean));
-                }
-
-                $kept = $uncommitted ? $item->getRawOriginal(OrderedRelation::RANK_KEY) : $item->getAttribute(OrderedRelation::RANK_KEY);
-
-                if ($softDeletes && $item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
-                    if ($stored === null) {
-                        return;
-                    }
-
-                    if ($stored[OrderedRelations::DELETED_AT] !== null) {
-                        $item->setAttribute(OrderedRelation::RANK_KEY, $next?->keyAt(Placement::last()));
-                        $item->restoredInto = $next;
-
-                        return;
-                    }
-
-                    $kept = $stored[OrderedRelation::RANK_KEY];
-                }
-
-                if (! $softDeletes || $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
-                    $item->followOrderedParent($current, $next, $kept);
-                }
-
-                if ($item->reparented === null && $current !== null && $declared !== [] && $item->isDirty($declared)) {
-                    $item->refilteredPosition = [$current, $current->memberPosition($item)];
-                }
-            }
+            self::prepareOrderedSave($item);
+            OrderedRelation::prepared($item);
         });
 
         static::creating(static function (self $item): void {
+            OrderedRelation::requirePrepared($item);
             $item->forgetPosition();
 
             $relation = $item->orderingRelation();
             $relation = array_find($item->lockedOrderedRelations, static fn (OrderedRelation $locked): bool => $locked->is($relation)) ?? $relation;
 
-            $item->setAttribute(OrderedRelation::RANK_KEY, $relation->keyAt($item->placement ?? Placement::last()));
+            $item->assignRankKey($relation->keyAt($item->placement ?? Placement::last()));
+            OrderedRelation::prepared($item);
+        });
+
+        static::replicating(static function (self $item): void {
+            unset($item->attributes[OrderedRelation::RANK_KEY]);
         });
 
         static::created(static function (self $item): void {
@@ -180,7 +134,7 @@ trait IsOrdered
 
             $restored?->placed($item);
 
-            if ($restored !== null || $reparented !== null) {
+            if ($restored !== null || $reparented !== null || $item->wasChanged(OrderedRelations::DELETED_AT)) {
                 $item->forgetPosition();
             }
 
@@ -285,6 +239,24 @@ trait IsOrdered
     }
 
     /**
+     * @return list<Model>
+     */
+    public function parentsToLockFirst(): array
+    {
+        $parents = [];
+
+        foreach ([$this->getRawOriginal(), $this->getAttributes()] as $attributes) {
+            $parent = OrderedRelation::of($this, $attributes, $this->heldOrderedParents())?->parent;
+
+            if ($parent !== null && ! array_any($parents, static fn (Model $named): bool => $named->is($parent))) {
+                $parents[] = $parent;
+            }
+        }
+
+        return $parents;
+    }
+
+    /**
      * @return Attribute<null|int, never>
      */
     protected function position(): Attribute
@@ -300,6 +272,77 @@ trait IsOrdered
     {
         if (method_exists($item, 'mergeUnobservedColumns')) {
             $item->mergeUnobservedColumns([OrderedRelation::RANK_KEY]);
+        }
+    }
+
+    private static function prepareOrderedSave(self $item): void
+    {
+        $assigned = $item->assignedRankKey;
+        $item->assignedRankKey = null;
+        $rankKey = $item->getAttributes()[OrderedRelation::RANK_KEY] ?? null;
+
+        throw_if(
+            ($item->exists ? $item->isDirty(OrderedRelation::RANK_KEY) : $rankKey !== null) && $assigned !== [$rankKey],
+            LogicException::class,
+            sprintf('[%s:%s] sets its [%s], which only an order write may set. Move it with move(), or place a new member with placeAt().', $item::class, $item->getKey(), OrderedRelation::RANK_KEY),
+        );
+
+        $uncommitted = $item->reparented !== null;
+        $item->restoredInto = null;
+        $item->reparented = null;
+        $item->storedOrderedRow = null;
+        $item->refilteredPosition = null;
+        $item->lockedOrderedRelations = [];
+
+        if (! $item->exists) {
+            $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
+        } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
+            [$current, $item->lockedOrderedRelations, $next, $membership] = $item->lockCurrentOrderedRelations(
+                static fn (null|array $stored): null|OrderedRelation => OrderedRelation::of(
+                    $item,
+                    $stored === null ? $item->getAttributes() : [...$stored, ...array_intersect_key($item->getDirty(), $stored)],
+                    $item->heldOrderedParents(),
+                ),
+            );
+
+            $softDeletes = in_array(SoftDeletes::class, class_uses_recursive($item), true);
+            $declared = OrderedRelation::declaredColumns($item);
+            $item->storedOrderedRow = $stored = $item->storedOrderedAttributes([
+                OrderedRelation::RANK_KEY,
+                ...OrderedRelation::membershipColumns($item),
+                ...$declared,
+                ...$softDeletes ? [OrderedRelations::DELETED_AT] : [],
+            ]);
+
+            if ($membership !== null) {
+                $clean = array_diff_key($membership, $item->getDirty());
+                $item->forceFill($clean)->syncOriginalAttributes(array_keys($clean));
+            }
+
+            $kept = $uncommitted ? $item->getRawOriginal(OrderedRelation::RANK_KEY) : $item->getAttribute(OrderedRelation::RANK_KEY);
+
+            if ($softDeletes && $item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
+                if ($stored === null) {
+                    return;
+                }
+
+                if ($stored[OrderedRelations::DELETED_AT] !== null) {
+                    $item->assignRankKey($next?->keyAt(Placement::last()));
+                    $item->restoredInto = $next;
+
+                    return;
+                }
+
+                $kept = $stored[OrderedRelation::RANK_KEY];
+            }
+
+            if (! $softDeletes || $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
+                $item->followOrderedParent($current, $next, $kept);
+            }
+
+            if ($item->reparented === null && $current !== null && $declared !== [] && $item->isDirty($declared)) {
+                $item->refilteredPosition = [$current, $current->memberPosition($item)];
+            }
         }
     }
 
@@ -325,13 +368,19 @@ trait IsOrdered
     private function followOrderedParent(null|OrderedRelation $current, null|OrderedRelation $next, mixed $kept): void
     {
         if ($current === null ? $next === null : $next !== null && $current->is($next)) {
-            $this->setAttribute(OrderedRelation::RANK_KEY, $kept);
+            $this->assignRankKey($kept);
 
             return;
         }
 
         $this->reparented = [$current, $next, $current?->position($this)];
-        $this->setAttribute(OrderedRelation::RANK_KEY, $next?->keyAt(Placement::last()));
+        $this->assignRankKey($next?->keyAt(Placement::last()));
+    }
+
+    private function assignRankKey(mixed $key): void
+    {
+        $this->setAttribute(OrderedRelation::RANK_KEY, $key);
+        $this->assignedRankKey = [$key];
     }
 
     /**

@@ -37,11 +37,25 @@ class Provider extends ServiceProvider
             throw new LogicException(sprintf('[withPositions()] numbers only a query that [%s::query()] returns.', OrderedRelation::class));
         });
 
+        Event::listen(['eloquent.creating: *', 'eloquent.updating: *'], self::requirePreparedOrder(...));
+
         $this->app->booted(static function (): void {
             foreach (self::pivotParents() as $related => $parents) {
                 self::raisePivotParentsOf($related, $parents);
             }
         });
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $payload
+     */
+    private static function requirePreparedOrder(string $event, array $payload): void
+    {
+        $model = $payload[0] ?? null;
+
+        if ($model instanceof Model && $model instanceof Ordered) {
+            OrderedRelation::requirePrepared($model);
+        }
     }
 
     /**

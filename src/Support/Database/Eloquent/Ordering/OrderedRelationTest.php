@@ -14,7 +14,9 @@ use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -26,6 +28,8 @@ use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
+use Support\Database\Eloquent\Ordering\Events\Rebalanced;
+use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
@@ -38,12 +42,15 @@ use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
+use Tests\Fixtures\Support\Playlists\Playlist;
+use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\HasManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
+use Tests\Fixtures\Support\Tracks\Track;
 use Tests\TestCase;
 use Throwable;
 
@@ -53,6 +60,9 @@ use Throwable;
 #[CoversClass(OrderWrite::class)]
 class OrderedRelationTest extends TestCase
 {
+    /** @var list<array{mixed, list<array{int|string, null|int, null|int}>}> */
+    private array $reorders = [];
+
     /**
      * @return iterable<string, array{Shape}>
      */
@@ -330,6 +340,39 @@ class OrderedRelationTest extends TestCase
         } catch (LogicException $exception) {
             $this->assertStringContainsString('does not join the pivot table [listing_customer].', $exception->getMessage());
         }
+    }
+
+    #[Test]
+    public function it_numbers_the_members_of_a_pivot_relation_that_binds_its_own_join(): void
+    {
+        $shape = new BelongsToManyShape;
+        [$listing, [$first, $second, $third]] = $shape->with(3);
+        Customer::query()->whereKey([$first->getAttribute('customer_id'), $third->getAttribute('customer_id')])->update(['name' => 'Kept']);
+
+        $parent = (new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')
+                    ->using(ListingCustomer::class)
+                    ->wherePivotNull('deleted_at')
+                    ->leftJoin('customers as kept', fn (JoinClause $join): JoinClause => $join->on('kept.id', '=', 'customers.id')->where('kept.name', '=', 'Kept'))
+                    ->select(['customers.*', 'kept.name as kept_name']);
+            }
+        })->newQuery()->findOrFail($listing->getKey());
+
+        $results = $parent->orderedRelation(ListingRevision::CustomersOrder)->query()->withPositions()->get();
+
+        $this->assertSame([$first->getKey() => 1, $second->getKey() => 2, $third->getKey() => 3], $shape->selectedPositions($results));
+        $this->assertSame(['Kept', null, 'Kept'], $results->pluck('kept_name')->all());
     }
 
     /**
@@ -760,6 +803,59 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([now()->toDateTimeString(), now()->toDateTimeString(), $before[2], $before[3]], $stamps());
     }
 
+    #[Test]
+    public function it_announces_only_the_source_for_a_save_into_a_parent_whose_relation_excludes_the_member(): void
+    {
+        [$audio, [, $moving]] = $this->playlist('audio', ['audio', 'audio']);
+        [$video] = $this->playlist('video', ['video']);
+        $revisions = [$this->tracksRevision($audio), $this->tracksRevision($video)];
+        $this->recordReorders();
+
+        $moving->playlist()->associate($video);
+
+        $this->assertTrue($moving->save());
+        $this->assertNull($video->orderedRelation(PlaylistRevision::TracksOrder)->position($moving));
+        $this->assertSame([[$audio->id, [[$moving->id, null, 2]]]], $this->reorders);
+        $this->assertSame([$revisions[0] + 1, $revisions[1] + 1], [$this->tracksRevision($audio), $this->tracksRevision($video)]);
+    }
+
+    #[Test]
+    public function it_announces_only_the_source_for_a_move_into_a_parent_whose_relation_excludes_the_member(): void
+    {
+        [$audio, [, $moving]] = $this->playlist('audio', ['audio', 'audio']);
+        [$video, [$held]] = $this->playlist('video', ['video']);
+        $revisions = [$this->tracksRevision($audio), $this->tracksRevision($video)];
+        $this->recordReorders();
+
+        $change = $moving->move(Placement::last()->in($video), expected: null);
+
+        $this->assertSame([[$audio->id, [[$moving->id, null, 2]]]], $this->reorders);
+        $this->assertSame([$revisions[0] + 1, $revisions[1] + 1], [$this->tracksRevision($audio), $this->tracksRevision($video)]);
+        $this->assertSame($video, $change->relation->parent);
+        $this->assertSame([$held->id], $change->order);
+        $this->assertSame([[$moving->id, null, null]], array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $change->changed));
+        $this->assertSame($audio->id, $change->source?->relation->parent->getKey());
+    }
+
+    #[Test]
+    public function it_reports_the_rebalance_of_a_parent_whose_relation_excludes_the_member_that_a_move_enters(): void
+    {
+        [, [$moving]] = $this->playlist('audio', ['audio']);
+        [$video, [$first, $second]] = $this->playlist('video', ['video', 'video']);
+        $prefix = 'a0'.str_repeat('V', OrderedRelation::MAX_KEY_LENGTH - 3);
+        DB::table('tracks')->where('id', $first->id)->update([OrderedRelation::RANK_KEY => $prefix.'V']);
+        DB::table('tracks')->where('id', $second->id)->update([OrderedRelation::RANK_KEY => $prefix.'W']);
+        $rebalanced = [];
+
+        Event::listen(Rebalanced::class, function (Rebalanced $event) use (&$rebalanced): void {
+            $rebalanced[] = [$event->relation->parent->getKey(), $event->ids];
+        });
+
+        $moving->move(Placement::after($first->id)->in($video), expected: null);
+
+        $this->assertSame([[$video->id, [$first->id, $second->id]]], $rebalanced);
+    }
+
     /**
      * @param  Closure(): (Model&OrdersRelations&Revisioned)  $parent
      */
@@ -1106,6 +1202,38 @@ class OrderedRelationTest extends TestCase
 
             return $key;
         })->values()->all();
+    }
+
+    /**
+     * @param  list<string>  $kinds
+     * @return array{Playlist, list<Track>}
+     */
+    private function playlist(string $kind, array $kinds): array
+    {
+        $playlist = Playlist::create(['kind' => $kind]);
+
+        return [$playlist, array_map(function (string $kind) use ($playlist): Track {
+            $track = new Track(['kind' => $kind]);
+            $track->playlist()->associate($playlist);
+            $track->save();
+
+            return $track;
+        }, $kinds)];
+    }
+
+    private function tracksRevision(Playlist $playlist): int
+    {
+        return (int) DB::table('playlists')->where('id', $playlist->id)->value('tracks_order_concurrency_revision');
+    }
+
+    private function recordReorders(): void
+    {
+        Event::listen(Reordered::class, function (Reordered $event): void {
+            $this->reorders[] = [
+                $event->change->relation->parent->getKey(),
+                array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $event->change->changed),
+            ];
+        });
     }
 
     private function addAsset(Section $section, string $title): Asset

@@ -748,18 +748,6 @@ class ReorderedTest extends TestCase
         $this->assertSame(3, $this->updated);
     }
 
-    #[DataProvider('shapes')]
-    #[Test]
-    public function it_fires_an_updated_event_for_an_eloquent_write_of_the_rank_key(Shape $shape): void
-    {
-        [, [$member]] = $shape->with(1);
-        $this->countUpdatedEvents($shape);
-
-        $member->setAttribute(OrderedRelation::RANK_KEY, 'b0')->save();
-
-        $this->assertSame(1, $this->updated);
-    }
-
     private function forget(): void
     {
         $this->dispatched = [];

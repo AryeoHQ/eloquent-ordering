@@ -38,6 +38,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
 use Throwable;
+use WeakMap;
 
 final class OrderedRelation
 {
@@ -65,6 +66,9 @@ final class OrderedRelation
 
     /** @var array<string, list<string>> */
     private static array $parentTableColumns = [];
+
+    /** @var null|WeakMap<Model, array<string, mixed>> */
+    private static null|WeakMap $prepared = null;
 
     private readonly string $relationName;
 
@@ -238,6 +242,42 @@ final class OrderedRelation
     public static function watchedColumns(Model&Ordered $item): array
     {
         return [self::RANK_KEY, ...self::membershipColumns($item), ...self::declaredColumns($item), OrderedRelations::DELETED_AT];
+    }
+
+    /**
+     * @internal
+     */
+    public static function prepared(Model&Ordered $item): void
+    {
+        $prepared = self::$prepared ??= new WeakMap;
+        $prepared[$item] = self::watchedAttributes($item);
+    }
+
+    /**
+     * @internal
+     */
+    public static function requirePrepared(Model&Ordered $item): void
+    {
+        $prepared = self::$prepared;
+
+        if ($prepared === null || ! $prepared->offsetExists($item)) {
+            return;
+        }
+
+        $before = $prepared[$item];
+        unset($prepared[$item]);
+        $changed = array_keys(array_filter(
+            self::watchedAttributes($item),
+            static fn (mixed $value, string $column): bool => $value !== ($before[$column] ?? null),
+            ARRAY_FILTER_USE_BOTH,
+        ));
+
+        throw_if($changed !== [], LogicException::class, sprintf(
+            'A listener changed [%s] of [%s:%s] after its order write was prepared.',
+            implode('], [', $changed),
+            $item::class,
+            $item->getKey(),
+        ));
     }
 
     /**
@@ -470,8 +510,15 @@ final class OrderedRelation
     {
         $id = self::keyOf($item);
         $left = $source->announce($source->change([$id => $previous]));
+        $change = $this->change([$id => null], $left);
 
-        return $this->announce($this->change([$id => null], $left));
+        if ($change->changed[0]->position !== null) {
+            return $this->announce($change);
+        }
+
+        $this->announceRebalance($change->revision);
+
+        return $change;
     }
 
     /**
@@ -693,6 +740,21 @@ final class OrderedRelation
     private static function parentNamedBy(array $membership, mixed $ownerKey): string
     {
         return self::parentClassOf($membership).':'.(is_int($ownerKey) || is_string($ownerKey) ? (string) $ownerKey : '');
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private static function watchedAttributes(Model&Ordered $item): array
+    {
+        $attributes = $item->getAttributes();
+        $watched = [];
+
+        foreach (self::watchedColumns($item) as $column) {
+            $watched[$column] = $attributes[$column] ?? null;
+        }
+
+        return $watched;
     }
 
     private static function requireConnectionOf(Model $item, Model $parent): void

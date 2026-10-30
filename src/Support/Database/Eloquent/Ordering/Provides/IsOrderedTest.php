@@ -220,7 +220,6 @@ class IsOrderedTest extends TestCase
     public static function writesWithoutSoftDeletes(): iterable
     {
         yield 'a save that changes the parent' => [fn (Video $video, Section $destination): mixed => $video->section()->associate($destination)];
-        yield 'a save that writes the rank key' => [fn (Video $video, Section $destination): mixed => $video->setAttribute('rank_key', 'Zz')];
     }
 
     /**
@@ -230,6 +229,24 @@ class IsOrderedTest extends TestCase
     {
         yield 'while the first parent is locked' => [0];
         yield 'while the second parent is locked' => [1];
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function lateSaveListeners(): iterable
+    {
+        yield 'an updating listener' => ['updating'];
+        yield 'a saving listener registered after boot' => ['saving'];
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function lateCreateListeners(): iterable
+    {
+        yield 'a saving listener registered after boot' => ['saving'];
+        yield 'a creating listener registered after boot' => ['creating'];
     }
 
     /**
@@ -634,6 +651,25 @@ class IsOrderedTest extends TestCase
         $this->assertFalse($stale->isDirty());
         $this->assertOrder($shape, [$third->getKey(), $first->getKey(), $second->getKey()], $parent);
         $this->assertSame($revision, $shape->storedRevision($parent));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_counts_the_position_again_after_a_stale_restore_of_a_member_whose_position_it_loaded(Shape $shape): void
+    {
+        [, [$first]] = $shape->with(3);
+        $first->delete();
+        $stale = $shape->find($this->key($first));
+        (new OrderedCollection([$stale]))->loadPositions();
+        $restored = $shape->find($this->key($first));
+        assert(method_exists($stale, 'restore') && method_exists($restored, 'restore'));
+        $this->assertNull($stale->getAttribute('position'));
+        $restored->restore();
+
+        $this->assertTrue($stale->restore());
+
+        $this->assertSame(3, $shape->find($this->key($first))->getAttribute('position'));
+        $this->assertSame(3, $stale->getAttribute('position'));
     }
 
     #[DataProvider('shapes')]
@@ -1146,22 +1182,23 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_writes_the_rank_key_of_a_stale_member_into_the_parent_it_moved_to(Shape $shape): void
+    public function it_refuses_a_save_that_sets_the_rank_key(Shape $shape): void
     {
-        [$source, [$member]] = $shape->with(1);
-        [$destination, [$holder]] = $shape->with(1);
-        $stale = $shape->find($this->key($member));
-        $member->move(Placement::last()->in($destination), expected: null);
-        $revision = $shape->storedRevision($source);
+        [$parent, [$member]] = $shape->with(2);
+        $member->setAttribute('rank_key', 'Zz');
 
-        $this->assertTrue($stale->setAttribute('rank_key', 'Zz')->save());
+        $this->assertRejected($shape, LogicException::class, fn (): bool => $member->save(), $parent);
+    }
 
-        $this->assertSame('Zz', $this->storedRankKey($shape, $member));
-        $this->assertSame($destination->getKey(), $stale->getAttribute($shape->foreignKey()));
-        $this->assertTrue($destination->is($stale->orderingRelation()->parent));
-        $this->assertFalse($stale->isDirty());
-        $this->assertOrder($shape, [$member->getKey(), $holder->getKey()], $destination);
-        $this->assertSame($revision, $shape->storedRevision($source));
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_refuses_a_new_member_whose_rank_key_is_set(Shape $shape): void
+    {
+        $parent = $shape->createParent();
+        $member = $shape->newMember($parent);
+        $member->setAttribute('rank_key', 'Zz');
+
+        $this->assertRejected($shape, LogicException::class, fn (): bool => $member->save(), $parent);
     }
 
     /**
@@ -1219,6 +1256,68 @@ class IsOrderedTest extends TestCase
         $this->assertSame($kept, $this->rankKey($moved));
         $this->assertFalse($moved->isDirty());
         $this->assertOrder($shape, [$moved->getKey(), $staying->getKey()], $source);
+    }
+
+    #[DataProvider('lateSaveListeners')]
+    #[Test]
+    public function it_refuses_a_listener_that_changes_the_parent_of_a_save_after_it_prepared_the_order(string $event): void
+    {
+        $shape = new HasManyShape;
+        $source = Section::create();
+        $destination = Section::create();
+        $moving = $shape->add($source);
+        $holder = $shape->add($destination);
+        $this->assertSame($this->storedRankKey($shape, $moving), $this->storedRankKey($shape, $holder));
+        $this->recordReorders();
+
+        Event::listen(sprintf('eloquent.%s: %s', $event, Asset::class), function (Asset $asset) use ($destination): void {
+            if ($asset->isDirty('title')) {
+                $asset->section_id = $destination->id;
+            }
+        });
+
+        $item = Asset::query()->findOrFail($moving->getKey());
+        $item->title = 'Renamed';
+
+        $this->assertRejected($shape, LogicException::class, fn (): bool => $item->save(), $source, $destination);
+        $this->assertSame(['section_id' => $source->id, 'title' => null], (array) DB::table('assets')->where('id', $moving->getKey())->first(['section_id', 'title']));
+        $this->assertSame([], $this->reorders);
+    }
+
+    #[DataProvider('lateCreateListeners')]
+    #[Test]
+    public function it_refuses_a_listener_that_changes_the_parent_of_a_create_after_it_prepared_the_order(string $event): void
+    {
+        $shape = new HasManyShape;
+        $source = Section::create();
+        $destination = Section::create();
+        $shape->add($destination);
+
+        Event::listen(sprintf('eloquent.%s: %s', $event, Asset::class), function (Asset $asset) use ($destination): void {
+            $asset->section_id = $destination->id;
+        });
+
+        $this->assertRejected($shape, LogicException::class, fn (): Model => $shape->add($source), $source, $destination);
+    }
+
+    #[DataProvider('lateSaveListeners')]
+    #[Test]
+    public function it_writes_a_column_outside_the_order_that_a_listener_changes_after_it_prepared_a_save(string $event): void
+    {
+        $shape = new HasManyShape;
+        [$source, [$staying, $moving]] = $shape->with(2);
+        [$destination, [$holder]] = $shape->with(1);
+
+        Event::listen(sprintf('eloquent.%s: %s', $event, Asset::class), function (Asset $asset): void {
+            $asset->title = 'Renamed';
+        });
+
+        $shape->associate($moving, $destination);
+
+        $this->assertTrue($moving->save());
+        $this->assertSame('Renamed', DB::table('assets')->where('id', $moving->getKey())->value('title'));
+        $this->assertOrder($shape, [$staying->getKey()], $source);
+        $this->assertOrder($shape, [$holder->getKey(), $moving->getKey()], $destination);
     }
 
     /**
@@ -1927,6 +2026,99 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
+    public function it_names_the_parent_that_a_write_of_the_member_locks_first_without_a_lock(Shape $shape): void
+    {
+        [$parent, [$member]] = $shape->with(1);
+        $loaded = $shape->find($this->key($member));
+        DB::enableQueryLog();
+
+        $parents = $loaded->parentsToLockFirst();
+
+        $this->assertSame([[$parent::class, $parent->getKey()]], array_map(fn (Model $model): array => [$model::class, $model->getKey()], $parents));
+        $this->assertSame([], array_filter(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => preg_match('/\bfor (no key )?(update|share)\b/', $query) === 1));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_names_the_parent_that_a_save_takes_the_member_from_and_the_parent_it_moves_it_to(Shape $shape): void
+    {
+        [$source, [$member]] = $shape->with(1);
+        [$destination] = $shape->with(1);
+        $shape->associate($member, $destination);
+
+        $parents = $member->parentsToLockFirst();
+
+        $this->assertSame(
+            [[$source::class, $source->getKey()], [$destination::class, $destination->getKey()]],
+            array_map(fn (Model $model): array => [$model::class, $model->getKey()], $parents),
+        );
+    }
+
+    #[Test]
+    public function it_names_no_parent_for_a_member_that_no_parent_orders(): void
+    {
+        $this->assertSame([], (new Asset)->parentsToLockFirst());
+    }
+
+    #[Test]
+    public function it_finishes_a_delete_that_locks_the_parents_first_and_a_reorder_of_the_parent_without_a_deadlock(): void
+    {
+        $racer = $this->racer();
+        [$section, [$deleted, $second, $third]] = $this->racingSectionWith(3);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('sections')->where('id', $section->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startReorder($section, [$third->id, $deleted->id, $second->id]);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startLockedDelete($deleted, 'parents first');
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): string => $rival->wait()->output(), $rivals);
+
+            $this->assertSame(['reordered', 'deleted'], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertSoftDeleted('assets', ['id' => $deleted->id]);
+            $this->assertOrder(new HasManyShape, [$third->id, $second->id], $section);
+            $this->assertSame(6, $this->sectionRevision($section));
+        } finally {
+            $this->finishRace($rivals, $section);
+        }
+    }
+
+    #[Test]
+    public function it_deadlocks_a_delete_that_locks_the_member_before_its_parents_with_a_reorder_of_the_parent(): void
+    {
+        $racer = $this->racer();
+        [$section, [$deleted, $second, $third]] = $this->racingSectionWith(3);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('sections')->where('id', $section->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startReorder($section, [$third->id, $deleted->id, $second->id]);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startLockedDelete($deleted, 'the member first');
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): string => $rival->wait()->output(), $rivals);
+
+            $this->assertContains('40P01', $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+        } finally {
+            $this->finishRace($rivals, $section);
+        }
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
     public function it_fires_the_model_events_of_a_member_and_then_of_its_parent_for_a_move_within_the_parent(Shape $shape): void
     {
         [$parent, [, , $moved]] = $shape->with(3);
@@ -2384,6 +2576,29 @@ class IsOrderedTest extends TestCase
             PHP_BINARY,
             dirname(__DIR__, 6).'/tests/Fixtures/Support/Concurrency/delete.php',
             (string) $asset->id,
+        ]);
+    }
+
+    private function startLockedDelete(Asset $asset, string $order): InvokedProcess
+    {
+        return Process::env($this->databaseEnvironment())->start([
+            PHP_BINARY,
+            dirname(__DIR__, 6).'/tests/Fixtures/Support/Concurrency/locked-delete.php',
+            (string) $asset->id,
+            $order,
+        ]);
+    }
+
+    /**
+     * @param  list<int>  $ids
+     */
+    private function startReorder(Section $section, array $ids): InvokedProcess
+    {
+        return Process::env($this->databaseEnvironment())->start([
+            PHP_BINARY,
+            dirname(__DIR__, 6).'/tests/Fixtures/Support/Concurrency/reorder.php',
+            (string) $section->id,
+            implode(',', $ids),
         ]);
     }
 
