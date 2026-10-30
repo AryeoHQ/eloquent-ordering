@@ -1,0 +1,7 @@
+parameters:
+    ignoreErrors:
+        -
+            identifier: staticMethod.dynamicCall
+            message: '#^Dynamic call to static method Illuminate\\Database\\Schema\\Blueprint::rankKey\(\)\.$#'
+
+services: []
