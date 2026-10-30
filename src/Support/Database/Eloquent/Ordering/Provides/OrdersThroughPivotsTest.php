@@ -210,6 +210,27 @@ class OrdersThroughPivotsTest extends TestCase
         $this->assertTrue($lock < $read && $read < $write && $write < $raise);
     }
 
+    #[DefineEnvironment('orderTheCustomersOfAListingByName')]
+    #[Test]
+    public function it_locks_the_listing_before_the_customer_when_a_save_changes_a_declared_customer_column(): void
+    {
+        self::recordCustomerNames();
+        $listing = Listing::create();
+        $customer = Customer::create(['name' => 'Ada']);
+        $listing->customers()->attach($customer);
+        DB::enableQueryLog();
+
+        $this->runDeferredChecks(fn (): bool => $customer->update(['name' => 'Grace']));
+
+        $queries = array_column(DB::getQueryLog(), 'query');
+        $lock = array_find_key($queries, fn (string $query): bool => str_contains($query, 'from "listings"') && str_ends_with($query, 'for no key update'));
+        $write = array_find_key($queries, fn (string $query): bool => str_starts_with($query, 'update "customers" set "name"'));
+
+        $this->assertIsInt($lock);
+        $this->assertIsInt($write);
+        $this->assertTrue($lock < $write);
+    }
+
     #[DataProvider('pivots')]
     #[Test]
     public function it_raises_nothing_for_a_change_to_a_customer_column_no_relation_declares(PivotShape $shape): void
