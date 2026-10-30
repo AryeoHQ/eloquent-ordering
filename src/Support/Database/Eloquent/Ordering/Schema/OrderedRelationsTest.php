@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Ordering\Schema;
 
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -27,6 +28,10 @@ use Tests\TestCase;
 #[CoversClass(Macros::class)]
 class OrderedRelationsTest extends TestCase
 {
+    private const string ASSETS_ORDER = 'assets_order_concurrency_revision';
+
+    private const string SCENES_ORDER = 'scenes_order_concurrency_revision';
+
     /**
      * @return iterable<string, array{string, list<string>}>
      */
@@ -53,24 +58,25 @@ class OrderedRelationsTest extends TestCase
      */
     #[DataProvider('watchedColumns')]
     #[Test]
-    public function it_compiles_triggers_that_watch_the_rank_key_the_relation_and_the_soft_delete(string $table, array $columns): void
+    public function it_installs_item_recorders_that_watch_the_rank_key_the_relation_and_the_soft_delete(string $table, array $columns): void
     {
         $sets = array_map(function (mixed $trigger): array {
             $this->assertIsObject($trigger);
             $this->assertIsString($trigger->arguments);
 
-            $watched = json_decode(explode('\000', $trigger->arguments)[3] ?? '', true, flags: JSON_THROW_ON_ERROR);
+            $arguments = explode('\000', $trigger->arguments);
+            $this->assertSame('item', $arguments[0]);
+
+            $watched = json_decode($arguments[4] ?? '', true, flags: JSON_THROW_ON_ERROR);
             $this->assertIsArray($watched);
             sort($watched);
 
             return $watched;
-        }, DB::select(
-            "select encode(t.tgargs, 'escape') as arguments from pg_trigger t join pg_proc p on p.oid = t.tgfoid where t.tgrelid = to_regclass(?) and p.proname = ?",
-            [$table, ConcurrencyRevisions::NAMED_FUNCTION],
-        ));
+        }, $this->triggers($table, ConcurrencyRevisions::NAMED_FUNCTION));
 
         $this->assertNotSame([], $sets);
         $this->assertSame([$columns], array_values(array_unique($sets, SORT_REGULAR)));
+        $this->assertSame(count($sets), 3 * count($this->triggers($table, ConcurrencyRevisions::NAMED_CHECK_FUNCTION, deferred: true)));
     }
 
     #[Test]
@@ -98,76 +104,84 @@ class OrderedRelationsTest extends TestCase
     }
 
     #[Test]
-    public function it_increments_the_order_revision_once_for_a_statement_that_inserts_items(): void
+    public function it_refuses_the_commit_of_an_insert_that_no_order_revision_raise_follows(): void
     {
         $section = Section::create();
-
-        DB::table('assets')->insert([
+        $insert = fn (): bool => DB::table('assets')->insert([
             ['section_id' => $section->id, 'rank_key' => 'a0'],
             ['section_id' => $section->id, 'rank_key' => 'a1'],
-            ['section_id' => $section->id, 'rank_key' => 'a2'],
         ]);
 
-        $this->assertSame(2, $this->storedRevision($section));
+        $this->assertRefused($insert);
+        $this->runDeferredChecks(function () use ($insert, $section): void {
+            $insert();
+            $this->raise($section, self::ASSETS_ORDER);
+        });
+
+        $this->assertSame(2, $this->storedRevision($section, self::ASSETS_ORDER));
     }
 
     #[Test]
-    public function it_increments_the_order_revision_when_a_rank_key_changes(): void
-    {
-        $section = Section::create();
-        $id = DB::table('assets')->insertGetId(['section_id' => $section->id, 'rank_key' => 'a0']);
-
-        DB::table('assets')->where('id', $id)->update(['rank_key' => 'a1']);
-
-        $this->assertSame(3, $this->storedRevision($section));
-    }
-
-    #[Test]
-    public function it_keeps_the_order_revision_when_an_unwatched_column_changes(): void
-    {
-        $section = Section::create();
-        $id = DB::table('assets')->insertGetId(['section_id' => $section->id, 'rank_key' => 'a0']);
-
-        DB::table('assets')->where('id', $id)->update(['title' => 'Dusk']);
-
-        $this->assertSame(2, $this->storedRevision($section));
-    }
-
-    #[Test]
-    public function it_increments_both_order_revisions_when_an_item_changes_parent(): void
-    {
-        $source = Section::create();
-        $destination = Section::create();
-        $id = DB::table('assets')->insertGetId(['section_id' => $source->id, 'rank_key' => 'a0']);
-
-        DB::table('assets')->where('id', $id)->update(['section_id' => $destination->id]);
-
-        $this->assertSame(3, $this->storedRevision($source));
-        $this->assertSame(2, $this->storedRevision($destination));
-    }
-
-    #[Test]
-    public function it_increments_the_order_revision_when_a_query_builder_soft_deletes_an_item(): void
+    public function it_refuses_the_commit_of_a_rank_key_change_that_no_order_revision_raise_follows(): void
     {
         $section = Section::create();
         $asset = Asset::create(['section_id' => $section->id]);
 
-        Asset::query()->whereKey($asset->id)->delete();
-
-        $this->assertSame(3, $this->storedRevision($section));
-        $this->assertSame($asset->rank_key, DB::table('assets')->where('id', $asset->id)->value('rank_key'));
-        $this->assertSame([], $section->orderedRelation(SectionRevision::AssetsOrder)->query()->pluck('id')->all());
+        $this->assertRefused(fn (): int => DB::table('assets')->where('id', $asset->id)->update(['rank_key' => 'b0']));
     }
 
     #[Test]
-    public function it_increments_the_order_revision_when_an_item_is_deleted(): void
+    public function it_commits_a_change_to_an_unwatched_column_without_an_order_revision_raise(): void
     {
         $section = Section::create();
-        $id = DB::table('assets')->insertGetId(['section_id' => $section->id, 'rank_key' => 'a0']);
+        $asset = Asset::create(['section_id' => $section->id]);
 
-        DB::table('assets')->where('id', $id)->delete();
+        $this->runDeferredChecks(fn (): int => DB::table('assets')->where('id', $asset->id)->update(['title' => 'Dusk']));
 
-        $this->assertSame(3, $this->storedRevision($section));
+        $this->assertSame(2, $this->storedRevision($section, self::ASSETS_ORDER));
+    }
+
+    #[Test]
+    public function it_refuses_the_commit_of_a_parent_change_unless_both_order_revisions_rise(): void
+    {
+        $source = Section::create();
+        $destination = Section::create();
+        $asset = Asset::create(['section_id' => $source->id]);
+        $move = fn (): int => DB::table('assets')->where('id', $asset->id)->update(['section_id' => $destination->id]);
+
+        $this->assertRefused(function () use ($move, $destination): void {
+            $move();
+            $this->raise($destination, self::ASSETS_ORDER);
+        });
+        $this->assertRefused(function () use ($move, $source): void {
+            $move();
+            $this->raise($source, self::ASSETS_ORDER);
+        });
+        $this->runDeferredChecks(function () use ($move, $source, $destination): void {
+            $move();
+            $this->raise($source, self::ASSETS_ORDER);
+            $this->raise($destination, self::ASSETS_ORDER);
+        });
+
+        $this->assertSame([3, 2], [$this->storedRevision($source, self::ASSETS_ORDER), $this->storedRevision($destination, self::ASSETS_ORDER)]);
+    }
+
+    #[Test]
+    public function it_refuses_the_commit_of_a_query_builder_soft_delete_that_no_order_revision_raise_follows(): void
+    {
+        $section = Section::create();
+        $asset = Asset::create(['section_id' => $section->id]);
+
+        $this->assertRefused(fn (): mixed => Asset::query()->whereKey($asset->id)->delete());
+    }
+
+    #[Test]
+    public function it_refuses_the_commit_of_a_delete_that_no_order_revision_raise_follows(): void
+    {
+        $section = Section::create();
+        $asset = Asset::create(['section_id' => $section->id]);
+
+        $this->assertRefused(fn (): int => DB::table('assets')->where('id', $asset->id)->delete());
     }
 
     #[Test]
@@ -176,43 +190,61 @@ class OrderedRelationsTest extends TestCase
         $section = Section::create();
 
         OrderedRelations::dropTrigger('assets', SectionRevision::AssetsOrder->value);
-        DB::table('assets')->insert(['section_id' => $section->id, 'rank_key' => 'a0']);
+        $this->runDeferredChecks(fn (): bool => DB::table('assets')->insert(['section_id' => $section->id, 'rank_key' => 'a0']));
 
-        $this->assertSame(1, $this->storedRevision($section));
+        $this->assertSame([], $this->triggers('assets', ConcurrencyRevisions::NAMED_FUNCTION));
+        $this->assertSame([], $this->triggers('assets', ConcurrencyRevisions::NAMED_CHECK_FUNCTION, deferred: true));
+        $this->assertSame(1, $this->storedRevision($section, self::ASSETS_ORDER));
     }
 
     #[Test]
-    public function it_increments_the_order_revision_of_the_morph_parent_whose_type_a_statement_names(): void
+    public function it_records_only_the_morph_parent_whose_type_a_statement_names(): void
     {
         $tour = Tour::create();
         $listing = Listing::create(['id' => $tour->id]);
-
-        DB::table('scenes')->insert([
-            ['id' => Str::uuid7()->toString(), 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0'],
-            ['id' => Str::uuid7()->toString(), 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a1'],
+        $insert = fn (Model $parent): bool => DB::table('scenes')->insert([
+            ['id' => Str::uuid7()->toString(), 'sceneable_type' => $parent->getMorphClass(), 'sceneable_id' => $parent->getKey(), 'rank_key' => 'a0'],
         ]);
 
-        $this->assertSame(2, $this->scenesRevision($tour));
-        $this->assertSame(1, $this->scenesRevision($listing));
+        $this->assertRefused(function () use ($insert, $tour, $listing): void {
+            $insert($tour);
+            $this->raise($listing, self::SCENES_ORDER);
+        });
+        $this->runDeferredChecks(function () use ($insert, $tour): void {
+            $insert($tour);
+            $this->raise($tour, self::SCENES_ORDER);
+        });
+        $this->runDeferredChecks(function () use ($insert, $listing): void {
+            $insert($listing);
+            $this->raise($listing, self::SCENES_ORDER);
+        });
 
-        DB::table('scenes')->insert(['id' => Str::uuid7()->toString(), 'sceneable_type' => $listing->getMorphClass(), 'sceneable_id' => $listing->id, 'rank_key' => 'a0']);
-
-        $this->assertSame(2, $this->scenesRevision($tour));
-        $this->assertSame(2, $this->scenesRevision($listing));
+        $this->assertSame([2, 2], [$this->storedRevision($tour, self::SCENES_ORDER), $this->storedRevision($listing, self::SCENES_ORDER)]);
     }
 
     #[Test]
-    public function it_increments_both_morph_parents_when_an_item_changes_parent_type(): void
+    public function it_records_both_morph_parents_when_an_item_changes_parent_type(): void
     {
         $tour = Tour::create();
         $listing = Listing::create();
         $id = Str::uuid7()->toString();
-        DB::table('scenes')->insert(['id' => $id, 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0']);
+        $this->runDeferredChecks(function () use ($id, $tour): void {
+            DB::table('scenes')->insert(['id' => $id, 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0']);
+            $this->raise($tour, self::SCENES_ORDER);
+        });
+        $move = fn (): int => DB::table('scenes')->where('id', $id)->update(['sceneable_type' => $listing->getMorphClass(), 'sceneable_id' => $listing->id]);
 
-        DB::table('scenes')->where('id', $id)->update(['sceneable_type' => $listing->getMorphClass(), 'sceneable_id' => $listing->id]);
+        $this->assertRefused(function () use ($move, $listing): void {
+            $move();
+            $this->raise($listing, self::SCENES_ORDER);
+        });
+        $this->runDeferredChecks(function () use ($move, $tour, $listing): void {
+            $move();
+            $this->raise($tour, self::SCENES_ORDER);
+            $this->raise($listing, self::SCENES_ORDER);
+        });
 
-        $this->assertSame(3, $this->scenesRevision($tour));
-        $this->assertSame(2, $this->scenesRevision($listing));
+        $this->assertSame([3, 2], [$this->storedRevision($tour, self::SCENES_ORDER), $this->storedRevision($listing, self::SCENES_ORDER)]);
     }
 
     #[Test]
@@ -220,13 +252,16 @@ class OrderedRelationsTest extends TestCase
     {
         $tour = Tour::create();
         $id = Str::uuid7()->toString();
-        DB::table('scenes')->insert(['id' => $id, 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0']);
+        $this->runDeferredChecks(function () use ($id, $tour): void {
+            DB::table('scenes')->insert(['id' => $id, 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0']);
+            $this->raise($tour, self::SCENES_ORDER);
+        });
 
-        DB::table('scenes')->where('id', $id)->update(['rank_key' => 'a1']);
-        DB::table('scenes')->where('id', $id)->update(['title' => 'Porch']);
-        DB::table('scenes')->where('id', $id)->update(['deleted_at' => now()]);
+        $this->assertRefused(fn (): int => DB::table('scenes')->where('id', $id)->update(['rank_key' => 'a1']));
+        $this->assertRefused(fn (): int => DB::table('scenes')->where('id', $id)->update(['deleted_at' => now()]));
+        $this->runDeferredChecks(fn (): int => DB::table('scenes')->where('id', $id)->update(['title' => 'Porch']));
 
-        $this->assertSame(4, $this->scenesRevision($tour));
+        $this->assertSame(2, $this->storedRevision($tour, self::SCENES_ORDER));
     }
 
     #[Test]
@@ -236,43 +271,52 @@ class OrderedRelationsTest extends TestCase
         $listing = Listing::create();
 
         OrderedRelations::dropTrigger('scenes', TourRevision::ScenesOrder->value);
-        DB::table('scenes')->insert([
+        $this->runDeferredChecks(fn (): bool => DB::table('scenes')->insert([
             ['id' => Str::uuid7()->toString(), 'sceneable_type' => $tour->getMorphClass(), 'sceneable_id' => $tour->id, 'rank_key' => 'a0'],
             ['id' => Str::uuid7()->toString(), 'sceneable_type' => $listing->getMorphClass(), 'sceneable_id' => $listing->id, 'rank_key' => 'a0'],
-        ]);
+        ]));
 
         $this->assertSame(ListingRevision::ScenesOrder->value, TourRevision::ScenesOrder->value);
-        $this->assertSame(1, $this->scenesRevision($tour));
-        $this->assertSame(1, $this->scenesRevision($listing));
+        $this->assertSame([], $this->triggers('scenes', ConcurrencyRevisions::NAMED_FUNCTION));
+        $this->assertSame([1, 1], [$this->storedRevision($tour, self::SCENES_ORDER), $this->storedRevision($listing, self::SCENES_ORDER)]);
     }
 
     #[DataProvider('archetype')]
     #[Test]
-    public function it_increments_the_order_revision_of_a_uuid_parent_that_a_row_names_by_its_morph_alias(UuidMorphManyShape $shape): void
+    public function it_records_a_uuid_parent_only_for_a_row_that_names_it_by_its_morph_alias(UuidMorphManyShape $shape): void
     {
         $gallery = $shape->createParent();
         $slide = $shape->add($gallery);
+        $insert = fn (string $type): bool => DB::table('slides')->insert(['id' => Str::uuid7()->toString(), 'slideable_type' => $type, 'slideable_id' => $gallery->id, 'rank_key' => 'a1']);
 
         $this->assertTrue(Relation::requiresMorphMap());
         $this->assertSame(Gallery::MORPH_ALIAS, DB::table('slides')->where('id', $slide->getKey())->value('slideable_type'));
         $this->assertSame(2, $shape->storedRevision($gallery));
 
-        DB::table('slides')->insert(['id' => Str::uuid7()->toString(), 'slideable_type' => Gallery::class, 'slideable_id' => $gallery->id, 'rank_key' => 'a1']);
+        $this->runDeferredChecks(fn (): bool => $insert(Gallery::class));
+        $this->assertRefused(fn (): bool => $insert(Gallery::MORPH_ALIAS));
 
         $this->assertSame(2, $shape->storedRevision($gallery));
-
-        DB::table('slides')->insert(['id' => Str::uuid7()->toString(), 'slideable_type' => Gallery::MORPH_ALIAS, 'slideable_id' => $gallery->id, 'rank_key' => 'a2']);
-
-        $this->assertSame(3, $shape->storedRevision($gallery));
     }
 
-    private function scenesRevision(Tour|Listing $parent): int
+    /**
+     * @return list<object>
+     */
+    private function triggers(string $table, string $function, bool $deferred = false): array
     {
-        return (int) DB::table($parent->getTable())->where('id', $parent->id)->value('scenes_order_concurrency_revision');
+        return DB::select(
+            "select encode(t.tgargs, 'escape') as arguments from pg_trigger t join pg_proc p on p.oid = t.tgfoid where t.tgrelid = to_regclass(?) and p.proname = ? and t.tgdeferrable = ? and t.tginitdeferred = ?",
+            [$table, $function, $deferred, $deferred],
+        );
     }
 
-    private function storedRevision(Section $section): int
+    private function raise(Model $parent, string $column): void
     {
-        return (int) DB::table('sections')->where('id', $section->id)->value('assets_order_concurrency_revision');
+        DB::table($parent->getTable())->where('id', $parent->getKey())->increment($column);
+    }
+
+    private function storedRevision(Model $parent, string $column): int
+    {
+        return (int) DB::table($parent->getTable())->where('id', $parent->getKey())->value($column);
     }
 }

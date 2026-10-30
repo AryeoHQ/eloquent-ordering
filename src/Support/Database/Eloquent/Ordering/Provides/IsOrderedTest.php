@@ -17,7 +17,6 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
-use stdClass;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
@@ -32,7 +31,6 @@ use Support\Database\Eloquent\Ordering\Placement;
 use Tests\Fixtures\Support\Albums\Album;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Boards\Board;
-use Tests\Fixtures\Support\Casts\JsonObject;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Events\ModelUpdated;
@@ -116,27 +114,97 @@ class IsOrderedTest extends TestCase
     /**
      * @return iterable<string, list<mixed>>
      */
-    public static function refusals(): iterable
+    public static function listenerWrites(): iterable
     {
         return Shape::crossed([
-            'a saving listener of the member' => [fn (Shape $shape, Model $parent): string => $shape->memberClass(), 'saving'],
-            'an updating listener of the parent' => [fn (Shape $shape, Model $parent): string => $parent::class, 'updating'],
+            'a saving listener of the member' => [fn (Model $parent, Model $moved): Model => $moved, 'saving'],
+            'an updating listener of the parent' => [fn (Model $parent, Model $moved): Model => $parent, 'updating'],
         ]);
     }
 
     /**
      * @return iterable<string, list<mixed>>
      */
-    public static function castChanges(): iterable
+    public static function packageWrites(): iterable
     {
-        return Shape::crossed([
-            'an assignment' => [fn (Model $model): mixed => $model->setAttribute('address', (object) ['zip' => '2', 'city' => 'X'])],
-            'a change to the cast object' => [function (Model $model): void {
-                $address = $model->getAttribute('address');
-                assert($address instanceof stdClass);
-                $address->zip = '2';
+        yield from Shape::crossed([
+            'a create' => [static function (Shape $shape): array {
+                [$parent] = $shape->with(1);
+
+                return [[$parent], fn (): Model => $shape->add($parent)];
+            }],
+            'a create that rebalances' => [static function (Shape $shape): array {
+                [$parent, [$first, $second]] = $shape->with(2);
+                $shape->crowd($first, $second);
+
+                return [[$parent], fn (): Model => $shape->add($parent, Placement::after(self::keyOf($first)))];
+            }],
+            'a move within a parent' => [static function (Shape $shape): array {
+                [$parent, [, , $moved]] = $shape->with(3);
+
+                return [[$parent], fn (): OrderChange => $moved->move(Placement::first(), expected: null)];
+            }],
+            'a move that rebalances' => [static function (Shape $shape): array {
+                [$parent, [$first, $second, $moved]] = $shape->with(3);
+                $shape->crowd($first, $second);
+
+                return [[$parent], fn (): OrderChange => $moved->move(Placement::after(self::keyOf($first)), expected: null)];
+            }],
+            'a move between parents' => [static function (Shape $shape): array {
+                [$source, [, $moved]] = $shape->with(2);
+                [$destination] = $shape->with(1);
+
+                return [[$source, $destination], fn (): OrderChange => $moved->move(Placement::last()->in($destination), expected: null)];
+            }],
+            'a save that changes the parent' => [static function (Shape $shape): array {
+                [$source, [, $moved]] = $shape->with(2);
+                [$destination] = $shape->with(1);
+                $shape->associate($moved, $destination);
+
+                return [[$source, $destination], fn (): bool => $moved->save()];
+            }],
+            'a reorder' => [static function (Shape $shape): array {
+                [$parent, [$first, $second, $third]] = $shape->with(3);
+
+                return [[$parent], fn (): OrderChange => $shape->orderedRelation($parent)->reorder([self::keyOf($third), self::keyOf($first), self::keyOf($second)], expected: null)];
+            }],
+            'a soft delete' => [static function (Shape $shape): array {
+                [$parent, [, $member]] = $shape->with(2);
+
+                return [[$parent], fn (): mixed => $member->delete()];
+            }],
+            'a force delete' => [static function (Shape $shape): array {
+                [$parent, [, $member]] = $shape->with(2);
+                assert(method_exists($member, 'forceDelete'));
+
+                return [[$parent], fn (): mixed => $member->forceDelete()];
+            }],
+            'a restore' => [static function (Shape $shape): array {
+                [$parent, [, $member]] = $shape->with(2);
+                $member->delete();
+                assert(method_exists($member, 'restore'));
+
+                return [[$parent], fn (): mixed => $member->restore()];
             }],
         ]);
+
+        foreach (PivotShape::pivots() as $name => [$shape]) {
+            yield "{$name}, an attach" => [$shape, static function (Shape $shape): array {
+                assert($shape instanceof PivotShape);
+                [$parent] = $shape->with(1);
+
+                return [[$parent], function () use ($shape, $parent): void {
+                    $shape->customers($parent)->attach(Customer::create());
+                }];
+            }];
+
+            yield "{$name}, a detach" => [$shape, static function (Shape $shape): array {
+                assert($shape instanceof PivotShape);
+                [$parent, [, $member]] = $shape->with(2);
+
+                return [[$parent], fn (): int => $shape->customers($parent)->detach($member->getAttribute('customer_id'))];
+            }];
+        }
     }
 
     /**
@@ -272,7 +340,7 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('positionedWrites')]
     #[Test]
-    public function it_replays_no_position_for_a_member_with_a_selected_position(Shape $shape, Closure $write): void
+    public function it_reports_no_position_in_the_events_of_a_member_with_a_selected_position(Shape $shape, Closure $write): void
     {
         [$parent] = $shape->with(3);
         [$destination] = $shape->with(1);
@@ -489,7 +557,7 @@ class IsOrderedTest extends TestCase
         $this->assertSame($this->storedRankKey($shape, $first), $this->rankKey($first));
         $this->assertFalse($first->isDirty());
         $this->assertOrder($shape, [$second->getKey(), $third->getKey(), $first->getKey()], $parent);
-        $this->assertGreaterThan($deleted, $shape->storedRevision($parent));
+        $this->assertSame($deleted + 1, $shape->storedRevision($parent));
         $this->assertSame($shape->storedRevision($parent), $parent->concurrencyRevision($shape->revision()));
         $this->assertFalse($parent->isDirty());
         $this->assertSame($parent, $first->orderingRelation()->parent);
@@ -619,7 +687,7 @@ class IsOrderedTest extends TestCase
 
         $member->delete();
 
-        $this->assertGreaterThan(2, $parent->concurrencyRevision($shape->revision()));
+        $this->assertSame(3, $parent->concurrencyRevision($shape->revision()));
         $this->assertSame($shape->storedRevision($parent), $parent->concurrencyRevision($shape->revision()));
         $this->assertFalse($parent->isDirty());
     }
@@ -674,7 +742,7 @@ class IsOrderedTest extends TestCase
     }
 
     #[Test]
-    public function it_reads_the_own_revision_of_a_revisioned_member_again_after_a_move(): void
+    public function it_raises_the_own_revision_of_a_revisioned_member_for_a_move_between_parents_only(): void
     {
         $section = Section::create();
         $destination = Section::create();
@@ -684,15 +752,16 @@ class IsOrderedTest extends TestCase
 
         $video->move(Placement::first(), expected: null);
 
-        $this->assertGreaterThan(1, $this->videoRevision($video));
-        $this->assertSame($this->videoRevision($video), $video->concurrencyRevision());
+        $this->assertSame(1, $this->videoRevision($video));
+        $this->assertSame(1, $video->concurrencyRevision());
         $this->assertSame(['title' => 'Dusk'], $video->getDirty());
 
         $video->move(Placement::last()->in($destination), expected: null);
 
-        $this->assertSame($this->videoRevision($video), $video->concurrencyRevision());
+        $this->assertSame(2, $this->videoRevision($video));
+        $this->assertSame(2, $video->concurrencyRevision());
         $this->assertSame(['title' => 'Dusk'], $video->getDirty());
-        $this->assertSame($video->concurrencyRevision() + 1, $video->claimConcurrencyRevision($video->concurrencyRevision()));
+        $this->assertSame(3, $video->claimConcurrencyRevision(2));
     }
 
     #[DataProvider('shapes')]
@@ -1171,7 +1240,7 @@ class IsOrderedTest extends TestCase
         $this->assertSame($parent, $change->relation->parent);
         $this->assertSame($shape->revision(), $change->relation->revision);
         $this->assertNull($change->source);
-        $this->assertGreaterThan(5, $change->revision);
+        $this->assertSame(6, $change->revision);
         $this->assertSame($shape->storedRevision($parent), $change->revision);
         $this->assertSame($change->revision, $parent->concurrencyRevision($shape->revision()));
         $this->assertFalse($parent->isDirty());
@@ -1193,7 +1262,7 @@ class IsOrderedTest extends TestCase
         $this->assertSame($destination, $change->relation->parent);
         $this->assertSame([$anchor->getKey(), $moved->getKey(), $last->getKey()], $change->order);
         $this->assertSame([['id' => $this->key($moved), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
-        $this->assertGreaterThan(3, $change->revision);
+        $this->assertSame(4, $change->revision);
         $this->assertSame($shape->storedRevision($destination), $change->revision);
         $this->assertSame($change->revision, $destination->concurrencyRevision($shape->revision()));
         $this->assertFalse($destination->isDirty());
@@ -1202,7 +1271,7 @@ class IsOrderedTest extends TestCase
         $this->assertSame($source, $change->source->relation->parent);
         $this->assertSame([$first->getKey(), $third->getKey()], $change->source->order);
         $this->assertSame([['id' => $this->key($moved), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $change->source->changed));
-        $this->assertGreaterThan(4, $change->source->revision);
+        $this->assertSame(5, $change->source->revision);
         $this->assertSame($shape->storedRevision($source), $change->source->revision);
         $this->assertSame($change->source->revision, $source->concurrencyRevision($shape->revision()));
         $this->assertFalse($source->isDirty());
@@ -1267,7 +1336,7 @@ class IsOrderedTest extends TestCase
         $change = $second->move(Placement::first(), expected: null);
 
         $this->assertOrder($shape, [$second->getKey(), $first->getKey()], $parent);
-        $this->assertGreaterThan(40, $change->revision);
+        $this->assertSame(41, $change->revision);
         $this->assertSame($shape->storedRevision($parent), $change->revision);
     }
 
@@ -1801,7 +1870,7 @@ class IsOrderedTest extends TestCase
             $this->assertSame('deleted', $result->output(), $result->errorOutput());
             $this->assertSoftDeleted('assets', ['id' => $moved->id]);
             $this->assertSame(4, $this->sectionRevision($source));
-            $this->assertGreaterThan(2, $this->sectionRevision($destination));
+            $this->assertSame(3, $this->sectionRevision($destination));
             $this->assertOrder(new HasManyShape, [$staying->id], $source);
             $this->assertOrder(new HasManyShape, [], $destination);
         } finally {
@@ -1851,41 +1920,44 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_replays_the_model_events_of_a_member_and_its_parent_for_a_move_within_the_parent(Shape $shape): void
+    public function it_fires_the_model_events_of_a_member_and_then_of_its_parent_for_a_move_within_the_parent(Shape $shape): void
     {
         [$parent, [, , $moved]] = $shape->with(3);
         $this->travel(1)->minutes();
-        [$member, $order] = [ModelEvents::row($moved), ModelEvents::row($parent)];
+        $member = ModelEvents::row($moved);
+        $revision = $shape->storedRevision($parent);
         $events = ModelEvents::record();
 
         $moved->move(Placement::first(), expected: null);
 
         $this->assertSame([
-            ...ModelEvents::replay($moved, $member, ModelEvents::row($moved)),
-            ...ModelEvents::replay($parent, $order, ModelEvents::row($parent)),
-        ], $events->fired);
+            ...self::savedEvents($moved, $member, ModelEvents::row($moved)),
+            ...self::raisedEvents($parent, $shape->column(), $revision),
+        ], self::sqlOf($events->fired));
         $this->assertArrayHasKey(OrderedRelation::RANK_KEY, $events->fired[0][4]);
-        $this->assertArrayHasKey($shape->column(), $events->fired[4][4]);
+        $this->assertSame($revision + 1, $shape->storedRevision($parent));
     }
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_replays_the_model_events_of_a_member_and_both_parents_for_a_move_between_parents(Shape $shape): void
+    public function it_fires_the_model_events_of_a_member_and_then_of_both_parents_for_a_move_between_parents(Shape $shape): void
     {
         [$source, [, $moved]] = $shape->with(2);
         [$destination] = $shape->with(1);
         $this->travel(1)->minutes();
-        $rows = array_map(ModelEvents::row(...), [$moved, $source, $destination]);
+        $member = ModelEvents::row($moved);
+        $revisions = [$shape->storedRevision($source), $shape->storedRevision($destination)];
         $events = ModelEvents::record();
 
         $moved->move(Placement::last()->in($destination), expected: null);
 
         $this->assertSame([
-            ...ModelEvents::replay($moved, $rows[0], ModelEvents::row($moved)),
-            ...ModelEvents::replay($source, $rows[1], ModelEvents::row($source)),
-            ...ModelEvents::replay($destination, $rows[2], ModelEvents::row($destination)),
-        ], $events->fired);
+            ...self::savedEvents($moved, $member, ModelEvents::row($moved)),
+            ...self::raisedEvents($source, $shape->column(), $revisions[0]),
+            ...self::raisedEvents($destination, $shape->column(), $revisions[1]),
+        ], self::sqlOf($events->fired));
         $this->assertSame([$shape->foreignKey() => $destination->getKey()], array_intersect_key($events->fired[0][4], [$shape->foreignKey() => true]));
+        $this->assertSame([$revisions[0] + 1, $revisions[1] + 1], [$shape->storedRevision($source), $shape->storedRevision($destination)]);
     }
 
     #[DataProvider('shapes')]
@@ -1904,7 +1976,7 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_dispatches_the_updated_event_class_of_a_replayed_member_and_parent(Shape $shape): void
+    public function it_dispatches_the_updated_event_class_of_a_moved_member_and_its_parent(Shape $shape): void
     {
         [$parent, [, $moved]] = $shape->with(2);
         $updated = [];
@@ -1942,73 +2014,46 @@ class IsOrderedTest extends TestCase
     }
 
     /**
-     * @param  Closure(Shape, Model): string  $class
+     * @param  Closure(Model, Model): Model  $saved
      */
-    #[DataProvider('refusals')]
+    #[DataProvider('listenerWrites')]
     #[Test]
-    public function it_refuses_a_listener_that_changes_a_replayed_row(Shape $shape, Closure $class, string $event): void
+    public function it_writes_what_a_listener_sets_on_a_member_or_a_parent_that_a_move_saves(Shape $shape, Closure $saved, string $event): void
     {
         [$parent, [$first, $moved]] = $shape->with(2);
-        $state = [$moved->getAttributes(), $moved->getRawOriginal(), $parent->getAttributes()];
-        $stored = [$shape->storedRevision($parent), $shape->rankKeys($parent)];
+        $model = $saved($parent, $moved);
 
-        Event::listen(sprintf('eloquent.%s: %s', $event, $class($shape, $parent)), function (Model $model): void {
+        Event::listen(sprintf('eloquent.%s: %s', $event, $model::class), function (Model $model): void {
             $model->setAttribute('updated_at', '2001-02-03 04:05:06');
-        });
-
-        try {
-            $moved->move(Placement::first(), expected: null);
-            $this->fail('A listener changed a replayed row.');
-        } catch (LogicException $exception) {
-            $this->assertStringContainsString(sprintf('changed [updated_at] of [%s:', $class($shape, $parent)), $exception->getMessage());
-        }
-
-        $this->assertSame($stored, [$shape->storedRevision($parent), $shape->rankKeys($parent)]);
-        $this->assertSame($state, [$moved->getAttributes(), $moved->getRawOriginal(), $parent->getAttributes()]);
-        $this->assertOrder($shape, [$first->getKey(), $moved->getKey()], $parent);
-    }
-
-    #[DataProvider('shapes')]
-    #[Test]
-    public function it_lets_a_listener_read_a_class_cast_attribute_of_a_replayed_row(Shape $shape): void
-    {
-        [$parent, [$first, $moved]] = $this->withAddresses($shape);
-
-        Event::listen(sprintf('eloquent.saving: %s', $shape->memberClass()), function (Model $model): void {
-            $model->mergeCasts(['address' => JsonObject::class])->getAttribute('address');
         });
 
         $moved->move(Placement::first(), expected: null);
 
+        $this->assertSame('2001-02-03 04:05:06', ModelEvents::row($model)['updated_at']);
         $this->assertOrder($shape, [$moved->getKey(), $first->getKey()], $parent);
     }
 
     /**
-     * @param  Closure(Model): void  $change
+     * @param  Closure(Shape): array{list<Model>, Closure(): mixed}  $prepare
      */
-    #[DataProvider('castChanges')]
+    #[DataProvider('packageWrites')]
     #[Test]
-    public function it_refuses_a_listener_that_changes_a_class_cast_attribute_of_a_replayed_row(Shape $shape, Closure $change): void
+    public function it_raises_each_order_revision_that_a_write_changes_by_one_in_a_write_that_commits(Shape $shape, Closure $prepare): void
     {
-        [$parent, [$first, $moved]] = $this->withAddresses($shape);
+        [$parents, $write] = $prepare($shape);
+        $before = array_map(fn (Model $parent): int => $shape->storedRevision($parent), $parents);
 
-        Event::listen(sprintf('eloquent.saving: %s', $shape->memberClass()), function (Model $model) use ($change): void {
-            $change($model->mergeCasts(['address' => JsonObject::class]));
-        });
+        $this->runDeferredChecks($write);
 
-        try {
-            $moved->move(Placement::first(), expected: null);
-            $this->fail('A listener changed a class cast attribute of a replayed row.');
-        } catch (LogicException $exception) {
-            $this->assertStringContainsString(sprintf('changed [address] of [%s:', $shape->memberClass()), $exception->getMessage());
-        }
-
-        $this->assertOrder($shape, [$first->getKey(), $moved->getKey()], $parent);
+        $this->assertSame(
+            array_map(fn (int $revision): int => $revision + 1, $before),
+            array_map(fn (Model $parent): int => $shape->storedRevision($parent), $parents),
+        );
     }
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_runs_none_of_its_own_listeners_for_a_replayed_member(Shape $shape): void
+    public function it_runs_none_of_its_own_listeners_for_a_member_that_a_move_saves(Shape $shape): void
     {
         [, [, $moved]] = $shape->with(2);
         [$destination] = $shape->with(1);
@@ -2099,19 +2144,13 @@ class IsOrderedTest extends TestCase
         return (int) DB::table($parent->getTable())->where('id', $parent->id)->value('scenes_order_concurrency_revision');
     }
 
-    /**
-     * @return array{Model&OrdersRelations&Revisioned, list<Model&Ordered>}
-     */
-    private function withAddresses(Shape $shape): array
+    private static function keyOf(Model $member): int|string
     {
-        [$parent, $members] = $shape->with(2);
-        $address = json_encode(['zip' => '1', 'city' => 'X']);
-        DB::statement(sprintf('alter table "%s" add column "address" jsonb', $shape->memberTable()));
-        DB::table($shape->memberTable())->whereIn('id', array_map(fn (Model $member): int|string => $this->key($member), $members))->update(['address' => $address]);
+        $key = $member->getKey();
 
-        $this->assertNotSame($address, DB::table($shape->memberTable())->where('id', $members[1]->getKey())->value('address'));
+        assert(is_int($key) || is_string($key));
 
-        return [$parent, array_map(fn (Model $member): Model&Ordered => $shape->find($this->key($member)), $members)];
+        return $key;
     }
 
     /**
@@ -2262,8 +2301,10 @@ class IsOrderedTest extends TestCase
 
         $ids = array_map(fn (Section $section): int => $section->id, $sections);
 
-        $racer->table('assets')->whereIn('section_id', $ids)->delete();
-        $racer->table('sections')->whereIn('id', $ids)->delete();
+        $racer->transaction(function () use ($racer, $ids): void {
+            $racer->table('assets')->whereIn('section_id', $ids)->delete();
+            $racer->table('sections')->whereIn('id', $ids)->delete();
+        });
     }
 
     /**

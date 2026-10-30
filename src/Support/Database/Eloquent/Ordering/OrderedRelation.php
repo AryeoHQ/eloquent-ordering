@@ -31,6 +31,7 @@ use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
+use Support\Database\Eloquent\Ordering\Events\Rebalanced;
 use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
@@ -59,6 +60,9 @@ final class OrderedRelation
     private readonly string $relationName;
 
     private readonly RelationKeys $keys;
+
+    /** @var list<int|string> */
+    private array $rebalanced = [];
 
     public function __construct(
         public readonly Model&OrdersRelations&Revisioned $parent,
@@ -157,14 +161,33 @@ final class OrderedRelation
             }
         }
 
-        usort($unique, static fn (self $first, self $second): int => [$first->parent->getMorphClass(), $first->parent->getKey()]
-            <=> [$second->parent->getMorphClass(), $second->parent->getKey()]);
+        $locked = self::inLockOrder($unique);
 
-        foreach ($unique as $relation) {
+        foreach ($locked as $relation) {
             $relation->lock();
         }
 
-        return $unique;
+        return $locked;
+    }
+
+    /**
+     * @internal
+     *
+     * @param  list<self>  $relations
+     */
+    public static function raiseAll(array $relations): void
+    {
+        $unique = [];
+
+        foreach ($relations as $relation) {
+            if (! array_any($unique, static fn (self $raised): bool => $raised->is($relation))) {
+                $unique[] = $relation;
+            }
+        }
+
+        foreach (self::inLockOrder($unique) as $relation) {
+            $relation->raise();
+        }
     }
 
     /**
@@ -325,7 +348,7 @@ final class OrderedRelation
      */
     public function reorder(array $ids, null|int $expected): OrderChange
     {
-        return OrderWrite::run($this->parent, function () use ($ids, $expected): OrderChange {
+        return $this->parent->getConnection()->transaction(function () use ($ids, $expected): OrderChange {
             self::lockAll([$this]);
             $this->compareConcurrencyRevision($expected);
 
@@ -340,7 +363,7 @@ final class OrderedRelation
             $sequence = $this->sequence(array_keys($keys), $members, $order);
 
             $this->rewrite($keys, array_combine($sequence, FractionalIndex::keysBetween(null, null, count($sequence))));
-            $this->refreshConcurrencyRevision();
+            $this->raise();
 
             $before = array_flip($members);
             $moved = [];
@@ -369,7 +392,7 @@ final class OrderedRelation
             }
 
             $this->write($item, [self::RANK_KEY => $this->keyAt($placement, $id)]);
-            $this->refreshWith($source);
+            $this->raise();
 
             return $this->announce($this->change([$id => $previous]));
         }
@@ -379,7 +402,7 @@ final class OrderedRelation
             ...$this->keys->pointingAt($this->parent),
             self::RANK_KEY => $this->keyAt($placement),
         ]);
-        $this->refreshWith($source);
+        self::raiseAll([$source, $this]);
 
         return $this->entered($item, $source, $previous);
     }
@@ -438,9 +461,16 @@ final class OrderedRelation
     /**
      * @internal
      */
-    public function refreshConcurrencyRevision(): void
+    public function announceRebalance(null|int $revision = null): void
     {
-        $this->fillParent($this->parentRow()->useWritePdo()->value($this->column()));
+        if ($this->rebalanced === []) {
+            return;
+        }
+
+        $ids = $this->rebalanced;
+        $this->rebalanced = [];
+
+        event(new Rebalanced($this, $revision ?? $this->concurrencyRevision(), $ids));
     }
 
     /**
@@ -811,6 +841,18 @@ final class OrderedRelation
     }
 
     /**
+     * @param  array<array-key, self>  $relations
+     * @return list<self>
+     */
+    private static function inLockOrder(array $relations): array
+    {
+        usort($relations, static fn (self $first, self $second): int => [$first->parent->getMorphClass(), $first->parent->getKey()]
+            <=> [$second->parent->getMorphClass(), $second->parent->getKey()]);
+
+        return $relations;
+    }
+
+    /**
      * @param  Closure(): Builder  $rows
      * @return array{null|string, null|string}
      */
@@ -864,8 +906,9 @@ final class OrderedRelation
     private function rebalance(): void
     {
         $keys = $this->rankKeys($this->indexedRows());
+        $rewritten = $this->rewrite($keys, array_combine(array_keys($keys), FractionalIndex::keysBetween(null, null, count($keys))));
 
-        OrderWrite::rebalanced($this, $this->rewrite($keys, array_combine(array_keys($keys), FractionalIndex::keysBetween(null, null, count($keys)))));
+        $this->rebalanced = array_values(array_unique([...$this->rebalanced, ...$rewritten]));
     }
 
     /**
@@ -881,15 +924,18 @@ final class OrderedRelation
             return [];
         }
 
-        $timestamps = $this->keys->item->usesTimestamps();
+        $ids = array_keys($changed);
+        $copies = OrderWrite::copies($this->keys->item, $ids, $this->keys->item->usesTimestamps());
 
-        OrderWrite::update($this->keys->item, array_keys($changed), [self::RANK_KEY => null], $timestamps);
+        $this->keys->item->newQueryWithoutScopes()->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $ids)->update([self::RANK_KEY => null]);
 
         foreach ($changed as $id => $key) {
-            OrderWrite::update($this->keys->item, [$id], [self::RANK_KEY => $key], $timestamps);
+            if (array_key_exists($id, $copies)) {
+                OrderWrite::save($copies[$id], [self::RANK_KEY => $key]);
+            }
         }
 
-        return array_keys($changed);
+        return $ids;
     }
 
     /**
@@ -956,7 +1002,7 @@ final class OrderedRelation
 
     private function announce(OrderChange $change): OrderChange
     {
-        OrderWrite::announcing($change);
+        $this->announceRebalance($change->revision);
         event(new Reordered($change));
 
         return $change;
@@ -992,7 +1038,9 @@ final class OrderedRelation
      */
     private function write(Model $item, array $attributes): void
     {
-        $written = OrderWrite::update($item, [$item->getKey()], $attributes, self::timestamps($item, $this->keys->item));
+        $copy = OrderWrite::copy($item, self::timestamps($item, $this->keys->item))
+            ?? throw new LogicException(sprintf('[%s:%s] has no row to write.', $item::class, self::keyOf($item)));
+        $written = OrderWrite::save($copy, $attributes);
         $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
 
         if ($item instanceof Revisioned) {
@@ -1000,13 +1048,16 @@ final class OrderedRelation
         }
     }
 
-    private function refreshWith(self $source): void
+    private function raise(): void
     {
-        if ($source->parent !== $this->parent) {
-            $source->refreshConcurrencyRevision();
+        $column = $this->column();
+        $copy = OrderWrite::copy($this->parent, timestamps: false);
+
+        if ($copy !== null) {
+            OrderWrite::save($copy, [$column => new Expression(sprintf('%s + 1', $copy->getConnection()->getQueryGrammar()->wrap($column)))]);
         }
 
-        $this->refreshConcurrencyRevision();
+        $this->fillParent($this->parentRow()->useWritePdo()->value($column));
     }
 
     /**
@@ -1169,7 +1220,6 @@ final class OrderedRelation
         /** @var array<string, mixed> $row */
         $row = (array) ($this->parentRow()->lock('for no key update')->first() ?? []);
 
-        OrderWrite::locked($this, $row);
         $this->fillParent($row[$this->column()] ?? null);
     }
 

@@ -9,11 +9,10 @@ use RuntimeException;
 
 final class WriteHalted extends RuntimeException
 {
-    public function __construct(Model $model, string $event)
+    public function __construct(Model $model)
     {
         parent::__construct(sprintf(
-            'A [%s] listener of [%s:%s] halted an order write, so the write rolled back.',
-            $event,
+            'A listener of [%s:%s] halted an order write, so the write rolled back.',
             $model::class,
             $model->getKey(),
         ));

@@ -354,37 +354,40 @@ class HasOrderedRelationsTest extends TestCase
      */
     #[DataProvider('eloquentWrites')]
     #[Test]
-    public function it_replays_the_model_events_of_each_parent_whose_order_an_eloquent_write_changes(Shape $shape, Closure $prepare): void
+    public function it_fires_the_model_events_of_each_parent_whose_order_an_eloquent_write_changes(Shape $shape, Closure $prepare): void
     {
         [$parents, $write, $member] = $prepare($shape);
-        $rows = array_map(ModelEvents::row(...), $parents);
+        $revisions = array_map(fn (Model $parent): int => $shape->storedRevision($parent), $parents);
         $events = ModelEvents::record();
 
         $write();
 
         $this->assertSame(
-            array_merge(...array_map(fn (Model $parent, array $row): array => ModelEvents::replay($parent, $row, ModelEvents::row($parent)), $parents, $rows)),
-            $events->ofClass($parents[0]::class),
+            array_merge(...array_map(fn (Model $parent, int $revision): array => self::raisedEvents($parent, $shape->column(), $revision), $parents, $revisions)),
+            self::sqlOf($events->ofClass($parents[0]::class)),
         );
         $this->assertSame($member, array_column($events->ofClass($shape->memberClass()), 0));
     }
 
     #[Test]
-    public function it_replays_the_model_events_of_a_parent_that_is_itself_an_ordered_item(): void
+    public function it_fires_the_model_events_of_a_parent_that_is_itself_an_ordered_item(): void
     {
         $video = $this->addVideo(Section::create());
         [$first, $moved] = [$this->addClip($video), $this->addClip($video)];
         $this->travel(1)->minutes();
-        $rows = [ModelEvents::row($moved), ModelEvents::row($video)];
+        $row = ModelEvents::row($moved);
+        $column = $video->concurrencyRevisionColumn(VideoRevision::ClipsOrder);
+        $revision = $video->concurrencyRevision(VideoRevision::ClipsOrder);
         $events = ModelEvents::record();
         DB::enableQueryLog();
 
         $moved->move(Placement::first(), expected: null);
 
         $this->assertSame([
-            ...ModelEvents::replay($moved, $rows[0], ModelEvents::row($moved)),
-            ...ModelEvents::replay($video, $rows[1], ModelEvents::row($video)),
-        ], $events->fired);
+            ...self::savedEvents($moved, $row, ModelEvents::row($moved)),
+            ...self::raisedEvents($video, $column, $revision),
+        ], self::sqlOf($events->fired));
+        $this->assertSame([1, $revision + 1], [(int) DB::table('videos')->where('id', $video->id)->value('concurrency_revision'), (int) DB::table('videos')->where('id', $video->id)->value($column)]);
         $this->assertSame([], array_values(array_filter(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => str_contains($query, 'from "sections"'))));
         $this->assertSame([$moved->id, $first->id], $video->orderedRelation(VideoRevision::ClipsOrder)->query()->pluck('id')->all());
     }

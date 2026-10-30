@@ -84,7 +84,7 @@ class WriteHaltedTest extends TestCase
                 $member->delete();
                 assert(method_exists($member, 'restore'));
 
-                return [$member, [$parent], fn (): mixed => $member->restore(), ['deleted_at' => null]];
+                return [$member, [$parent], fn (): mixed => $member->restore()];
             }],
         ]);
 
@@ -178,18 +178,17 @@ class WriteHaltedTest extends TestCase
     }
 
     /**
-     * @param  Closure(Shape): array{0: Model, 1: list<Model>, 2: Closure(): mixed, 3?: array<string, mixed>}  $prepare
+     * @param  Closure(Shape): array{Model, list<Model>, Closure(): mixed}  $prepare
      */
     #[DataProvider('parentHalts')]
     #[Test]
-    public function it_rolls_back_a_write_whose_parent_replay_a_listener_halts(Shape $shape, Closure $prepare): void
+    public function it_rolls_back_a_write_whose_parent_save_a_listener_halts(Shape $shape, Closure $prepare): void
     {
-        $prepared = $prepare($shape);
-        [$caller, $parents, $write] = $prepared;
+        [, $parents, $write] = $prepare($shape);
 
         Event::listen('eloquent.updating: '.$parents[0]::class, fn (): bool => false);
 
-        $this->assertHalted($shape, $caller, $parents, $write, sprintf('A [updating] listener of [%s:%s]', $parents[0]::class, $parents[0]->getKey()), $prepared[3] ?? []);
+        $this->assertHalted($shape, $parents, $write, sprintf('A listener of [%s:%s] halted an order write', $parents[0]::class, $parents[0]->getKey()));
     }
 
     /**
@@ -197,13 +196,13 @@ class WriteHaltedTest extends TestCase
      */
     #[DataProvider('memberHalts')]
     #[Test]
-    public function it_rolls_back_a_write_whose_member_replay_a_listener_halts(Shape $shape, Closure $prepare): void
+    public function it_rolls_back_a_write_whose_member_save_a_listener_halts(Shape $shape, Closure $prepare): void
     {
-        [$caller, $halting, $parents, $write] = $prepare($shape);
+        [, $halting, $parents, $write] = $prepare($shape);
 
         Event::listen('eloquent.saving: '.$shape->memberClass(), fn (): bool => false);
 
-        $this->assertHalted($shape, $caller, $parents, $write, sprintf('A [saving] listener of [%s:%s]', $halting::class, $halting->getKey()));
+        $this->assertHalted($shape, $parents, $write, sprintf('A listener of [%s:%s] halted an order write', $halting::class, $halting->getKey()));
     }
 
     private function forget(): void
@@ -223,34 +222,24 @@ class WriteHaltedTest extends TestCase
     /**
      * @param  list<Model>  $parents
      * @param  Closure(): mixed  $write
-     * @param  array<string, mixed>  $setBeforeTheWrite
      */
-    private function assertHalted(Shape $shape, Model $caller, array $parents, Closure $write, string $message, array $setBeforeTheWrite = []): void
+    private function assertHalted(Shape $shape, array $parents, Closure $write, string $message): void
     {
         $stored = fn (): array => [
             DB::table($shape->memberTable())->orderBy('id')->get()->map(fn (object $row): array => (array) $row)->all(),
             array_map(fn (Model $parent): array => (array) DB::table($parent->getTable())->where('id', $parent->getKey())->first(), $parents),
         ];
-        $state = fn (): array => [
-            $caller->exists,
-            $caller->getAttributes(),
-            $caller->getRawOriginal(),
-            array_map(fn (mixed $related): mixed => is_object($related) ? spl_object_id($related) : $related, $caller->getRelations()),
-            array_map(fn (Model $parent): array => $parent->getAttributes(), $parents),
-        ];
-        [$before, $instances] = [$stored(), $state()];
-        $instances[1] = [...$instances[1], ...$setBeforeTheWrite];
+        $before = $stored();
         $this->forget();
 
         try {
             $write();
-            $this->fail('A halted replay let the write through.');
+            $this->fail('A halted save let the write through.');
         } catch (WriteHalted $exception) {
             $this->assertStringStartsWith($message, $exception->getMessage());
         }
 
         $this->assertSame($before, $stored());
-        $this->assertSame($instances, $state());
         $this->assertSame([], $this->dispatched);
     }
 }

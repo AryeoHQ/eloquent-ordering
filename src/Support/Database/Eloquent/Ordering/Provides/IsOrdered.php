@@ -11,6 +11,7 @@ use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use LogicException;
 use RuntimeException;
+use Support\Database\Eloquent\Concurrency\Concerns\WritesInTransactions;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Exceptions\ContendedOrder;
@@ -27,6 +28,8 @@ use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
  */
 trait IsOrdered
 {
+    use WritesInTransactions;
+
     private const int ORDER_LOCK_ATTEMPTS = 5;
 
     private null|OrderedRelation $resolvedOrderedRelation = null;
@@ -43,16 +46,21 @@ trait IsOrdered
     /** @var list<OrderedRelation> */
     private array $lockedOrderedRelations = [];
 
+    /** @var null|array<string, mixed> */
+    private null|array $storedOrderedRow = null;
+
     public static function bootIsOrdered(): void
     {
         static::saving(static function (self $item): void {
-            if (OrderWrite::replays($item)) {
+            if (OrderWrite::saves($item)) {
                 return;
             }
 
             $uncommitted = $item->reparented !== null;
             $item->restoredInto = null;
             $item->reparented = null;
+            $item->storedOrderedRow = null;
+            $item->lockedOrderedRelations = [];
 
             if (! $item->exists) {
                 $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
@@ -65,17 +73,21 @@ trait IsOrdered
                     ),
                 );
 
+                $softDeletes = in_array(SoftDeletes::class, class_uses_recursive($item), true);
+                $item->storedOrderedRow = $stored = $item->storedOrderedAttributes([
+                    OrderedRelation::RANK_KEY,
+                    ...OrderedRelation::membershipColumns($item),
+                    ...$softDeletes ? [OrderedRelations::DELETED_AT] : [],
+                ]);
+
                 if ($membership !== null) {
                     $clean = array_diff_key($membership, $item->getDirty());
                     $item->forceFill($clean)->syncOriginalAttributes(array_keys($clean));
                 }
 
-                $softDeletes = in_array(SoftDeletes::class, class_uses_recursive($item), true);
                 $kept = $uncommitted ? $item->getRawOriginal(OrderedRelation::RANK_KEY) : $item->getAttribute(OrderedRelation::RANK_KEY);
 
                 if ($softDeletes && $item->getRawOriginal(OrderedRelations::DELETED_AT) !== null && $item->getAttribute(OrderedRelations::DELETED_AT) === null) {
-                    $stored = $item->storedOrderedAttributes([OrderedRelation::RANK_KEY, OrderedRelations::DELETED_AT]);
-
                     if ($stored === null) {
                         return;
                     }
@@ -98,14 +110,23 @@ trait IsOrdered
 
         static::creating(static function (self $item): void {
             $item->forgetPosition();
-            $item->setAttribute(OrderedRelation::RANK_KEY, $item->orderingRelation()->keyAt($item->placement ?? Placement::last()));
+
+            $relation = $item->orderingRelation();
+            $relation = array_find($item->lockedOrderedRelations, static fn (OrderedRelation $locked): bool => $locked->is($relation)) ?? $relation;
+
+            $item->setAttribute(OrderedRelation::RANK_KEY, $relation->keyAt($item->placement ?? Placement::last()));
         });
 
         static::created(static function (self $item): void {
             $item->placement = null;
+            $relations = $item->lockedOrderedRelations;
+            $item->lockedOrderedRelations = [];
 
-            foreach ($item->refreshLockedOrderedRelations() as $relation) {
+            OrderedRelation::raiseAll($relations);
+
+            foreach ($relations as $relation) {
                 $relation->placed($item);
+                $relation->announceRebalance();
             }
         });
 
@@ -115,54 +136,71 @@ trait IsOrdered
         });
 
         static::registerModelEvent('trashed', static function (self $item): void {
-            $written = OrderWrite::update($item, [$item->getKey()], [OrderedRelation::RANK_KEY => null], OrderedRelation::usesTimestamps($item));
-            $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
+            $copy = OrderWrite::copy($item, OrderedRelation::usesTimestamps($item));
+
+            if ($copy !== null) {
+                $written = OrderWrite::save($copy, [OrderedRelation::RANK_KEY => null]);
+                $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
+            }
         });
 
         static::saved(static function (self $item): void {
-            if (OrderWrite::replays($item)) {
+            if (OrderWrite::saves($item)) {
                 return;
             }
 
             $restored = $item->restoredInto;
             $reparented = $item->reparented;
+            $stored = $item->storedOrderedRow;
+            $relations = $item->lockedOrderedRelations;
             $item->restoredInto = null;
             $item->reparented = null;
+            $item->storedOrderedRow = null;
+            $item->lockedOrderedRelations = [];
 
-            $item->refreshLockedOrderedRelations();
+            if ($stored !== null && $item->storedOrderedAttributes(array_keys($stored)) !== $stored) {
+                OrderedRelation::raiseAll($relations);
+            }
+
             $restored?->placed($item);
 
             if ($restored !== null || $reparented !== null) {
                 $item->forgetPosition();
             }
 
-            if ($reparented === null) {
-                return;
-            }
+            if ($reparented !== null) {
+                [$source, $destination, $previous] = $reparented;
 
-            [$source, $destination, $previous] = $reparented;
-
-            if ($destination !== null) {
-                $item->resolvedOrderedRelation = $destination;
-            }
-
-            if ($source !== null && $previous !== null) {
-                if ($destination === null) {
-                    $source->removed($item, $previous);
-                } else {
-                    $destination->entered($item, $source, $previous);
+                if ($destination !== null) {
+                    $item->resolvedOrderedRelation = $destination;
                 }
-            } elseif ($destination !== null) {
-                $destination->placed($item);
+
+                if ($source !== null && $previous !== null) {
+                    if ($destination === null) {
+                        $source->removed($item, $previous);
+                    } else {
+                        $destination->entered($item, $source, $previous);
+                    }
+                } elseif ($destination !== null) {
+                    $destination->placed($item);
+                }
+            }
+
+            foreach ($relations as $relation) {
+                $relation->announceRebalance();
             }
         });
 
         static::deleted(static function (self $item): void {
             $vacated = $item->vacatedPosition;
+            $relations = $item->lockedOrderedRelations;
             $item->vacatedPosition = null;
+            $item->lockedOrderedRelations = [];
             $item->forgetPosition();
 
-            foreach ($item->refreshLockedOrderedRelations() as $relation) {
+            OrderedRelation::raiseAll($relations);
+
+            foreach ($relations as $relation) {
                 if ($vacated !== null) {
                     $relation->removed($item, $vacated);
                 }
@@ -173,19 +211,8 @@ trait IsOrdered
     public function initializeIsOrdered(): void
     {
         $this->makeHidden(OrderedRelation::RANK_KEY);
-    }
 
-    /**
-     * @param  array<string, mixed>  $options
-     */
-    public function save(array $options = []): bool
-    {
-        return $this->commitUnlessHalted(fn (): bool => parent::save($options));
-    }
-
-    public function delete()
-    {
-        return $this->commitUnlessHalted(fn () => parent::delete());
+        self::leaveRankKeyUnobserved($this);
     }
 
     public function placeAt(Placement $placement): static
@@ -202,7 +229,7 @@ trait IsOrdered
     {
         throw_unless($this->exists, LogicException::class, sprintf('[%s] must be saved before it moves.', static::class));
 
-        return OrderWrite::run($this, function () use ($placement, $expected): OrderChange {
+        return $this->getConnection()->transaction(function () use ($placement, $expected): OrderChange {
             $destination = $placement->parent === null ? null : OrderedRelation::in($placement->parent, $this);
             $original = $this->getRawOriginal();
             [$source, , , $stored] = $this->lockCurrentOrderedRelations(static fn (): null|OrderedRelation => $destination);
@@ -251,6 +278,13 @@ trait IsOrdered
             array_key_exists(OrderedRelation::POSITION, $this->attributes) => $value === null ? null : intval($value),
             default => $this->resolveOrderedRelation($this->getAttributes())?->position($this),
         });
+    }
+
+    private static function leaveRankKeyUnobserved(Model $item): void
+    {
+        if (method_exists($item, 'mergeUnobservedColumns')) {
+            $item->mergeUnobservedColumns([OrderedRelation::RANK_KEY]);
+        }
     }
 
     private function forgetPosition(): void
@@ -333,10 +367,9 @@ trait IsOrdered
             $stored = $this->storedOrderedAttributes(OrderedRelation::membershipColumns($this));
             $current = $stored === null ? null : $this->resolveOrderedRelation($stored);
             $next = $resolveNext === null ? null : $resolveNext($stored);
-            $locked = [];
 
             try {
-                return $this->getConnection()->transaction(function () use ($stored, $current, $next, $moved, &$locked): array {
+                return $this->getConnection()->transaction(function () use ($stored, $current, $next, $moved): array {
                     $locked = OrderedRelation::lockAll([$current, $next]);
 
                     throw_unless($this->storedOrderedAttributes(OrderedRelation::membershipColumns($this)) === $stored, $moved);
@@ -345,7 +378,6 @@ trait IsOrdered
                 });
             } catch (RuntimeException $exception) {
                 throw_unless($exception === $moved, $exception);
-                OrderWrite::released($locked);
             }
         }
 
@@ -361,47 +393,5 @@ trait IsOrdered
         $stored = $this->newQueryWithoutScopes()->whereKey($this->getKey())->toBase()->useWritePdo()->first($columns);
 
         return $stored === null ? null : (array) $stored;
-    }
-
-    /**
-     * @return list<OrderedRelation>
-     */
-    private function refreshLockedOrderedRelations(): array
-    {
-        $relations = $this->lockedOrderedRelations;
-
-        foreach ($relations as $relation) {
-            $relation->refreshConcurrencyRevision();
-        }
-
-        $this->lockedOrderedRelations = [];
-
-        return $relations;
-    }
-
-    /**
-     * @template TResult of null|bool|int
-     *
-     * @param  Closure(): TResult  $write
-     * @return TResult
-     */
-    private function commitUnlessHalted(Closure $write): null|bool|int
-    {
-        $halted = new RuntimeException;
-        $result = null;
-
-        try {
-            return OrderWrite::run($this, function () use ($write, $halted, &$result): null|bool|int {
-                $result = $write();
-
-                throw_if($result === false, $halted);
-
-                return $result;
-            });
-        } catch (RuntimeException $exception) {
-            throw_unless($exception === $halted, $exception);
-
-            return $result;
-        }
     }
 }

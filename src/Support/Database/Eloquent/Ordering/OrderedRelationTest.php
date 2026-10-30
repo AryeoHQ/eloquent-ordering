@@ -23,6 +23,7 @@ use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
+use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
 use Tests\Fixtures\Support\Agencies\Agency;
@@ -415,7 +416,7 @@ class OrderedRelationTest extends TestCase
         ], array_map(get_object_vars(...), $change->changed));
         $this->assertSame($relation, $change->relation);
         $this->assertNull($change->source);
-        $this->assertGreaterThan(5, $change->revision);
+        $this->assertSame(6, $change->revision);
         $this->assertSame($shape->storedRevision($parent), $change->revision);
         $this->assertSame($change->revision, $parent->concurrencyRevision($shape->revision()));
         $this->assertFalse($parent->isDirty());
@@ -494,7 +495,7 @@ class OrderedRelationTest extends TestCase
         $change = $shape->orderedRelation($parent)->reorder([$this->key($second), $this->key($first)], expected: null);
 
         $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($parent));
-        $this->assertGreaterThan(40, $change->revision);
+        $this->assertSame(41, $change->revision);
         $this->assertSame($shape->storedRevision($parent), $change->revision);
     }
 
@@ -680,43 +681,49 @@ class OrderedRelationTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_replays_the_model_events_of_each_member_a_reorder_rewrites_and_of_the_parent(Shape $shape): void
+    public function it_fires_the_model_events_of_each_member_a_reorder_rewrites_and_then_of_the_parent(Shape $shape): void
     {
         [$parent, [$first, $second, $third]] = $shape->with(3);
         $this->travel(1)->minutes();
-        $rows = array_map(ModelEvents::row(...), [$first, $second, $third, $parent]);
+        $rows = array_map(ModelEvents::row(...), [$first, $second, $third]);
+        $revision = $shape->storedRevision($parent);
         $events = ModelEvents::record();
 
         $shape->orderedRelation($parent)->reorder([$this->key($third), $this->key($second), $this->key($first)], expected: null);
 
         $this->assertSame($rows[1], ModelEvents::row($second));
         $this->assertSame([
-            ...ModelEvents::replay($third, $rows[2], ModelEvents::row($third)),
-            ...ModelEvents::replay($first, $rows[0], ModelEvents::row($first)),
-            ...ModelEvents::replay($parent, $rows[3], ModelEvents::row($parent)),
-        ], $events->fired);
+            ...self::savedEvents($third, $rows[2], ModelEvents::row($third)),
+            ...self::savedEvents($first, $rows[0], ModelEvents::row($first)),
+            ...self::raisedEvents($parent, $shape->column(), $revision),
+        ], self::sqlOf($events->fired));
+        $this->assertSame($revision + 1, $shape->storedRevision($parent));
     }
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_replays_the_model_events_of_each_member_a_rebalance_rewrites_once(Shape $shape): void
+    public function it_fires_the_model_events_of_each_member_a_rebalance_rewrites_and_of_the_moved_member_again(Shape $shape): void
     {
         [$parent, [$first, $second, $third]] = $shape->with(3);
         $shape->crowd($first, $second);
         DB::table($shape->memberTable())->where('id', $third->getKey())->update([OrderedRelation::RANK_KEY => 'a5']);
         $this->travel(1)->minutes();
-        $rows = array_map(ModelEvents::row(...), [$first, $second, $third, $parent]);
+        $rows = array_map(ModelEvents::row(...), [$first, $second, $third]);
+        $rebalanced = [...$rows[2], OrderedRelation::RANK_KEY => FractionalIndex::keysBetween(null, null, 3)[2], 'updated_at' => now()->toDateTimeString()];
+        $revision = $shape->storedRevision($parent);
         $events = ModelEvents::record();
 
         $third->move(Placement::after($this->key($first)), expected: null);
 
         $this->assertLessThan(OrderedRelation::MAX_KEY_LENGTH, $shape->longestRankKey($parent));
         $this->assertSame([
-            ...ModelEvents::replay($first, $rows[0], ModelEvents::row($first)),
-            ...ModelEvents::replay($second, $rows[1], ModelEvents::row($second)),
-            ...ModelEvents::replay($third, $rows[2], ModelEvents::row($third)),
-            ...ModelEvents::replay($parent, $rows[3], ModelEvents::row($parent)),
-        ], $events->fired);
+            ...self::savedEvents($first, $rows[0], ModelEvents::row($first)),
+            ...self::savedEvents($second, $rows[1], ModelEvents::row($second)),
+            ...self::savedEvents($third, $rows[2], $rebalanced),
+            ...self::savedEvents($third, $rebalanced, ModelEvents::row($third)),
+            ...self::raisedEvents($parent, $shape->column(), $revision),
+        ], self::sqlOf($events->fired));
+        $this->assertSame($revision + 1, $shape->storedRevision($parent));
     }
 
     #[DataProvider('shapes')]
