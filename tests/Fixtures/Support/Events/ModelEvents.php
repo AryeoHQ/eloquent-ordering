@@ -49,7 +49,7 @@ final class ModelEvents
      * @param  array<string, mixed>  $after
      * @return list<array{string, class-string, mixed, array<string, mixed>, array<string, mixed>}>
      */
-    public static function replay(Model $model, array $before, array $after): array
+    public static function saveEvents(Model $model, array $before, array $after): array
     {
         $changed = array_keys(array_filter($after, static fn (mixed $value, string $column): bool => ! array_key_exists($column, $before) || $before[$column] !== $value, ARRAY_FILTER_USE_BOTH));
         $changes = [array_intersect_key($before, array_flip($changed)), array_intersect_key($after, array_flip($changed))];

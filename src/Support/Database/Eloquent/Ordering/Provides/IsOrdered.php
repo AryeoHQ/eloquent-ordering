@@ -246,10 +246,10 @@ trait IsOrdered
         $parents = [];
 
         foreach ([$this->getRawOriginal(), $this->getAttributes()] as $attributes) {
-            $parent = OrderedRelation::of($this, $attributes, $this->heldOrderedParents())?->parent;
-
-            if ($parent !== null && ! array_any($parents, static fn (Model $named): bool => $named->is($parent))) {
-                $parents[] = $parent;
+            foreach (OrderedRelation::namedParents($this, $attributes, $this->heldOrderedParents()) as $parent) {
+                if (! array_any($parents, static fn (Model $named): bool => $named->is($parent))) {
+                    $parents[] = $parent;
+                }
             }
         }
 
@@ -296,6 +296,10 @@ trait IsOrdered
 
         if (! $item->exists) {
             $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
+
+            foreach ($item->lockedOrderedRelations as $relation) {
+                $relation->lockRelatedOf($item);
+            }
         } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
             [$current, $item->lockedOrderedRelations, $next, $membership] = $item->lockCurrentOrderedRelations(
                 static fn (null|array $stored): null|OrderedRelation => OrderedRelation::of(

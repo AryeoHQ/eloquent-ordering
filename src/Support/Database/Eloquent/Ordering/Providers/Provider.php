@@ -29,6 +29,9 @@ use WeakMap;
  */
 class Provider extends ServiceProvider
 {
+    /** @var array<class-string<Model>, list<PivotParent>> */
+    private static array $parentsByRelated = [];
+
     public function boot(): void
     {
         (new Macros)->register();
@@ -40,10 +43,32 @@ class Provider extends ServiceProvider
         Event::listen(['eloquent.creating: *', 'eloquent.updating: *'], self::requirePreparedOrder(...));
 
         $this->app->booted(static function (): void {
-            foreach (self::pivotParents() as $related => $parents) {
+            self::$parentsByRelated = self::pivotParents();
+
+            foreach (self::$parentsByRelated as $related => $parents) {
                 self::raisePivotParentsOf($related, $parents);
             }
         });
+    }
+
+    /**
+     * @internal
+     *
+     * @return list<Model>
+     */
+    public static function parentsReachedBy(Model $related): array
+    {
+        $parents = [];
+
+        foreach (self::$parentsByRelated[$related::class] ?? [] as $parent) {
+            foreach (self::pivotsOf($related, $parent) as [$relation]) {
+                if (! array_any($parents, static fn (Model $named): bool => $named->is($relation->parent))) {
+                    $parents[] = $relation->parent;
+                }
+            }
+        }
+
+        return $parents;
     }
 
     /**
@@ -53,7 +78,7 @@ class Provider extends ServiceProvider
     {
         $model = $payload[0] ?? null;
 
-        if ($model instanceof Model && $model instanceof Ordered) {
+        if ($model instanceof Model) {
             OrderedRelation::requirePrepared($model);
         }
     }
@@ -112,6 +137,7 @@ class Provider extends ServiceProvider
     {
         /** @var WeakMap<Model, array<int, ReachedParents>> $held */
         $held = new WeakMap;
+        $watched = array_values(array_unique(array_merge(...array_column($parents, 2))));
 
         Event::listen("eloquent.deleting: {$related}", static function (Model $model) use ($parents, $held): void {
             $held[$model] = method_exists($model, 'isForceDeleting') && $model->isForceDeleting() === false ? self::lockPivotParents($model, $parents) : [];
@@ -124,15 +150,25 @@ class Provider extends ServiceProvider
             self::raiseHeldPivotParents($model, $parents, $positions);
         });
 
-        Event::listen("eloquent.updating: {$related}", static function (Model $model) use ($parents, $held): void {
+        Event::listen("eloquent.updating: {$related}", static function (Model $model) use ($parents, $held, $watched): void {
             $held[$model] = self::lockPivotParents($model, array_filter($parents, static fn (array $parent): bool => $model->isDirty($parent[2])));
+            OrderedRelation::preparedRelated($model, $watched);
         });
 
         Event::listen("eloquent.updated: {$related}", static function (Model $model) use ($parents, $held): void {
             $positions = $held[$model] ?? [];
             unset($held[$model]);
+            $changed = array_filter($parents, static fn (array $parent): bool => $model->wasChanged($parent[2]));
+            $unprepared = array_diff_key($changed, $positions);
 
-            self::raiseHeldPivotParents($model, array_filter($parents, static fn (array $parent): bool => $model->wasChanged($parent[2])), $positions);
+            throw_if($unprepared !== [], LogicException::class, sprintf(
+                '[%s:%s] changed [%s] without a prepared order write. A listener ran after the package\'s [updating] listener, or stopped it.',
+                $model::class,
+                $model->getKey(),
+                implode('], [', array_values(array_intersect(array_keys($model->getChanges()), array_merge(...array_column($unprepared, 2))))),
+            ));
+
+            self::raiseHeldPivotParents($model, $changed, $positions);
         });
     }
 

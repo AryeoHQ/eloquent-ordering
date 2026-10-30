@@ -5,12 +5,15 @@ declare(strict_types=1);
 namespace Tests;
 
 use Closure;
+use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Process;
 use Orchestra\Testbench;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
 use Tests\Fixtures\Support\Shapes\UuidMorphManyShape;
@@ -125,5 +128,80 @@ abstract class TestCase extends Testbench\TestCase
         $sql = static fn (mixed $value): mixed => $value instanceof Expression ? $value->getValue($grammar) : $value;
 
         return array_map(static fn (array $event): array => [$event[0], $event[1], $event[2], array_map($sql, $event[3]), array_map($sql, $event[4])], $fired);
+    }
+
+    protected function racer(): Connection
+    {
+        config()->set('database.connections.racer', config('database.connections.pgsql'));
+        config()->set('database.connections.observer', config('database.connections.pgsql'));
+
+        return DB::connection('racer');
+    }
+
+    protected function startRival(string $fixture, string ...$arguments): InvokedProcess
+    {
+        return Process::env($this->databaseEnvironment())->start([
+            PHP_BINARY,
+            __DIR__.'/Fixtures/Support/Concurrency/'.$fixture,
+            ...$arguments,
+        ]);
+    }
+
+    protected function awaitLockWait(int $waiters, InvokedProcess ...$rivals): void
+    {
+        $deadline = microtime(true) + 10;
+
+        while (microtime(true) < $deadline) {
+            foreach ($rivals as $rival) {
+                $this->assertTrue($rival->running(), $rival->errorOutput());
+            }
+
+            if ($this->lockWaits() >= $waiters) {
+                return;
+            }
+
+            usleep(10_000);
+        }
+
+        $this->fail('The rivals never waited on the row locks.');
+    }
+
+    protected function awaitLockWaitOrExit(InvokedProcess $rival): bool
+    {
+        $deadline = microtime(true) + 10;
+
+        while (microtime(true) < $deadline) {
+            if ($this->lockWaits() >= 1) {
+                return true;
+            }
+
+            if (! $rival->running()) {
+                return false;
+            }
+
+            usleep(10_000);
+        }
+
+        $this->fail('The rival neither waited on a row lock nor finished.');
+    }
+
+    private function lockWaits(): int
+    {
+        return intval(DB::connection('observer')->scalar("select count(*) from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'"));
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function databaseEnvironment(): array
+    {
+        return [
+            'DB_CONNECTION' => 'pgsql',
+            'DB_HOST' => config()->string('database.connections.pgsql.host'),
+            'DB_PORT' => config()->string('database.connections.pgsql.port'),
+            'DB_DATABASE' => config()->string('database.connections.pgsql.database'),
+            'DB_USERNAME' => config()->string('database.connections.pgsql.username'),
+            'DB_PASSWORD' => config()->string('database.connections.pgsql.password'),
+        ];
     }
 }

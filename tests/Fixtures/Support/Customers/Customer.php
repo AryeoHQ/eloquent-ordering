@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
@@ -19,7 +20,7 @@ use Tests\Fixtures\Support\Tours\Tour;
  * @property string|null $name
  * @property bool $visible
  */
-class Customer extends Model
+class Customer extends Model implements LocksParentsFirst
 {
     use OrdersThroughPivots;
     use SoftDeletes;

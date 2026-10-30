@@ -3,28 +3,38 @@
 declare(strict_types=1);
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Foundation\Application as Laravel;
 use Illuminate\Support\Facades\DB;
 use Orchestra\Testbench\Foundation\Application;
+use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
-use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Listings\Listing;
 
 require __DIR__.'/../../../../vendor/autoload.php';
 
-[, $asset, $order] = $_SERVER['argv'];
+[, $class, $key, $order] = $_SERVER['argv'];
 
-Application::create(options: ['extra' => ['providers' => [Provider::class]]]);
+Application::create(
+    resolvingCallback: static function (Laravel $app): void {
+        $app->booting(static function (): void {
+            config()->set('concurrency.models', [Listing::class]);
+        });
+    },
+    options: ['extra' => ['providers' => [Provider::class]]],
+);
 
 try {
-    DB::transaction(static function () use ($asset, $order): void {
-        $member = Asset::query()->findOrFail($asset);
-        $parents = $order === 'parents first' ? $member->parentsToLockFirst() : [];
+    DB::transaction(static function () use ($class, $key, $order): void {
+        assert(is_a($class, Model::class, true));
+        $model = $class::query()->findOrFail($key);
+        $parents = $order === 'parents first' && $model instanceof LocksParentsFirst ? $model->parentsToLockFirst() : [];
         usort($parents, static fn (Model $first, Model $second): int => [$first->getMorphClass(), $first->getKey()] <=> [$second->getMorphClass(), $second->getKey()]);
 
-        foreach ([...$parents, $member] as $model) {
-            $model->setRawAttributes($model->newQuery()->whereKey($model->getKey())->lockForUpdate()->firstOrFail()->getAttributes(), true);
+        foreach ([...$parents, $model] as $locked) {
+            $locked->setRawAttributes($locked->newQuery()->whereKey($locked->getKey())->lockForUpdate()->firstOrFail()->getAttributes(), true);
         }
 
-        $member->delete();
+        $model->delete();
     });
 
     echo 'deleted';

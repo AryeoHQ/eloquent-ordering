@@ -7,8 +7,10 @@ namespace Support\Database\Eloquent\Ordering\Provides;
 use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use LogicException;
 use Orchestra\Testbench\Attributes\DefineEnvironment;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversTrait;
@@ -29,10 +31,12 @@ use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
+use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\TestCase;
+use Throwable;
 
 #[CoversClass(Provider::class)]
 #[CoversClass(OrderedRelations::class)]
@@ -251,8 +255,7 @@ class OrdersThroughPivotsTest extends TestCase
     #[Test]
     public function it_raises_the_order_revision_and_reports_each_leave_and_enter_for_a_declared_customer_column(): void
     {
-        OrderedRelations::dropTrigger('customers', ListingRevision::CustomersOrder->value);
-        OrderedRelations::createRelatedTrigger('customers', 'listings', 'listing_customer', 'customer_id', 'listing_id', ListingRevision::CustomersOrder->value, membership: ['name']);
+        self::recordCustomerNames();
         $listing = Listing::create();
         [$first, $renamed, $third] = [Customer::create(['name' => 'Ada']), Customer::create(['name' => 'Ada']), Customer::create(['name' => 'Ada'])];
         $listing->customers()->attach([$first->id, $renamed->id, $third->id]);
@@ -269,6 +272,203 @@ class OrdersThroughPivotsTest extends TestCase
             [self::listingsByCustomerName(), $listing->id, $pivots, [[$pivots[1], 2, null]], 7],
         ], $this->reorders);
         $this->assertRefused(fn (): int => Customer::query()->whereKey($renamed->id)->update(['name' => 'Grace']));
+    }
+
+    #[DefineEnvironment('orderTheCustomersOfAListingByName')]
+    #[Test]
+    public function it_refuses_a_listener_that_changes_a_declared_customer_column_after_it_prepared_the_order(): void
+    {
+        [$listing, $customer] = $this->listingOfACustomerNamedAda();
+
+        Customer::updating(function (Customer $customer): void {
+            $customer->name = 'Grace';
+        });
+
+        $this->assertListenerRefused(
+            sprintf('A listener changed [name] of [%s:%s] after its order write was prepared.', Customer::class, $customer->id),
+            $listing,
+            $customer,
+            fn (): bool => $customer->update(['visible' => false]),
+        );
+    }
+
+    #[DefineEnvironment('orderTheCustomersOfAListingByName')]
+    #[Test]
+    public function it_refuses_a_change_to_a_declared_customer_column_that_no_order_write_prepared(): void
+    {
+        [$listing, $customer] = $this->listingOfACustomerNamedAda();
+
+        Event::listen('eloquent.updating: *', function (string $event, array $payload): void {
+            if (($payload[0] ?? null) instanceof Customer) {
+                $payload[0]->name = 'Grace';
+            }
+        });
+
+        $this->assertListenerRefused(
+            sprintf("[%s:%s] changed [name] without a prepared order write. A listener ran after the package's [updating] listener, or stopped it.", Customer::class, $customer->id),
+            $listing,
+            $customer,
+            fn (): bool => $customer->update(['visible' => false]),
+        );
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_locks_the_customer_of_an_attach_for_share_after_the_parent_and_before_the_pivot(PivotShape $shape): void
+    {
+        $parent = $shape->createParent();
+        $customer = Customer::create();
+        DB::enableQueryLog();
+
+        $shape->customers($parent)->attach($customer);
+
+        $queries = array_column(DB::getQueryLog(), 'query');
+        $lock = array_find_key($queries, fn (string $query): bool => str_contains($query, sprintf('from "%s"', $shape->parentTable())) && str_ends_with($query, 'for no key update'));
+        $share = array_find_key($queries, fn (string $query): bool => str_contains($query, 'from "customers"') && str_ends_with($query, 'for share'));
+        $insert = array_find_key($queries, fn (string $query): bool => str_starts_with($query, sprintf('insert into "%s"', $shape->memberTable())));
+
+        $this->assertIsInt($lock);
+        $this->assertIsInt($share);
+        $this->assertIsInt($insert);
+        $this->assertTrue($lock < $share && $share < $insert);
+    }
+
+    #[Test]
+    public function it_holds_an_attach_of_a_customer_until_a_soft_delete_of_the_customer_commits_and_reports_no_enter(): void
+    {
+        $racer = $this->racer();
+        [$listing, $other] = [Listing::on('racer')->create(), Listing::on('racer')->create()];
+        [$kept, $customer] = [Customer::on('racer')->create(), Customer::on('racer')->create()];
+        $listing->customers()->attach($kept);
+        $other->customers()->attach($customer);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $customer->delete();
+
+            $rivals[] = $this->startRival('attach.php', (string) $listing->id, (string) $customer->id);
+            $waited = $this->awaitLockWaitOrExit($rivals[0]);
+            $racer->commit();
+
+            $this->assertSame(
+                ['waited' => true, 'attach' => ['attached', []], 'revision' => 3, 'members' => [self::pivotOf($listing, $kept)]],
+                ['waited' => $waited, 'attach' => $this->attachedBy($rivals[0]), 'revision' => self::customersRevision($listing), 'members' => (new BelongsToManyShape)->members($listing)],
+            );
+        } finally {
+            $this->finishRace($rivals, [$listing, $other], [$kept, $customer]);
+        }
+    }
+
+    #[Test]
+    public function it_holds_an_attach_of_a_customer_until_a_restore_of_the_customer_commits_and_reports_the_enter(): void
+    {
+        $racer = $this->racer();
+        [$listing, $other] = [Listing::on('racer')->create(), Listing::on('racer')->create()];
+        [$kept, $customer] = [Customer::on('racer')->create(), Customer::on('racer')->create()];
+        $listing->customers()->attach($kept);
+        $other->customers()->attach($customer);
+        $customer->delete();
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            self::restore($customer);
+
+            $rivals[] = $this->startRival('attach.php', (string) $listing->id, (string) $customer->id);
+            $waited = $this->awaitLockWaitOrExit($rivals[0]);
+            $racer->commit();
+            $attached = $this->attachedBy($rivals[0]);
+            $members = [self::pivotOf($listing, $kept), self::pivotOf($listing, $customer)];
+
+            $this->assertSame(
+                ['waited' => true, 'attach' => ['attached', [[$members, [[$members[1], 2, null]], 3]]], 'revision' => 3, 'members' => $members],
+                ['waited' => $waited, 'attach' => $attached, 'revision' => self::customersRevision($listing), 'members' => (new BelongsToManyShape)->members($listing)],
+            );
+        } finally {
+            $this->finishRace($rivals, [$listing, $other], [$kept, $customer]);
+        }
+    }
+
+    #[Test]
+    public function it_names_every_parent_that_the_pivots_of_a_customer_reach_without_a_lock(): void
+    {
+        $customer = Customer::create();
+        [$member, $former, $stranger] = [Listing::create(), Listing::create(), Listing::create()];
+        $tour = Tour::create();
+        $member->customers()->attach($customer);
+        $former->customers()->attach($customer);
+        $former->customers()->detach($customer);
+        $stranger->customers()->attach(Customer::create());
+        $tour->customers()->attach($customer);
+        $loaded = Customer::query()->findOrFail($customer->id);
+        DB::enableQueryLog();
+
+        $parents = $loaded->parentsToLockFirst();
+
+        $this->assertSame(
+            [[Listing::class, $member->id], [Listing::class, $former->id], [Tour::class, $tour->id]],
+            array_map(fn (Model $parent): array => [$parent::class, $parent->getKey()], $parents),
+        );
+        $this->assertSame([], array_filter(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => preg_match('/\bfor (no key )?(update|share)\b/', $query) === 1));
+    }
+
+    #[Test]
+    public function it_finishes_a_soft_delete_of_a_customer_that_locks_the_parents_first_and_an_attach_of_the_customer_without_a_deadlock(): void
+    {
+        $racer = $this->racer();
+        $listing = Listing::on('racer')->create();
+        $customer = Customer::on('racer')->create();
+        $listing->customers()->attach($customer);
+        $listing->customers()->detach($customer);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('listings')->where('id', $listing->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('attach.php', (string) $listing->id, (string) $customer->id);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('locked-delete.php', Customer::class, (string) $customer->id, 'parents first');
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $this->assertSame(['attached', 'deleted'], [$this->attachedBy($rivals[0])[0], $rivals[1]->wait()->output()], $rivals[1]->errorOutput());
+            $this->assertSoftDeleted('customers', ['id' => $customer->id]);
+            $this->assertSame(5, self::customersRevision($listing));
+        } finally {
+            $this->finishRace($rivals, [$listing], [$customer]);
+        }
+    }
+
+    #[Test]
+    public function it_deadlocks_a_soft_delete_of_a_customer_that_locks_the_customer_before_its_parents_with_an_attach_of_the_customer(): void
+    {
+        $racer = $this->racer();
+        $listing = Listing::on('racer')->create();
+        $customer = Customer::on('racer')->create();
+        $listing->customers()->attach($customer);
+        $listing->customers()->detach($customer);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('listings')->where('id', $listing->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('attach.php', (string) $listing->id, (string) $customer->id);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('locked-delete.php', Customer::class, (string) $customer->id, 'the customer first');
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $this->assertContains('40P01', [$this->attachedBy($rivals[0])[0], $rivals[1]->wait()->output()], $rivals[1]->errorOutput());
+        } finally {
+            $this->finishRace($rivals, [$listing], [$customer]);
+        }
     }
 
     protected function orderTheCustomersOfEveryParent(): void
@@ -311,6 +511,94 @@ class OrdersThroughPivotsTest extends TestCase
                     ->where('customers.name', 'Ada');
             }
         })::class;
+    }
+
+    private static function recordCustomerNames(): void
+    {
+        OrderedRelations::dropTrigger('customers', ListingRevision::CustomersOrder->value);
+        OrderedRelations::createRelatedTrigger('customers', 'listings', 'listing_customer', 'customer_id', 'listing_id', ListingRevision::CustomersOrder->value, membership: ['name']);
+    }
+
+    private static function pivotOf(Listing $listing, Customer $customer): mixed
+    {
+        return (new BelongsToManyShape)->pivotOf($listing, $customer)->getKey();
+    }
+
+    private static function customersRevision(Listing $listing): int
+    {
+        return (new BelongsToManyShape)->storedRevision($listing);
+    }
+
+    /**
+     * @return array{Listing, Customer}
+     */
+    private function listingOfACustomerNamedAda(): array
+    {
+        self::recordCustomerNames();
+        $listing = Listing::create();
+        $customer = Customer::create(['name' => 'Ada']);
+        $listing->customers()->attach($customer);
+        $this->recordReorders();
+
+        return [$listing, $customer];
+    }
+
+    /**
+     * @param  Closure(): mixed  $write
+     */
+    private function assertListenerRefused(string $message, Listing $listing, Customer $customer, Closure $write): void
+    {
+        $thrown = null;
+
+        try {
+            $this->runDeferredChecks($write);
+        } catch (Throwable $thrown) {
+        }
+
+        $this->assertInstanceOf(LogicException::class, $thrown);
+        $this->assertSame($message, $thrown->getMessage());
+        $this->assertSame(['name' => 'Ada', 'visible' => true], (array) DB::table('customers')->where('id', $customer->id)->first(['name', 'visible']));
+        $this->assertSame(2, self::customersRevision($listing));
+        $this->assertSame([], $this->reorders);
+    }
+
+    /**
+     * @return array<mixed>
+     */
+    private function attachedBy(InvokedProcess $rival): array
+    {
+        $result = $rival->wait();
+        $attached = json_decode($result->output(), true);
+
+        $this->assertIsArray($attached, $result->output().$result->errorOutput());
+
+        return $attached;
+    }
+
+    /**
+     * @param  list<InvokedProcess>  $rivals
+     * @param  list<Listing>  $listings
+     * @param  list<Customer>  $customers
+     */
+    private function finishRace(array $rivals, array $listings, array $customers): void
+    {
+        $racer = DB::connection('racer');
+
+        if ($racer->transactionLevel() > 0) {
+            $racer->rollBack();
+        }
+
+        foreach ($rivals as $rival) {
+            $rival->wait();
+        }
+
+        $racer->transaction(function () use ($racer, $listings, $customers): void {
+            $listings = array_map(fn (Listing $listing): int => $listing->id, $listings);
+
+            $racer->table('listing_customer')->whereIn('listing_id', $listings)->delete();
+            $racer->table('listings')->whereIn('id', $listings)->delete();
+            $racer->table('customers')->whereIn('id', array_map(fn (Customer $customer): int => $customer->id, $customers))->delete();
+        });
     }
 
     private function recordCustomersOfToursAndAgencies(): void

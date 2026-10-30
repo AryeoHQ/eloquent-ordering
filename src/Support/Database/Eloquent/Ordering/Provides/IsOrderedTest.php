@@ -5,13 +5,11 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering\Provides;
 
 use Closure;
-use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
-use Illuminate\Support\Facades\Process;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\CoversTrait;
@@ -125,6 +123,7 @@ class IsOrderedTest extends TestCase
     {
         return Shape::crossed([
             'a saving listener of the member' => [fn (Model $parent, Model $moved): Model => $moved, 'saving'],
+            'an updating listener of the member' => [fn (Model $parent, Model $moved): Model => $moved, 'updating'],
             'an updating listener of the parent' => [fn (Model $parent, Model $moved): Model => $parent, 'updating'],
         ]);
     }
@@ -247,6 +246,14 @@ class IsOrderedTest extends TestCase
     {
         yield 'a saving listener registered after boot' => ['saving'];
         yield 'a creating listener registered after boot' => ['creating'];
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function lateCopyListeners(): iterable
+    {
+        return Shape::crossed(self::lateSaveListeners());
     }
 
     /**
@@ -1300,6 +1307,27 @@ class IsOrderedTest extends TestCase
         $this->assertRejected($shape, LogicException::class, fn (): Model => $shape->add($source), $source, $destination);
     }
 
+    #[DataProvider('lateCopyListeners')]
+    #[Test]
+    public function it_refuses_a_listener_that_changes_the_rank_key_of_a_member_that_a_reorder_saves(Shape $shape, string $event): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $this->recordReorders();
+        $keys = 0;
+
+        Event::listen(sprintf('eloquent.%s: %s', $event, $shape->memberClass()), function (Model $member) use (&$keys): void {
+            $member->setAttribute(OrderedRelation::RANK_KEY, 'z'.++$keys);
+        });
+
+        $this->assertRejected(
+            $shape,
+            LogicException::class,
+            fn (): OrderChange => $shape->orderedRelation($parent)->reorder([self::keyOf($third), self::keyOf($first), self::keyOf($second)], expected: null),
+            $parent,
+        );
+        $this->assertSame([], $this->reorders);
+    }
+
     #[DataProvider('lateSaveListeners')]
     #[Test]
     public function it_writes_a_column_outside_the_order_that_a_listener_changes_after_it_prepared_a_save(string $event): void
@@ -2060,6 +2088,52 @@ class IsOrderedTest extends TestCase
         $this->assertSame([], (new Asset)->parentsToLockFirst());
     }
 
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_names_no_parent_for_attributes_that_name_a_parent_that_does_not_exist(Shape $shape): void
+    {
+        [$source, [$member]] = $shape->with(1);
+        $missing = $shape->createParent();
+        DB::table($shape->parentTable())->where('id', $missing->getKey())->delete();
+        $member->setAttribute($shape->foreignKey(), $missing->getKey());
+
+        $parents = $member->parentsToLockFirst();
+
+        $this->assertSame([[$source::class, $source->getKey()]], array_map(fn (Model $model): array => [$model::class, $model->getKey()], $parents));
+        $this->assertRejected($shape, LogicException::class, fn (): bool => $member->save(), $source);
+    }
+
+    #[Test]
+    public function it_names_each_parent_of_attributes_that_name_two_parents(): void
+    {
+        $board = Board::create();
+        $album = Album::create();
+        $photo = $this->addPhoto($board);
+        $photo->album_id = $album->id;
+
+        $this->assertSame(
+            [[Board::class, $board->id], [Album::class, $album->id]],
+            array_map(fn (Model $model): array => [$model::class, $model->getKey()], $photo->parentsToLockFirst()),
+        );
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_names_the_parent_on_the_connection_of_the_member_for_a_parent_it_holds_on_another_connection(Shape $shape): void
+    {
+        config()->set('database.connections.other', config('database.connections.pgsql'));
+        [$source, [$member]] = $shape->with(1);
+        [$destination] = $shape->with(1);
+        $shape->associate($member, (clone $destination)->setConnection('other'));
+
+        $parents = $member->parentsToLockFirst();
+
+        $this->assertSame(
+            [[$source::class, $source->getKey(), 'pgsql'], [$destination::class, $destination->getKey(), 'pgsql']],
+            array_map(fn (Model $model): array => [$model::class, $model->getKey(), $model->getConnection()->getName()], $parents),
+        );
+    }
+
     #[Test]
     public function it_finishes_a_delete_that_locks_the_parents_first_and_a_reorder_of_the_parent_without_a_deadlock(): void
     {
@@ -2161,7 +2235,7 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_replays_the_model_events_of_a_member_whose_rank_key_a_soft_delete_clears(Shape $shape): void
+    public function it_fires_the_model_events_of_a_member_whose_rank_key_a_soft_delete_clears(Shape $shape): void
     {
         [, [, $deleted]] = $shape->with(3);
         $this->travel(1)->minutes();
@@ -2170,7 +2244,7 @@ class IsOrderedTest extends TestCase
 
         $deleted->delete();
 
-        $this->assertSame(ModelEvents::replay($deleted, [OrderedRelation::RANK_KEY => $rankKey], [OrderedRelation::RANK_KEY => null]), $events->of($deleted));
+        $this->assertSame(ModelEvents::saveEvents($deleted, [OrderedRelation::RANK_KEY => $rankKey], [OrderedRelation::RANK_KEY => null]), $events->of($deleted));
     }
 
     #[DataProvider('shapes')]
@@ -2532,14 +2606,6 @@ class IsOrderedTest extends TestCase
         return (new HasManyShape)->storedRevision($section);
     }
 
-    private function racer(): Connection
-    {
-        config()->set('database.connections.racer', config('database.connections.pgsql'));
-        config()->set('database.connections.observer', config('database.connections.pgsql'));
-
-        return DB::connection('racer');
-    }
-
     /**
      * @return array{Section, list<Asset>}
      */
@@ -2561,32 +2627,17 @@ class IsOrderedTest extends TestCase
 
     private function startMove(Asset $asset, Section $destination, int $expected): InvokedProcess
     {
-        return Process::env($this->databaseEnvironment())->start([
-            PHP_BINARY,
-            dirname(__DIR__, 6).'/tests/Fixtures/Support/Concurrency/move.php',
-            (string) $asset->id,
-            (string) $destination->id,
-            (string) $expected,
-        ]);
+        return $this->startRival('move.php', (string) $asset->id, (string) $destination->id, (string) $expected);
     }
 
     private function startDelete(Asset $asset): InvokedProcess
     {
-        return Process::env($this->databaseEnvironment())->start([
-            PHP_BINARY,
-            dirname(__DIR__, 6).'/tests/Fixtures/Support/Concurrency/delete.php',
-            (string) $asset->id,
-        ]);
+        return $this->startRival('delete.php', (string) $asset->id);
     }
 
     private function startLockedDelete(Asset $asset, string $order): InvokedProcess
     {
-        return Process::env($this->databaseEnvironment())->start([
-            PHP_BINARY,
-            dirname(__DIR__, 6).'/tests/Fixtures/Support/Concurrency/locked-delete.php',
-            (string) $asset->id,
-            $order,
-        ]);
+        return $this->startRival('locked-delete.php', Asset::class, (string) $asset->id, $order);
     }
 
     /**
@@ -2594,33 +2645,7 @@ class IsOrderedTest extends TestCase
      */
     private function startReorder(Section $section, array $ids): InvokedProcess
     {
-        return Process::env($this->databaseEnvironment())->start([
-            PHP_BINARY,
-            dirname(__DIR__, 6).'/tests/Fixtures/Support/Concurrency/reorder.php',
-            (string) $section->id,
-            implode(',', $ids),
-        ]);
-    }
-
-    private function awaitLockWait(int $waiters, InvokedProcess ...$rivals): void
-    {
-        $deadline = microtime(true) + 10;
-
-        while (microtime(true) < $deadline) {
-            foreach ($rivals as $rival) {
-                $this->assertTrue($rival->running(), $rival->errorOutput());
-            }
-
-            $waiting = intval(DB::connection('observer')->scalar("select count(*) from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'"));
-
-            if ($waiting >= $waiters) {
-                return;
-            }
-
-            usleep(10_000);
-        }
-
-        $this->fail('The rivals never waited on the row locks.');
+        return $this->startRival('reorder.php', (string) $section->id, implode(',', $ids));
     }
 
     /**
@@ -2644,20 +2669,5 @@ class IsOrderedTest extends TestCase
             $racer->table('assets')->whereIn('section_id', $ids)->delete();
             $racer->table('sections')->whereIn('id', $ids)->delete();
         });
-    }
-
-    /**
-     * @return array<string, string>
-     */
-    private function databaseEnvironment(): array
-    {
-        return [
-            'DB_CONNECTION' => 'pgsql',
-            'DB_HOST' => config()->string('database.connections.pgsql.host'),
-            'DB_PORT' => config()->string('database.connections.pgsql.port'),
-            'DB_DATABASE' => config()->string('database.connections.pgsql.database'),
-            'DB_USERNAME' => config()->string('database.connections.pgsql.username'),
-            'DB_PASSWORD' => config()->string('database.connections.pgsql.password'),
-        ];
     }
 }

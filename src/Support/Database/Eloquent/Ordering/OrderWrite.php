@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Ordering;
 
 use Illuminate\Database\Eloquent\Model;
 use ReflectionMethod;
+use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Exceptions\WriteHalted;
 use WeakMap;
 
@@ -64,6 +65,10 @@ final class OrderWrite
         if ($copy->forceFill($attributes)->isDirty()) {
             $saving = self::saving();
             $saving[$copy] = true;
+
+            if ($copy instanceof Ordered) {
+                OrderedRelation::prepared($copy);
+            }
 
             try {
                 throw_unless((new ReflectionMethod(Model::class, 'save'))->invoke($copy) === true, WriteHalted::class, $copy);

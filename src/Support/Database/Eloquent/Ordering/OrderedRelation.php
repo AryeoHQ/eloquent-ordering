@@ -70,6 +70,9 @@ final class OrderedRelation
     /** @var null|WeakMap<Model, array<string, mixed>> */
     private static null|WeakMap $prepared = null;
 
+    /** @var null|WeakMap<Model, array<string, mixed>> */
+    private static null|WeakMap $preparedRelated = null;
+
     private readonly string $relationName;
 
     private readonly RelationKeys $keys;
@@ -112,26 +115,52 @@ final class OrderedRelation
             return null;
         }
 
-        ['parent' => $parent, 'revision' => $revision, 'keys' => $keys] = $membership;
-
-        foreach ([...$held, ...$item instanceof Pivot ? [$item->pivotParent] : []] as $model) {
-            $candidate = self::asParent($model);
-
-            if ($candidate !== null && self::isNamed($membership, $attributes, $candidate)) {
+        foreach (self::heldParentsOf($item, $held) as $candidate) {
+            if (self::isNamed($membership, $attributes, $candidate)) {
                 self::requireConnectionOf($item, $candidate);
 
-                return new self($candidate, $revision);
+                return new self($candidate, $membership['revision']);
             }
         }
 
-        $loaded = self::asParent($parent->newQueryWithoutScopes()->where($keys->ownerKey, $attributes[$keys->foreignKey])->first()) ?? throw new LogicException(sprintf(
+        $loaded = self::storedParent($membership, $attributes) ?? throw new LogicException(sprintf(
             '[%s:%s] names a [%s] that does not exist.',
             $item::class,
             $item->getKey(),
-            $parent::class,
+            $membership['parent']::class,
         ));
 
-        return new self($loaded, $revision);
+        return new self($loaded, $membership['revision']);
+    }
+
+    /**
+     * @internal
+     *
+     * @param  array<string, mixed>  $attributes
+     * @param  list<Model>  $held
+     * @return list<Model&OrdersRelations&Revisioned>
+     */
+    public static function namedParents(Model&Ordered $item, array $attributes, array $held = []): array
+    {
+        $connection = $item->getConnection()->getName();
+        $parents = [];
+
+        foreach (self::memberships($item) as $membership) {
+            if (! $membership['keys']->names($attributes)) {
+                continue;
+            }
+
+            $parent = array_find(
+                self::heldParentsOf($item, $held),
+                static fn (Model $candidate): bool => self::isNamed($membership, $attributes, $candidate) && $candidate->getConnection()->getName() === $connection,
+            ) ?? self::storedParent($membership, $attributes);
+
+            if ($parent !== null) {
+                $parents[] = $parent;
+            }
+        }
+
+        return $parents;
     }
 
     /**
@@ -250,34 +279,27 @@ final class OrderedRelation
     public static function prepared(Model&Ordered $item): void
     {
         $prepared = self::$prepared ??= new WeakMap;
-        $prepared[$item] = self::watchedAttributes($item);
+        $prepared[$item] = self::attributesOf($item, self::watchedColumns($item));
+    }
+
+    /**
+     * @internal
+     *
+     * @param  list<string>  $columns
+     */
+    public static function preparedRelated(Model $related, array $columns): void
+    {
+        $prepared = self::$preparedRelated ??= new WeakMap;
+        $prepared[$related] = self::attributesOf($related, $columns);
     }
 
     /**
      * @internal
      */
-    public static function requirePrepared(Model&Ordered $item): void
+    public static function requirePrepared(Model $model): void
     {
-        $prepared = self::$prepared;
-
-        if ($prepared === null || ! $prepared->offsetExists($item)) {
-            return;
-        }
-
-        $before = $prepared[$item];
-        unset($prepared[$item]);
-        $changed = array_keys(array_filter(
-            self::watchedAttributes($item),
-            static fn (mixed $value, string $column): bool => $value !== ($before[$column] ?? null),
-            ARRAY_FILTER_USE_BOTH,
-        ));
-
-        throw_if($changed !== [], LogicException::class, sprintf(
-            'A listener changed [%s] of [%s:%s] after its order write was prepared.',
-            implode('], [', $changed),
-            $item::class,
-            $item->getKey(),
-        ));
+        self::requireUnchanged(self::$prepared, $model);
+        self::requireUnchanged(self::$preparedRelated, $model);
     }
 
     /**
@@ -583,6 +605,30 @@ final class OrderedRelation
     /**
      * @internal
      */
+    public function lockRelatedOf(Model&Ordered $item): void
+    {
+        ['declaration' => $declaration, 'relation' => $relation] = self::declarations($this->parent)[(string) $this->revision->value];
+
+        if (! $relation instanceof BelongsToMany) {
+            return;
+        }
+
+        $related = $relation->getRelated();
+
+        if (! in_array(SoftDeletes::class, class_uses_recursive($related), true) && $declaration->membershipOf($related->getTable()) === []) {
+            return;
+        }
+
+        $related->newQueryWithoutScopes()
+            ->where($related->qualifyColumn($relation->getRelatedKeyName()), $item->getAttribute($relation->getRelatedPivotKeyName()))
+            ->toBase()
+            ->lock('for share')
+            ->first([$related->qualifyColumn($relation->getRelatedKeyName())]);
+    }
+
+    /**
+     * @internal
+     */
     public function memberPosition(Model $item): null|int
     {
         $position = self::positionsOf([$this], [$item])[(string) self::keyOf($item)] ?? null;
@@ -717,6 +763,27 @@ final class OrderedRelation
     }
 
     /**
+     * @param  list<Model>  $held
+     * @return list<Model&OrdersRelations&Revisioned>
+     */
+    private static function heldParentsOf(Model&Ordered $item, array $held): array
+    {
+        return array_values(array_filter(array_map(
+            self::asParent(...),
+            [...$held, ...$item instanceof Pivot ? [$item->pivotParent] : []],
+        )));
+    }
+
+    /**
+     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
+     * @param  array<string, mixed>  $attributes
+     */
+    private static function storedParent(array $membership, array $attributes): null|(Model&OrdersRelations&Revisioned)
+    {
+        return self::asParent($membership['parent']->newQueryWithoutScopes()->where($membership['keys']->ownerKey, $attributes[$membership['keys']->foreignKey])->first());
+    }
+
+    /**
      * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
      * @param  array<string, mixed>  $attributes
      */
@@ -743,18 +810,44 @@ final class OrderedRelation
     }
 
     /**
+     * @param  list<string>  $columns
      * @return array<string, mixed>
      */
-    private static function watchedAttributes(Model&Ordered $item): array
+    private static function attributesOf(Model $model, array $columns): array
     {
-        $attributes = $item->getAttributes();
+        $attributes = $model->getAttributes();
         $watched = [];
 
-        foreach (self::watchedColumns($item) as $column) {
+        foreach ($columns as $column) {
             $watched[$column] = $attributes[$column] ?? null;
         }
 
         return $watched;
+    }
+
+    /**
+     * @param  null|WeakMap<Model, array<string, mixed>>  $prepared
+     */
+    private static function requireUnchanged(null|WeakMap $prepared, Model $model): void
+    {
+        if ($prepared === null || ! $prepared->offsetExists($model)) {
+            return;
+        }
+
+        $before = $prepared[$model];
+        unset($prepared[$model]);
+        $changed = array_keys(array_filter(
+            self::attributesOf($model, array_keys($before)),
+            static fn (mixed $value, string $column): bool => $value !== $before[$column],
+            ARRAY_FILTER_USE_BOTH,
+        ));
+
+        throw_if($changed !== [], LogicException::class, sprintf(
+            'A listener changed [%s] of [%s:%s] after its order write was prepared.',
+            implode('], [', $changed),
+            $model::class,
+            $model->getKey(),
+        ));
     }
 
     private static function requireConnectionOf(Model $item, Model $parent): void
