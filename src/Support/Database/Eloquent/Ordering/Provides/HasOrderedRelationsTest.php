@@ -945,6 +945,28 @@ class HasOrderedRelationsTest extends TestCase
         $this->assertTrue($lock < $reads[0] && $reads[0] < $write && $write < $reads[1]);
     }
 
+    #[Test]
+    public function it_refuses_a_listener_that_changes_a_membership_column_of_the_parent_during_a_reorder(): void
+    {
+        [$playlist, [$first, $second]] = $this->playlist('audio', ['audio', 'audio']);
+        $before = [$this->tracksRevision($playlist), $this->trackKeys($playlist), 'audio'];
+        $this->recordReorders();
+
+        Playlist::updating(function (Playlist $updating): void {
+            $updating->kind = 'video';
+        });
+
+        try {
+            $playlist->orderedRelation(PlaylistRevision::TracksOrder)->reorder([$second->id, $first->id], null);
+            $this->fail('The reorder accepted a listener that changed [kind].');
+        } catch (LogicException $exception) {
+            $this->assertSame(sprintf('A listener changed [kind] of [%s:%s] after its order write was prepared.', Playlist::class, $playlist->id), $exception->getMessage());
+        }
+
+        $this->assertSame($before, [$this->tracksRevision($playlist), $this->trackKeys($playlist), DB::table('playlists')->where('id', $playlist->id)->value('kind')]);
+        $this->assertSame([], $this->reorders);
+    }
+
     private function addVideo(Section $section): Video
     {
         $video = new Video;

@@ -1031,6 +1031,54 @@ class OrderedRelationTest extends TestCase
                 return $this->hasMany(Asset::class, 'section_id');
             }
         }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [videos.title], which names no table of the relation.'];
+
+        yield 'an automatic item timestamp' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['assets.updated_at'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [assets.updated_at], which Eloquent sets on a save of [Tests\Fixtures\Support\Assets\Asset].'];
+
+        yield 'an automatic parent timestamp' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['sections.created_at'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [sections.created_at], which Eloquent sets on a save of [Illuminate\Database\Eloquent\Model@anonymous'];
+
+        yield 'an automatic related timestamp' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers', membership: ['customers.updated_at'])] class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')->using(ListingCustomer::class);
+            }
+        }, ListingRevision::CustomersOrder, '::customers()] declares the membership column [customers.updated_at], which Eloquent sets on a save of [Tests\Fixtures\Support\Customers\Customer].'];
     }
 
     /**
@@ -1038,7 +1086,7 @@ class OrderedRelationTest extends TestCase
      */
     public static function inspectableMemberships(): iterable
     {
-        yield 'basic, null, in and column clauses on declared item columns' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['assets.title', 'assets.visible', 'assets.created_at', 'assets.updated_at'])] class extends Model implements OrdersRelations, Revisioned
+        yield 'basic, null, in and column clauses on declared item columns' => [static fn (): Model&OrdersRelations&Revisioned => new #[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets', membership: ['assets.title', 'assets.visible'])] class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
             use HasOrderedRelations;
@@ -1054,7 +1102,7 @@ class OrderedRelationTest extends TestCase
                     ->where('title', 'Shown')
                     ->whereNotNull('assets.title')
                     ->whereIn('assets.visible', [true])
-                    ->whereColumn('assets.created_at', '<=', 'assets.updated_at');
+                    ->whereColumn('assets.title', '!=', 'assets.visible');
             }
         }, SectionRevision::AssetsOrder];
 

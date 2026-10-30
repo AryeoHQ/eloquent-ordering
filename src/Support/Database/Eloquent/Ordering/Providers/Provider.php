@@ -72,6 +72,18 @@ class Provider extends ServiceProvider
     }
 
     /**
+     * @internal
+     */
+    public static function locksPivotParentsOf(Model $related, bool $deleting): bool
+    {
+        $parents = self::$parentsByRelated[$related::class] ?? [];
+
+        return $deleting
+            ? $parents !== [] && self::trashes($related)
+            : array_any($parents, static fn (array $parent): bool => $related->isDirty($parent[2]));
+    }
+
+    /**
      * @param  array<array-key, mixed>  $payload
      */
     private static function requirePreparedOrder(string $event, array $payload): void
@@ -140,7 +152,7 @@ class Provider extends ServiceProvider
         $watched = array_values(array_unique(array_merge(...array_column($parents, 2))));
 
         Event::listen("eloquent.deleting: {$related}", static function (Model $model) use ($parents, $held): void {
-            $held[$model] = method_exists($model, 'isForceDeleting') && $model->isForceDeleting() === false ? self::lockPivotParents($model, $parents) : [];
+            $held[$model] = self::trashes($model) ? self::lockPivotParents($model, $parents) : [];
         });
 
         Event::listen("eloquent.trashed: {$related}", static function (Model $model) use ($parents, $held): void {
@@ -179,6 +191,10 @@ class Provider extends ServiceProvider
      */
     private static function lockPivotParents(Model $related, array $parents): array
     {
+        if ($parents !== [] && $related instanceof Ordered) {
+            OrderedRelation::lockParentsFirstUnlessLocked($related);
+        }
+
         $reached = array_map(static fn (array $parent): array => self::pivotsOf($related, $parent), $parents);
 
         OrderedRelation::lockAll(array_merge([], ...array_map(
@@ -263,6 +279,11 @@ class Provider extends ServiceProvider
         $column = in_array(SoftDeletes::class, class_uses_recursive($related), true) && method_exists($related, 'getDeletedAtColumn') ? $related->getDeletedAtColumn() : null;
 
         return is_string($column) ? [$column] : [];
+    }
+
+    private static function trashes(Model $related): bool
+    {
+        return method_exists($related, 'isForceDeleting') && $related->isForceDeleting() === false;
     }
 
     private static function keyOf(mixed $key): string

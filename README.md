@@ -265,6 +265,7 @@ OrderedRelations::createParentTrigger('playlists', PlaylistRevision::TracksOrder
 The package checks each relation once per process, when it first resolves. The check throws `LogicException` when:
 
 - a declared entry is not `table.column` on one of those tables;
+- a declared entry names the `created_at` or `updated_at` column of a model that uses timestamps, because Eloquent sets that column after the package reads the save's changes;
 - the relation's own clauses use a type other than `where()` with an operator, `whereNull()`, `whereNotNull()`, `whereIn()`, `whereNotIn()`, `whereColumn()`, or a nested group of these;
 - a clause filters by an expression, or joins a top-level filter with `or`, because that filter reaches the rows of other parents;
 - a pivot relation filters by an unqualified column;
@@ -430,6 +431,8 @@ No attribute value makes `parentsToLockFirst()` throw. It leaves out a parent th
 
 **Lock a related model's parents first too.** The `parentsToLockFirst()` of a model that uses `OrdersThroughPivots` returns every parent that its pivot rows reach, soft-deleted pivot rows included. For a model that also uses `IsOrdered`, the list starts with the parents that order the model, and names each parent once. Its soft delete locks the same parents. A related model locked before those parents can deadlock with an `attach()` to one of them.
 
+A model that uses both traits locks that whole list in `(morph class, key)` order before it locks any parent for a single role. A soft delete, a restore, and a save that changes a column the pivot parents watch all lock it this way. Such a write therefore cannot deadlock with a caller that locks the sorted list first.
+
 ## Model events
 
 The package saves every row it writes through Eloquent, so each row fires the native `saving`, `updating`, `updated`, and `saved` events. Observers, `Event::listen('eloquent.updated: …')` listeners, and `$dispatchesEvents` classes all receive them.
@@ -442,6 +445,7 @@ The package's item saves also set `updated_at` when the item model uses timestam
 
 - **A listener's change outside the order is written.** A `saving` or `updating` listener can change a column of a copy, such as `updated_at`, and the save writes that change.
 - **A late change to the order is refused.** `IsOrdered` prepares an order write in its own `saving` listener, which the model registers when it boots. A listener that runs after it and changes `rank_key`, the foreign key, the morph type, a pivot's related key, a declared item column, or `deleted_at` throws `LogicException`, and the write rolls back. A later `saving` listener, a `creating` listener, and an `updating` listener are all covered.
+- **A late change to a parent's membership is refused.** `HasOrderedRelations` records the declared parent columns, such as `playlists.kind`, in its own `saving` listener. A later listener that changes one of them throws `LogicException`, and the write rolls back. This covers the parent copy that an order write raises, so a `reorder()` cannot change the parent's membership without a report.
 - **A copy is checked the same way.** A package write records the copy's order columns after it sets them, and before the save. A `saving` or `updating` listener that changes one of them throws `LogicException`, and the whole write rolls back.
 - **A halt rolls the write back.** A `saving` or `updating` listener that returns `false` for a copy halts the whole write. The transaction rolls back, no `Reordered` or `Rebalanced` dispatches, and the call throws `WriteHalted`. `save()` and `delete()` throw too.
 - After a halt or a refusal, no row changes. The caller's instance and each parent instance keep the state that Eloquent left them in, so reload them. A halted create leaves `exists` true on the caller's instance, although no row exists.
@@ -549,5 +553,5 @@ Asset::query()->whereKey($id)->delete();                              // soft de
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
 | `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
 | `WriteHalted` (`RuntimeException`) | A `saving` or `updating` listener returned `false` for a copy that an order write saved. The message names the model and its key. The write rolled back. |
-| `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order after the package prepared the write, a watched related column changed without a prepared order write, `withPositions()` ran on a query that `OrderedRelation::query()` did not return, or `loadPositions()` met a model that is not `Ordered` or a pivot without its `id`. At boot: a parent in `concurrency.models` orders the pivots of a model that does not use `OrdersThroughPivots`. |
+| `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a membership declares a timestamp that Eloquent sets, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order or a declared parent column after the package prepared the write, a watched related column changed without a prepared order write, `withPositions()` ran on a query that `OrderedRelation::query()` did not return, or `loadPositions()` met a model that is not `Ordered` or a pivot without its `id`. At boot: a parent in `concurrency.models` orders the pivots of a model that does not use `OrdersThroughPivots`. |
 | SQLSTATE `23514` | A write changed an order, and no raise of its order revision followed. The commit throws `PDOException`. A statement outside a transaction commits by itself, so it throws `QueryException`. |

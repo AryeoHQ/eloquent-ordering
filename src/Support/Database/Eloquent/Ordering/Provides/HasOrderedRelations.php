@@ -29,6 +29,7 @@ trait HasOrderedRelations
     {
         static::saving(static function (self $parent): void {
             $parent->refilteredOrders = OrderedRelation::membersBeforeRefilter($parent);
+            OrderedRelation::preparedParent($parent);
         });
 
         static::updating(static function (self $parent): void {

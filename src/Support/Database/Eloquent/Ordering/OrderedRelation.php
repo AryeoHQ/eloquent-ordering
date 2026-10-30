@@ -24,6 +24,7 @@ use LogicException;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionNamedType;
+use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
@@ -72,6 +73,9 @@ final class OrderedRelation
 
     /** @var null|WeakMap<Model, array<string, mixed>> */
     private static null|WeakMap $preparedRelated = null;
+
+    /** @var null|WeakMap<Model, true> */
+    private static null|WeakMap $parentsLockedFirst = null;
 
     private readonly string $relationName;
 
@@ -221,6 +225,33 @@ final class OrderedRelation
 
     /**
      * @internal
+     */
+    public static function lockParentsFirst(Model&LocksParentsFirst $model): void
+    {
+        self::lockInOrder($model->parentsToLockFirst());
+
+        $locked = self::$parentsLockedFirst ??= new WeakMap;
+        $locked[$model] = true;
+    }
+
+    /**
+     * @internal
+     */
+    public static function lockParentsFirstUnlessLocked(Model&LocksParentsFirst $model): void
+    {
+        $locked = self::$parentsLockedFirst;
+
+        if ($locked !== null && $locked->offsetExists($model)) {
+            unset($locked[$model]);
+
+            return;
+        }
+
+        self::lockInOrder($model->parentsToLockFirst());
+    }
+
+    /**
+     * @internal
      *
      * @param  list<self>  $relations
      */
@@ -303,7 +334,21 @@ final class OrderedRelation
     public static function preparedRelated(Model $related, array $columns): void
     {
         $prepared = self::$preparedRelated ??= new WeakMap;
-        $prepared[$related] = self::attributesOf($related, $columns);
+        $prepared[$related] = [...$prepared[$related] ?? [], ...self::attributesOf($related, $columns)];
+    }
+
+    /**
+     * @internal
+     */
+    public static function preparedParent(Model&OrdersRelations&Revisioned $parent): void
+    {
+        $columns = array_values(array_unique(array_merge(
+            ...array_map(static fn (OrdersRelation $declaration): array => $declaration->membershipOf($parent->getTable()), self::attributes($parent, OrdersRelation::class)),
+        )));
+
+        if ($parent->exists && $columns !== []) {
+            self::preparedRelated($parent, $columns);
+        }
     }
 
     /**
@@ -927,16 +972,31 @@ final class OrderedRelation
         $keys = self::describe($relation);
         $item = $keys->item;
         $related = $relation instanceof BelongsToMany ? $relation->getRelated() : null;
-        $tables = array_values(array_unique([$item->getTable(), $parent->getTable(), ...$related === null ? [] : [$related->getTable()]]));
+        $models = [];
+
+        foreach ([$item, $parent, ...$related === null ? [] : [$related]] as $model) {
+            $models[$model->getTable()] ??= $model;
+        }
+
+        $tables = array_keys($models);
 
         foreach ($declaration->membership as $column) {
-            $table = explode('.', $column)[0];
+            [$table, $named] = array_pad(explode('.', $column, 2), 2, '');
 
             throw_unless(substr_count($column, '.') === 1 && in_array($table, $tables, true), LogicException::class, sprintf(
                 '[%s] declares the membership column [%s], which names no table of the relation. Qualify it by [%s].',
                 $name,
                 $column,
                 implode('], [', $tables),
+            ));
+
+            $model = $models[$table];
+
+            throw_if($model->usesTimestamps() && in_array($named, [$model->getCreatedAtColumn(), $model->getUpdatedAtColumn()], true), LogicException::class, sprintf(
+                '[%s] declares the membership column [%s], which Eloquent sets on a save of [%s]. Declare a column that only the application writes.',
+                $name,
+                $column,
+                $model::class,
             ));
         }
 
@@ -1264,10 +1324,26 @@ final class OrderedRelation
      */
     private static function inLockOrder(array $relations): array
     {
-        usort($relations, static fn (self $first, self $second): int => [$first->parent->getMorphClass(), $first->parent->getKey()]
-            <=> [$second->parent->getMorphClass(), $second->parent->getKey()]);
+        usort($relations, static fn (self $first, self $second): int => self::lockOrder($first->parent, $second->parent));
 
         return $relations;
+    }
+
+    /**
+     * @param  list<Model>  $parents
+     */
+    private static function lockInOrder(array $parents): void
+    {
+        usort($parents, self::lockOrder(...));
+
+        foreach ($parents as $parent) {
+            $parent->newQueryWithoutScopes()->whereKey($parent->getKey())->toBase()->lock('for no key update')->first([$parent->getKeyName()]);
+        }
+    }
+
+    private static function lockOrder(Model $first, Model $second): int
+    {
+        return [$first->getMorphClass(), $first->getKey()] <=> [$second->getMorphClass(), $second->getKey()];
     }
 
     /**

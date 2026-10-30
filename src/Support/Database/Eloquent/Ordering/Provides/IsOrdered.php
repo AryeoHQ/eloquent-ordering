@@ -19,6 +19,7 @@ use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\OrderWrite;
 use Support\Database\Eloquent\Ordering\Placement;
+use Support\Database\Eloquent\Ordering\Providers\Provider;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
 
 /**
@@ -96,6 +97,10 @@ trait IsOrdered
         });
 
         static::deleting(static function (self $item): void {
+            if (Provider::locksPivotParentsOf($item, deleting: true)) {
+                OrderedRelation::lockParentsFirst($item);
+            }
+
             [$current, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations();
             $item->vacatedPosition = $current?->position($item);
         });
@@ -286,6 +291,10 @@ trait IsOrdered
         $item->storedOrderedRow = null;
         $item->refilteredPosition = null;
         $item->lockedOrderedRelations = [];
+
+        if ($item->exists && Provider::locksPivotParentsOf($item, deleting: false)) {
+            OrderedRelation::lockParentsFirst($item);
+        }
 
         if (! $item->exists) {
             $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);

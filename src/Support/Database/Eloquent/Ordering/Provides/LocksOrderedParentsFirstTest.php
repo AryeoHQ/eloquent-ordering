@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering\Provides;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Orchestra\Testbench\Attributes\DefineEnvironment;
 use PHPUnit\Framework\Attributes\CoversTrait;
@@ -88,9 +89,97 @@ class LocksOrderedParentsFirstTest extends TestCase
         $this->assertSame(1, $speaker->refresh()->position);
     }
 
+    #[Test]
+    public function it_locks_the_conference_before_the_panel_when_a_soft_delete_or_a_restore_reaches_both(): void
+    {
+        $panel = Panel::create();
+        $speaker = $panel->speakers()->create();
+        $conference = Conference::create();
+        $conference->speakers()->attach($speaker);
+        DB::enableQueryLog();
+
+        $this->runDeferredChecks(fn (): mixed => $speaker->delete());
+        $deleted = $this->lockedParentTables();
+        DB::flushQueryLog();
+
+        $this->runDeferredChecks(fn (): mixed => self::restore($speaker));
+
+        $this->assertSame([['conferences', 'panels'], ['conferences', 'panels']], [$deleted, $this->lockedParentTables()]);
+    }
+
+    #[Test]
+    public function it_finishes_soft_deletes_of_two_speakers_that_share_their_parents_without_a_deadlock_when_one_locks_the_sorted_parents_first(): void
+    {
+        $racer = $this->racer();
+        $panel = Panel::on('racer')->create();
+        [$first, $second] = [$panel->speakers()->create(), $panel->speakers()->create()];
+        $conference = Conference::on('racer')->create();
+        $conference->speakers()->attach($first);
+        $conference->speakers()->attach($second);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('conferences')->where('id', $conference->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('locked-delete.php', Speaker::class, (string) $second->id, 'parents first');
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('locked-delete.php', Speaker::class, (string) $first->id, 'the speaker first');
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $this->assertSame(['deleted', 'deleted'], array_map(fn (InvokedProcess $rival): string => $rival->wait()->output(), $rivals), $rivals[0]->errorOutput().$rivals[1]->errorOutput());
+            $this->assertSoftDeleted('speakers', ['id' => $first->id]);
+            $this->assertSoftDeleted('speakers', ['id' => $second->id]);
+        } finally {
+            $this->finishRace($rivals, $panel, $conference);
+        }
+    }
+
     protected function orderTheSpeakersOfEveryConference(): void
     {
         config()->set('concurrency.models', [Conference::class]);
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function lockedParentTables(): array
+    {
+        $tables = [];
+
+        foreach (array_column(DB::getQueryLog(), 'query') as $query) {
+            if (preg_match('/ from "(panels|conferences)" .*for no key update$/', $query, $match) === 1 && ! in_array($match[1], $tables, true)) {
+                $tables[] = $match[1];
+            }
+        }
+
+        return $tables;
+    }
+
+    /**
+     * @param  list<InvokedProcess>  $rivals
+     */
+    private function finishRace(array $rivals, Panel $panel, Conference $conference): void
+    {
+        $racer = DB::connection('racer');
+
+        if ($racer->transactionLevel() > 0) {
+            $racer->rollBack();
+        }
+
+        foreach ($rivals as $rival) {
+            $rival->wait();
+        }
+
+        $racer->transaction(function () use ($racer, $panel, $conference): void {
+            $racer->table('conference_speaker')->where('conference_id', $conference->id)->delete();
+            $racer->table('speakers')->where('panel_id', $panel->id)->delete();
+            $racer->table('conferences')->where('id', $conference->id)->delete();
+            $racer->table('panels')->where('id', $panel->id)->delete();
+        });
     }
 
     private static function restore(Model $speaker): mixed

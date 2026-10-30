@@ -8,6 +8,7 @@ use Illuminate\Support\Facades\DB;
 use Orchestra\Testbench\Foundation\Application;
 use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
+use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Listings\Listing;
 
 require __DIR__.'/../../../../vendor/autoload.php';
@@ -17,7 +18,7 @@ require __DIR__.'/../../../../vendor/autoload.php';
 Application::create(
     resolvingCallback: static function (Laravel $app): void {
         $app->booting(static function (): void {
-            config()->set('concurrency.models', [Listing::class]);
+            config()->set('concurrency.models', [Listing::class, Conference::class]);
         });
     },
     options: ['extra' => ['providers' => [Provider::class]]],
