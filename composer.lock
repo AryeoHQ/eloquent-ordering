@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "0c585f26bb58b8e497b6c30eb66697f6",
+    "content-hash": "3cc998a799cd18f4c387a2ea5fc2efdc",
     "packages": [
         {
             "name": "aryeo/eloquent-concurrency",
@@ -11213,6 +11213,8 @@
     "platform": {
         "php": "^8.5"
     },
-    "platform-dev": {},
+    "platform-dev": {
+        "ext-pdo": "*"
+    },
     "plugin-api-version": "2.9.0"
 }
