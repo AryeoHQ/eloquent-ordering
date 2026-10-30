@@ -12,12 +12,12 @@
             "source": {
                 "type": "git",
                 "url": "git@github.com:AryeoHQ/eloquent-concurrency.git",
-                "reference": "f97afe9f331146f6432de9e2f7fff765f2a263ce"
+                "reference": "1392163d1b60fa4831d34b22de39956fbbb44934"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/AryeoHQ/eloquent-concurrency/zipball/f97afe9f331146f6432de9e2f7fff765f2a263ce",
-                "reference": "f97afe9f331146f6432de9e2f7fff765f2a263ce",
+                "url": "https://api.github.com/repos/AryeoHQ/eloquent-concurrency/zipball/1392163d1b60fa4831d34b22de39956fbbb44934",
+                "reference": "1392163d1b60fa4831d34b22de39956fbbb44934",
                 "shasum": ""
             },
             "require": {
@@ -98,7 +98,7 @@
                 "source": "https://github.com/AryeoHQ/eloquent-concurrency/tree/feat/2026-10-29t1851-app-revisions-ma",
                 "issues": "https://github.com/AryeoHQ/eloquent-concurrency/issues"
             },
-            "time": "2026-10-30T13:20:20+00:00"
+            "time": "2026-10-30T14:31:41+00:00"
         },
         {
             "name": "aryeo/tooling-laravel",
