@@ -4,6 +4,10 @@
     "type": "library",
     "license": "MIT",
     "repositories": {
+        "eloquent-concurrency": {
+            "type": "vcs",
+            "url": "https://github.com/AryeoHQ/eloquent-concurrency"
+        },
         "artifactory": {
             "type": "composer",
             "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/",
@@ -16,7 +20,7 @@
     "require": {
         "php": "^8.5",
         "laravel/framework": "^12.37 || ^13",
-        "aryeo/eloquent-concurrency": "0.0.2",
+        "aryeo/eloquent-concurrency": "dev-feat/2026-10-29t1851-app-revisions-ma as 0.0.3",
         "aryeo/tooling-laravel": "0.0.43"
     },
     "require-dev": {
