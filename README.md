@@ -433,6 +433,8 @@ No attribute value makes `parentsToLockFirst()` throw. It leaves out a parent th
 
 A model that uses both traits locks that whole list in `(morph class, key)` order before it locks any parent for a single role. A soft delete, a restore, and a save that changes a column the pivot parents watch all lock it this way. Such a write therefore cannot deadlock with a caller that locks the sorted list first.
 
+**A parent that is also an item locks its own parents first.** A save of such a model can change a declared parent column and a column that its own order watches, such as its foreign key. That save locks the sorted `parentsToLockFirst()` list before it locks the model's own row. A `reorder()` of the model's parent locks that parent before it writes the model, so the two writes cannot deadlock. The order of the two traits in the class does not change this.
+
 ## Model events
 
 The package saves every row it writes through Eloquent, so each row fires the native `saving`, `updating`, `updated`, and `saved` events. Observers, `Event::listen('eloquent.updated: …')` listeners, and `$dispatchesEvents` classes all receive them.

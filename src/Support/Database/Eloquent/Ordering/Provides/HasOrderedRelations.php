@@ -9,8 +9,10 @@ use Illuminate\Database\Query\Expression;
 use Support\Database\Eloquent\Concurrency\Concerns\WritesInTransactions;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
+use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
+use Support\Database\Eloquent\Ordering\Providers\Provider;
 
 /**
  * @phpstan-require-extends Model
@@ -28,6 +30,10 @@ trait HasOrderedRelations
     public static function bootHasOrderedRelations(): void
     {
         static::saving(static function (self $parent): void {
+            if (OrderedRelation::refilters($parent)) {
+                self::lockOrderingParentsFirst($parent);
+            }
+
             $parent->refilteredOrders = OrderedRelation::membersBeforeRefilter($parent);
             OrderedRelation::preparedParent($parent);
         });
@@ -53,5 +59,18 @@ trait HasOrderedRelations
     public function orderedRelation(NamesConcurrencyRevision $revision): OrderedRelation
     {
         return new OrderedRelation($this, $revision);
+    }
+
+    private static function lockOrderingParentsFirst(Model $parent): void
+    {
+        if (! $parent instanceof Ordered) {
+            return;
+        }
+
+        if (Provider::locksPivotParentsOf($parent, deleting: false)) {
+            OrderedRelation::lockParentsFirst($parent);
+        } elseif ($parent->isDirty(OrderedRelation::watchedColumns($parent))) {
+            OrderedRelation::lockParentsFirstUnlessLocked($parent);
+        }
     }
 }

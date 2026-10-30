@@ -228,9 +228,13 @@ final class OrderedRelation
      */
     public static function lockParentsFirst(Model&LocksParentsFirst $model): void
     {
-        self::lockInOrder($model->parentsToLockFirst());
-
         $locked = self::$parentsLockedFirst ??= new WeakMap;
+
+        if ($locked->offsetExists($model)) {
+            return;
+        }
+
+        self::lockInOrder($model->parentsToLockFirst());
         $locked[$model] = true;
     }
 
@@ -342,13 +346,21 @@ final class OrderedRelation
      */
     public static function preparedParent(Model&OrdersRelations&Revisioned $parent): void
     {
-        $columns = array_values(array_unique(array_merge(
-            ...array_map(static fn (OrdersRelation $declaration): array => $declaration->membershipOf($parent->getTable()), self::attributes($parent, OrdersRelation::class)),
-        )));
+        $columns = self::parentMembershipColumns($parent);
 
         if ($parent->exists && $columns !== []) {
             self::preparedRelated($parent, $columns);
         }
+    }
+
+    /**
+     * @internal
+     */
+    public static function refilters(Model&OrdersRelations&Revisioned $parent): bool
+    {
+        $columns = self::parentMembershipColumns($parent);
+
+        return $parent->exists && $columns !== [] && $parent->isDirty($columns);
     }
 
     /**
@@ -1344,6 +1356,16 @@ final class OrderedRelation
     private static function lockOrder(Model $first, Model $second): int
     {
         return [$first->getMorphClass(), $first->getKey()] <=> [$second->getMorphClass(), $second->getKey()];
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function parentMembershipColumns(Model&OrdersRelations&Revisioned $parent): array
+    {
+        return array_values(array_unique(array_merge(
+            ...array_map(static fn (OrdersRelation $declaration): array => $declaration->membershipOf($parent->getTable()), self::attributes($parent, OrdersRelation::class)),
+        )));
     }
 
     /**

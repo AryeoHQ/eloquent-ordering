@@ -13,6 +13,7 @@ use Illuminate\Database\Eloquent\Relations\MorphPivot;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use LogicException;
@@ -31,6 +32,7 @@ use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Placement;
 use Support\Database\Eloquent\Ordering\PositionChange;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Clips\Clip;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\Customerable;
@@ -44,6 +46,7 @@ use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
+use Tests\Fixtures\Support\Shelves\Shelf;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\Fixtures\Support\Tracks\Track;
@@ -965,6 +968,94 @@ class HasOrderedRelationsTest extends TestCase
 
         $this->assertSame($before, [$this->tracksRevision($playlist), $this->trackKeys($playlist), DB::table('playlists')->where('id', $playlist->id)->value('kind')]);
         $this->assertSame([], $this->reorders);
+    }
+
+    #[Test]
+    public function it_locks_the_ordering_parents_before_the_model_when_a_save_changes_its_parent_and_a_membership_column_of_the_order_it_holds(): void
+    {
+        [$shelf, $destination] = [Shelf::create(), Shelf::create()];
+        $binder = $this->addBinder($shelf, 'audio');
+        DB::enableQueryLog();
+
+        $this->runDeferredChecks(fn (): bool => $binder->update(['shelf_id' => $destination->id, 'kind' => 'video']));
+
+        $this->assertSame(['shelves', 'binders'], $this->lockedBinderTables());
+        $this->assertSame([$destination->id, 'video', 1], [$binder->refresh()->shelf_id, $binder->kind, $binder->position]);
+    }
+
+    #[Test]
+    public function it_finishes_a_save_that_changes_the_parent_and_a_membership_column_of_the_model_and_a_reorder_of_that_parent_without_a_deadlock(): void
+    {
+        $racer = $this->racer();
+        [$shelf, $destination] = [Shelf::on('racer')->create(), Shelf::on('racer')->create()];
+        [$first, $second] = [$this->addBinder($shelf, 'audio', 'racer'), $this->addBinder($shelf, 'audio', 'racer')];
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('shelves')->where('id', $shelf->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('reorder-shelf.php', (string) $shelf->id, "{$second->id},{$first->id}");
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('refilter-move.php', (string) $first->id, (string) $destination->id, 'video');
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $this->assertSame(['reordered', 'saved'], array_map(fn (InvokedProcess $rival): string => $rival->wait()->output(), $rivals), $rivals[0]->errorOutput().$rivals[1]->errorOutput());
+            $this->assertSame([$destination->id, 'video'], array_values((array) $racer->table('binders')->where('id', $first->id)->first(['shelf_id', 'kind'])));
+        } finally {
+            $this->finishRace($rivals, $shelf, $destination);
+        }
+    }
+
+    private function addBinder(Shelf $shelf, string $kind, null|string $connection = null): Binder
+    {
+        $binder = (new Binder(['kind' => $kind]))->setConnection($connection);
+        $binder->shelf()->associate($shelf);
+        $binder->save();
+
+        return $binder;
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function lockedBinderTables(): array
+    {
+        $tables = [];
+
+        foreach (array_column(DB::getQueryLog(), 'query') as $query) {
+            if (preg_match('/ from "(shelves|binders)" .*for no key update$/', $query, $match) === 1 && ! in_array($match[1], $tables, true)) {
+                $tables[] = $match[1];
+            }
+        }
+
+        return $tables;
+    }
+
+    /**
+     * @param  list<InvokedProcess>  $rivals
+     */
+    private function finishRace(array $rivals, Shelf ...$shelves): void
+    {
+        $racer = DB::connection('racer');
+
+        if ($racer->transactionLevel() > 0) {
+            $racer->rollBack();
+        }
+
+        foreach ($rivals as $rival) {
+            $rival->wait();
+        }
+
+        $ids = array_map(fn (Shelf $shelf): int => $shelf->id, $shelves);
+
+        $racer->transaction(function () use ($racer, $ids): void {
+            $racer->table('binders')->whereIn('shelf_id', $ids)->delete();
+            $racer->table('shelves')->whereIn('id', $ids)->delete();
+        });
     }
 
     private function addVideo(Section $section): Video
