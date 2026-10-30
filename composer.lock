@@ -4,21 +4,15 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "92009a4d4ff33b561fd471032735ca1c",
+    "content-hash": "0c585f26bb58b8e497b6c30eb66697f6",
     "packages": [
         {
             "name": "aryeo/eloquent-concurrency",
-            "version": "dev-feat/2026-10-29t1851-app-revisions-ma",
-            "source": {
-                "type": "git",
-                "url": "git@github.com:AryeoHQ/eloquent-concurrency.git",
-                "reference": "1392163d1b60fa4831d34b22de39956fbbb44934"
-            },
+            "version": "0.0.3",
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/AryeoHQ/eloquent-concurrency/zipball/1392163d1b60fa4831d34b22de39956fbbb44934",
-                "reference": "1392163d1b60fa4831d34b22de39956fbbb44934",
-                "shasum": ""
+                "url": "https://artifactory.zgtools.net/artifactory/api/composer/listing-and-vendor-management-composer/direct-dists/aryeo/eloquent-concurrency/eloquent-concurrency-0.0.3.zip",
+                "reference": "c3139fef8bd075dfc967e5012075c7cd41a95436"
             },
             "require": {
                 "aryeo/tooling-laravel": "0.0.43",
@@ -93,12 +87,7 @@
                     "email": "justinsel@zillowgroup.com"
                 }
             ],
-            "description": "Application-raised concurrency revisions for Eloquent models, with Postgres refusing a missed raise",
-            "support": {
-                "source": "https://github.com/AryeoHQ/eloquent-concurrency/tree/feat/2026-10-29t1851-app-revisions-ma",
-                "issues": "https://github.com/AryeoHQ/eloquent-concurrency/issues"
-            },
-            "time": "2026-10-30T14:31:41+00:00"
+            "description": "Application-raised concurrency revisions for Eloquent models, with Postgres refusing a missed raise"
         },
         {
             "name": "aryeo/tooling-laravel",
@@ -11216,18 +11205,9 @@
             "time": "2026-10-12T12:37:13+00:00"
         }
     ],
-    "aliases": [
-        {
-            "package": "aryeo/eloquent-concurrency",
-            "version": "dev-feat/2026-10-29t1851-app-revisions-ma",
-            "alias": "0.0.3",
-            "alias_normalized": "0.0.3.0"
-        }
-    ],
+    "aliases": [],
     "minimum-stability": "stable",
-    "stability-flags": {
-        "aryeo/eloquent-concurrency": 20
-    },
+    "stability-flags": {},
     "prefer-stable": false,
     "prefer-lowest": false,
     "platform": {
