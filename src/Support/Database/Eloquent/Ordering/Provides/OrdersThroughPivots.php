@@ -16,12 +16,13 @@ use Support\Database\Eloquent\Ordering\Providers\Provider;
  */
 trait OrdersThroughPivots
 {
+    use LocksOrderedParentsFirst;
     use WritesInTransactions;
 
     /**
      * @return list<Model>
      */
-    public function parentsToLockFirst(): array
+    private function pivotParentsToLockFirst(): array
     {
         return Provider::parentsReachedBy($this);
     }

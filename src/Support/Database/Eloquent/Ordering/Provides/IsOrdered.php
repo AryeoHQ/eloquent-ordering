@@ -28,6 +28,7 @@ use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
  */
 trait IsOrdered
 {
+    use LocksOrderedParentsFirst;
     use WritesInTransactions;
 
     private const int ORDER_LOCK_ATTEMPTS = 5;
@@ -240,24 +241,6 @@ trait IsOrdered
     }
 
     /**
-     * @return list<Model>
-     */
-    public function parentsToLockFirst(): array
-    {
-        $parents = [];
-
-        foreach ([$this->getRawOriginal(), $this->getAttributes()] as $attributes) {
-            foreach (OrderedRelation::namedParents($this, $attributes, $this->heldOrderedParents()) as $parent) {
-                if (! array_any($parents, static fn (Model $named): bool => $named->is($parent))) {
-                    $parents[] = $parent;
-                }
-            }
-        }
-
-        return $parents;
-    }
-
-    /**
      * @return Attribute<null|int, never>
      */
     protected function position(): Attribute
@@ -358,6 +341,17 @@ trait IsOrdered
                 $item->refilteredPosition = [$current, $current->memberPosition($item)];
             }
         }
+    }
+
+    /**
+     * @return list<Model>
+     */
+    private function orderingParentsToLockFirst(): array
+    {
+        return [
+            ...OrderedRelation::namedParents($this, $this->getRawOriginal(), $this->heldOrderedParents()),
+            ...OrderedRelation::namedParents($this, $this->getAttributes(), $this->heldOrderedParents()),
+        ];
     }
 
     private function forgetPosition(): void

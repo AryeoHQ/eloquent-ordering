@@ -310,6 +310,8 @@ class Customer extends Model implements LocksParentsFirst
 
 List each parent in the `models` key of `config/concurrency.php`, which eloquent-concurrency reads. After the application boots, the provider reads the ordered `BelongsToMany` and `MorphToMany` relations of each listed parent. A related model without `OrdersThroughPivots` throws `LogicException` at that point, so every artisan command fails until the model uses the trait. The trait runs the related model's `save()` and `delete()` in a transaction. It also provides `parentsToLockFirst()`. The boot check does not require `LocksParentsFirst`, but PHPStan reports a model that uses the trait without it.
 
+An `Ordered` model can also be the related model of an ordered pivot. It then uses both `IsOrdered` and `OrdersThroughPivots`, and implements `Ordered`, which extends `LocksParentsFirst`. Both traits take `parentsToLockFirst()` from one shared trait, so PHP reports no collision.
+
 Install a related recorder for each parent that orders the pivots:
 
 ```php
@@ -426,7 +428,7 @@ A `move()` re-reads the stored foreign key under the lock. If another transactio
 
 No attribute value makes `parentsToLockFirst()` throw. It leaves out a parent that does not exist, and returns both parents of attributes that name two. A parent that the item holds on another connection comes back from the item's own connection. The write then throws `LogicException` as before.
 
-**Lock a related model's parents first too.** The `parentsToLockFirst()` of a model that uses `OrdersThroughPivots` returns every parent that its pivot rows reach, soft-deleted pivot rows included. Its soft delete locks the same parents. A related model locked before those parents can deadlock with an `attach()` to one of them.
+**Lock a related model's parents first too.** The `parentsToLockFirst()` of a model that uses `OrdersThroughPivots` returns every parent that its pivot rows reach, soft-deleted pivot rows included. For a model that also uses `IsOrdered`, the list starts with the parents that order the model, and names each parent once. Its soft delete locks the same parents. A related model locked before those parents can deadlock with an `attach()` to one of them.
 
 ## Model events
 
