@@ -38,6 +38,7 @@ use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Photos\Photo;
 use Tests\Fixtures\Support\Playlists\Playlist;
+use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
@@ -246,6 +247,18 @@ class IsOrderedTest extends TestCase
     {
         yield 'a saving listener registered after boot' => ['saving'];
         yield 'a creating listener registered after boot' => ['creating'];
+    }
+
+    /**
+     * @return iterable<string, array{PivotShape, string}>
+     */
+    public static function latePivotCreateListeners(): iterable
+    {
+        foreach (PivotShape::pivots() as $name => [$shape]) {
+            foreach (self::lateCreateListeners() as $listener => [$event]) {
+                yield "{$name}, {$listener}" => [$shape, $event];
+            }
+        }
     }
 
     /**
@@ -1208,6 +1221,38 @@ class IsOrderedTest extends TestCase
         $this->assertRejected($shape, LogicException::class, fn (): bool => $member->save(), $parent);
     }
 
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_refuses_a_save_that_sets_the_rank_key_its_create_assigned_after_a_move(Shape $shape): void
+    {
+        [$parent, [$member]] = $shape->with(2);
+        $assigned = $this->rankKey($member);
+        $member->move(Placement::last(), null);
+        $member->setAttribute('rank_key', $assigned);
+
+        $this->assertRejected($shape, LogicException::class, fn (): bool => $member->save(), $parent);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_refuses_a_save_that_changes_the_related_key_of_a_pivot(PivotShape $shape): void
+    {
+        [$parent, [$member]] = $shape->with(2);
+        $customer = $member->getAttribute('customer_id');
+        $member->setAttribute('customer_id', Customer::create()->id);
+
+        $this->assertRejected($shape, LogicException::class, fn (): bool => $member->save(), $parent);
+        $this->assertSame($customer, DB::table($shape->memberTable())->where('id', $member->getKey())->value('customer_id'));
+
+        $this->expectExceptionObject(new LogicException(sprintf(
+            '[%s:%s] changes its [customer_id]. Detach it with detach(), then attach the new related model with attach().',
+            $member::class,
+            $member->getKey(),
+        )));
+
+        $member->save();
+    }
+
     /**
      * @param  Closure(Video, Section): mixed  $write
      */
@@ -1305,6 +1350,22 @@ class IsOrderedTest extends TestCase
         });
 
         $this->assertRejected($shape, LogicException::class, fn (): Model => $shape->add($source), $source, $destination);
+    }
+
+    #[DataProvider('latePivotCreateListeners')]
+    #[Test]
+    public function it_refuses_a_listener_that_changes_the_related_key_of_a_new_pivot_after_it_prepared_the_create(PivotShape $shape, string $event): void
+    {
+        $parent = $shape->createParent();
+        $member = $shape->newMember($parent);
+        $customer = Customer::create();
+
+        Event::listen(sprintf('eloquent.%s: %s', $event, $shape->memberClass()), function (Model $pivot) use ($customer): void {
+            $pivot->setAttribute('customer_id', $customer->id);
+        });
+
+        $this->assertRejected($shape, LogicException::class, fn (): bool => $member->save(), $parent);
+        $this->assertFalse(DB::table($shape->memberTable())->where('customer_id', $customer->id)->exists());
     }
 
     #[DataProvider('lateCopyListeners')]
@@ -2384,6 +2445,36 @@ class IsOrderedTest extends TestCase
 
         $this->assertSame($revision + 1, $this->tracksRevision($playlist));
         $this->assertSame([], $this->reorders);
+    }
+
+    #[Test]
+    public function it_counts_the_position_again_after_a_membership_change_takes_out_a_track_with_a_selected_position(): void
+    {
+        [$playlist, [, $second]] = $this->playlist('audio', ['audio', 'audio', 'audio']);
+        $leaving = $playlist->orderedRelation(PlaylistRevision::TracksOrder)->query()->withPositions()->get()->firstOrFail(fn (Model $track): bool => $track->getKey() === $second->id);
+        $this->assertSame(2, $leaving->getAttribute('position'));
+
+        $leaving->setAttribute('kind', 'video');
+        $leaving->save();
+
+        $this->assertArrayNotHasKey(OrderedRelation::POSITION, $leaving->getAttributes());
+        $this->assertNull($leaving->getAttribute('position'));
+    }
+
+    #[Test]
+    public function it_counts_the_position_again_after_a_membership_change_admits_a_track_with_a_selected_position(): void
+    {
+        [, [, $second]] = $this->playlist('audio', ['audio', 'video', 'audio']);
+        $entering = Track::query()->findOrFail($second->id);
+        (new OrderedCollection([$entering]))->loadPositions();
+        $this->assertArrayHasKey(OrderedRelation::POSITION, $entering->getAttributes());
+        $this->assertNull($entering->position);
+
+        $entering->kind = 'audio';
+        $entering->save();
+
+        $this->assertArrayNotHasKey(OrderedRelation::POSITION, $entering->getAttributes());
+        $this->assertSame(2, $entering->position);
     }
 
     #[Test]

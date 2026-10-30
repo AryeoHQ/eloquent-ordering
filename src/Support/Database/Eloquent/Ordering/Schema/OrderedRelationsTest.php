@@ -14,12 +14,14 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Concurrency\Schema\ConcurrencyRevisions;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Galleries\Gallery;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
+use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\UuidMorphManyShape;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
@@ -43,9 +45,9 @@ class OrderedRelationsTest extends TestCase
     {
         yield 'a foreign key with soft deletes' => ['assets', ['deleted_at', 'rank_key', 'section_id']];
         yield 'a foreign key without soft deletes' => ['clips', ['rank_key', 'video_id']];
-        yield 'a pivot' => ['listing_customer', ['deleted_at', 'listing_id', 'rank_key']];
+        yield 'a pivot' => ['listing_customer', ['customer_id', 'deleted_at', 'listing_id', 'rank_key']];
         yield 'a morph of two parent types' => ['scenes', ['deleted_at', 'rank_key', 'sceneable_id', 'sceneable_type']];
-        yield 'a morph pivot' => ['customerables', ['customerable_id', 'customerable_type', 'deleted_at', 'rank_key']];
+        yield 'a morph pivot' => ['customerables', ['customer_id', 'customerable_id', 'customerable_type', 'deleted_at', 'rank_key']];
         yield 'a uuid morph' => ['slides', ['deleted_at', 'rank_key', 'slideable_id', 'slideable_type']];
     }
 
@@ -55,6 +57,14 @@ class OrderedRelationsTest extends TestCase
     public static function archetype(): iterable
     {
         yield UuidMorphManyShape::NAME => [new UuidMorphManyShape];
+    }
+
+    /**
+     * @return iterable<string, array{PivotShape}>
+     */
+    public static function pivots(): iterable
+    {
+        return PivotShape::pivots();
     }
 
     /**
@@ -103,6 +113,16 @@ class OrderedRelationsTest extends TestCase
         OrderedRelations::createMorphTrigger('scenes', 'tours', 'sceneable', (new Tour)->getMorphClass(), TourRevision::ScenesOrder->value, membership: ['title']);
 
         $this->assertSame([['item', ['deleted_at', 'rank_key', 'sceneable_id', 'sceneable_type', 'title']]], $this->recorders('scenes'));
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_refuses_the_commit_of_a_related_key_change_of_a_pivot_that_no_order_revision_raise_follows(PivotShape $shape): void
+    {
+        [, [$member]] = $shape->with(1);
+        $customer = Customer::create();
+
+        $this->assertRefused(fn (): int => DB::table($shape->memberTable())->where('id', $member->getKey())->update(['customer_id' => $customer->id]));
     }
 
     #[Test]

@@ -30,7 +30,7 @@ return new class extends Migration
             'create unique index listing_customer_listing_id_rank_key_unique on listing_customer (listing_id, rank_key) where deleted_at is null',
         );
 
-        OrderedRelations::createTrigger('listing_customer', 'listings', 'listing_id', ListingRevision::CustomersOrder->value);
+        OrderedRelations::createTrigger('listing_customer', 'listings', 'listing_id', ListingRevision::CustomersOrder->value, relatedKey: 'customer_id');
         OrderedRelations::createRelatedTrigger('customers', 'listings', 'listing_customer', 'customer_id', 'listing_id', ListingRevision::CustomersOrder->value);
     }
 

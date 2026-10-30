@@ -158,6 +158,7 @@ class Provider extends ServiceProvider
         Event::listen("eloquent.updated: {$related}", static function (Model $model) use ($parents, $held): void {
             $positions = $held[$model] ?? [];
             unset($held[$model]);
+            OrderedRelation::requirePrepared($model);
             $changed = array_filter($parents, static fn (array $parent): bool => $model->wasChanged($parent[2]));
             $unprepared = array_diff_key($changed, $positions);
 

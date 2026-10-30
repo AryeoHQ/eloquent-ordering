@@ -268,6 +268,19 @@ final class OrderedRelation
      *
      * @return list<string>
      */
+    public static function relatedKeyColumns(Model&Ordered $item): array
+    {
+        return array_values(array_unique(array_filter(
+            array_map(static fn (array $membership): null|string => $membership['keys']->relatedKey, self::memberships($item)),
+            is_string(...),
+        )));
+    }
+
+    /**
+     * @internal
+     *
+     * @return list<string>
+     */
     public static function watchedColumns(Model&Ordered $item): array
     {
         return [self::RANK_KEY, ...self::membershipColumns($item), ...self::declaredColumns($item), OrderedRelations::DELETED_AT];
@@ -279,7 +292,7 @@ final class OrderedRelation
     public static function prepared(Model&Ordered $item): void
     {
         $prepared = self::$prepared ??= new WeakMap;
-        $prepared[$item] = self::attributesOf($item, self::watchedColumns($item));
+        $prepared[$item] = self::attributesOf($item, [...self::watchedColumns($item), ...self::relatedKeyColumns($item)]);
     }
 
     /**
@@ -1202,6 +1215,7 @@ final class OrderedRelation
                 $relation->getForeignPivotKeyName(),
                 $relation->getParentKeyName(),
                 ...$morph,
+                relatedKey: $relation->getRelatedPivotKeyName(),
             );
         }
 

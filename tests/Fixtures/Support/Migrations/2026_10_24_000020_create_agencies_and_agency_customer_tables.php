@@ -38,7 +38,7 @@ return new class extends Migration
             'create unique index agency_customer_agency_id_rank_key_unique on agency_customer (agency_id, rank_key) where deleted_at is null',
         );
 
-        OrderedRelations::createTrigger('agency_customer', 'agencies', 'agency_id', AgencyRevision::CustomersOrder->value);
+        OrderedRelations::createTrigger('agency_customer', 'agencies', 'agency_id', AgencyRevision::CustomersOrder->value, relatedKey: 'customer_id');
     }
 
     public function down(): void

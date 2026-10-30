@@ -31,7 +31,7 @@ return new class extends Migration
             'create unique index customerables_customerable_rank_key_unique on customerables (customerable_type, customerable_id, rank_key) where deleted_at is null',
         );
 
-        OrderedRelations::createMorphTrigger('customerables', 'tours', 'customerable', (new Tour)->getMorphClass(), TourRevision::CustomersOrder->value);
+        OrderedRelations::createMorphTrigger('customerables', 'tours', 'customerable', (new Tour)->getMorphClass(), TourRevision::CustomersOrder->value, relatedKey: 'customer_id');
     }
 
     public function down(): void

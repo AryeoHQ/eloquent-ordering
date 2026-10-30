@@ -294,6 +294,26 @@ class OrdersThroughPivotsTest extends TestCase
 
     #[DefineEnvironment('orderTheCustomersOfAListingByName')]
     #[Test]
+    public function it_refuses_a_listener_that_changes_a_prepared_customer_column_again_and_stops_the_later_listeners(): void
+    {
+        [$listing, $customer] = $this->listingOfACustomerNamedAda();
+
+        Customer::updating(function (Customer $customer): bool {
+            $customer->name = 'Linus';
+
+            return true;
+        });
+
+        $this->assertListenerRefused(
+            sprintf('A listener changed [name] of [%s:%s] after its order write was prepared.', Customer::class, $customer->id),
+            $listing,
+            $customer,
+            fn (): bool => $customer->update(['name' => 'Grace']),
+        );
+    }
+
+    #[DefineEnvironment('orderTheCustomersOfAListingByName')]
+    #[Test]
     public function it_refuses_a_change_to_a_declared_customer_column_that_no_order_write_prepared(): void
     {
         [$listing, $customer] = $this->listingOfACustomerNamedAda();

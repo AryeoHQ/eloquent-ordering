@@ -17,6 +17,7 @@ final readonly class RelationKeys
         public string $ownerKey,
         public null|string $morphType = null,
         public null|string $morphClass = null,
+        public null|string $relatedKey = null,
     ) {}
 
     /**

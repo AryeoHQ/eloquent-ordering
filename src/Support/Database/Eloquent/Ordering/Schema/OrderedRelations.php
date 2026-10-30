@@ -16,13 +16,13 @@ final class OrderedRelations
     /**
      * @param  list<string>  $membership
      */
-    public static function createTrigger(string $table, string $parent, string $foreignKey, string $revision, array $membership = []): void
+    public static function createTrigger(string $table, string $parent, string $foreignKey, string $revision, array $membership = [], null|string $relatedKey = null): void
     {
         ConcurrencyRevisions::createNamedTrigger(
             NamedRevisionTrigger::on($table)
                 ->increments($parent, $revision)
                 ->through($foreignKey)
-                ->whenColumnsChange(...self::watchedColumns($table), ...$membership)
+                ->whenColumnsChange(...self::watchedColumns($table, $relatedKey), ...$membership)
                 ->whenRowsInsertedOrDeleted(),
         );
     }
@@ -30,13 +30,13 @@ final class OrderedRelations
     /**
      * @param  list<string>  $membership
      */
-    public static function createMorphTrigger(string $table, string $parent, string $morphName, string $morphType, string $revision, array $membership = []): void
+    public static function createMorphTrigger(string $table, string $parent, string $morphName, string $morphType, string $revision, array $membership = [], null|string $relatedKey = null): void
     {
         ConcurrencyRevisions::createNamedTrigger(
             NamedRevisionTrigger::on($table)
                 ->increments($parent, $revision)
                 ->throughMorph($morphName, $morphType)
-                ->whenColumnsChange(...self::watchedColumns($table), ...$membership)
+                ->whenColumnsChange(...self::watchedColumns($table, $relatedKey), ...$membership)
                 ->whenRowsInsertedOrDeleted(),
         );
     }
@@ -88,9 +88,9 @@ final class OrderedRelations
     /**
      * @return list<string>
      */
-    private static function watchedColumns(string $table): array
+    private static function watchedColumns(string $table, null|string $relatedKey): array
     {
-        return [OrderedRelation::RANK_KEY, ...self::softDeleteColumn($table)];
+        return [OrderedRelation::RANK_KEY, ...self::softDeleteColumn($table), ...$relatedKey === null ? [] : [$relatedKey]];
     }
 
     /**

@@ -123,6 +123,7 @@ trait IsOrdered
             $item->storedOrderedRow = null;
             $item->refilteredPosition = null;
             $item->lockedOrderedRelations = [];
+            $item->assignedRankKey = null;
 
             if ($stored !== null && $item->storedOrderedAttributes(array_keys($stored)) !== $stored) {
                 OrderedRelation::raiseAll($relations);
@@ -134,7 +135,7 @@ trait IsOrdered
 
             $restored?->placed($item);
 
-            if ($restored !== null || $reparented !== null || $item->wasChanged(OrderedRelations::DELETED_AT)) {
+            if ($restored !== null || $reparented !== null || $refiltered !== null || $item->wasChanged(OrderedRelations::DELETED_AT)) {
                 $item->forgetPosition();
             }
 
@@ -286,6 +287,15 @@ trait IsOrdered
             LogicException::class,
             sprintf('[%s:%s] sets its [%s], which only an order write may set. Move it with move(), or place a new member with placeAt().', $item::class, $item->getKey(), OrderedRelation::RANK_KEY),
         );
+
+        $reassigned = $item->exists ? array_values(array_filter(OrderedRelation::relatedKeyColumns($item), $item->isDirty(...))) : [];
+
+        throw_if($reassigned !== [], LogicException::class, sprintf(
+            '[%s:%s] changes its [%s]. Detach it with detach(), then attach the new related model with attach().',
+            $item::class,
+            $item->getKey(),
+            implode('], [', $reassigned),
+        ));
 
         $uncommitted = $item->reparented !== null;
         $item->restoredInto = null;
