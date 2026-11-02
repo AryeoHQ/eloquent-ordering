@@ -24,6 +24,7 @@ use PHPUnit\Framework\Attributes\Test;
 use ReflectionClass;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
+use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Exceptions\UndeclaredConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
@@ -995,6 +996,44 @@ class HasOrderedRelationsTest extends TestCase
         $this->assertIsInt($write);
         $this->assertCount(3, $reads);
         $this->assertTrue($lock < $reads[0] && $reads[0] < $write && $write < $reads[1]);
+    }
+
+    #[Test]
+    public function it_rejects_the_digest_of_a_stale_parent_instance_against_the_membership_the_parent_row_holds(): void
+    {
+        [$playlist, [, $firstVideo, , $secondVideo]] = $this->playlist('audio', ['audio', 'video', 'audio', 'video']);
+        $stale = Playlist::query()->findOrFail($playlist->id);
+        $current = Playlist::query()->findOrFail($playlist->id);
+        $expected = $stale->concurrencyRevision(PlaylistRevision::TracksOrder);
+        $current->update(['kind' => 'video']);
+        $keys = $this->trackKeys($playlist);
+        $this->recordReorders();
+
+        try {
+            $stale->orderedRelation(PlaylistRevision::TracksOrder)->reorder([$secondVideo->id, $firstVideo->id], $expected);
+            $this->fail('The reorder accepted the digest of a membership the parent row no longer holds.');
+        } catch (StaleConcurrencyRevision) {
+        }
+
+        $this->assertSame($keys, $this->trackKeys($playlist));
+        $this->assertSame([], $this->reorders);
+    }
+
+    #[Test]
+    public function it_reorders_a_stale_parent_instance_against_the_digest_of_the_membership_the_parent_row_holds(): void
+    {
+        [$playlist, [, $firstVideo, , $secondVideo]] = $this->playlist('audio', ['audio', 'video', 'audio', 'video']);
+        $stale = Playlist::query()->findOrFail($playlist->id);
+        $current = Playlist::query()->findOrFail($playlist->id);
+        $current->update(['kind' => 'video']);
+        $expected = $this->tracksRevision($playlist);
+        $this->recordReorders();
+
+        $change = $stale->orderedRelation(PlaylistRevision::TracksOrder)->reorder([$secondVideo->id, $firstVideo->id], $expected);
+
+        $this->assertSame([$secondVideo->id, $firstVideo->id], $change->order);
+        $this->assertSame([$secondVideo->id, $firstVideo->id], Playlist::query()->findOrFail($playlist->id)->orderedRelation(PlaylistRevision::TracksOrder)->query()->pluck('tracks.id')->all());
+        $this->assertCount(1, $this->reorders);
     }
 
     #[Test]
