@@ -48,8 +48,8 @@ Schema::create('assets', function (Blueprint $table): void {
     $table->foreignUuid('section_id')->index()->constrained();
     $table->rankKey();
     $table->string('title')->nullable();
-    $table->timestamps();
-    $table->softDeletes();
+    $table->timestampsTz();
+    $table->softDeletesTz();
     $table->rankKeyIndex('section_id');
 });
 ```
@@ -85,7 +85,7 @@ $section->concurrencyRevision(SectionRevision::AssetsOrder);   // '9ab0…', one
 
 The relation method must be public and must declare its return type: `HasMany`, `MorphMany`, or `BelongsToMany`. The related model must be `Ordered`.
 
-**The order digest covers the members in order.** A member is a row of the relation with a rank key. The digest query removes every global scope of the related model except `SoftDeletingScope`, and orders by `rank_key`, then by key. A rebalance keeps the order, so it keeps the digest. An empty relation has a digest too. For a pivot relation, the digest covers the related model keys.
+**The order digest covers the members in order.** A member is a row of the relation with a rank key. The digest query removes every global scope of the related model except `SoftDeletingScope`, and orders by `rank_key`, then by key. A rebalance keeps the order, so it keeps the digest. An empty relation has a digest too. For a pivot relation, the digest covers the related model keys. The digest covers the members' keys in order, not their content, so it serves as a precondition token for an order write. An API that tags a nested index with it must also cover the members' rendered fields in that tag.
 
 **Keys must be named `id`.** The parent's primary key, the item's primary key, and the relation's owner key must all be `id`. For a pivot relation, the parent key and the pivot's primary key count. A relation such as `hasMany(Asset::class, 'section_legacy_id', 'legacy_id')` throws `LogicException` when the relation resolves.
 

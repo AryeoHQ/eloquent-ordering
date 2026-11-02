@@ -58,9 +58,7 @@ class Provider extends ServiceProvider
         Event::listen("eloquent.trashed: {$related}", static function (Model $model) use ($held): void {
             $positions = $held[$model] ?? [];
             unset($held[$model]);
-            OrderedRelation::forgetParentsLockedFirst($model);
-
-            self::reportHeldPivotParents($positions);
+            self::reportTrashedPivotParents($model, $positions);
         });
 
         Event::listen("eloquent.updating: {$related}", static function (Model $model) use ($held): void {
@@ -73,19 +71,7 @@ class Provider extends ServiceProvider
         Event::listen("eloquent.updated: {$related}", static function (Model $model) use ($held): void {
             $positions = $held[$model] ?? [];
             unset($held[$model]);
-            OrderedRelation::forgetParentsLockedFirst($model);
-            OrderedRelation::requirePrepared($model);
-            $changed = array_filter(self::pivotParentsOf($model), static fn (array $parent): bool => $model->wasChanged($parent[3]));
-            $unprepared = array_diff_key($changed, $positions);
-
-            throw_if($unprepared !== [], LogicException::class, sprintf(
-                '[%s:%s] changed [%s] without a prepared order write. A listener ran after the package\'s [updating] listener, or stopped it.',
-                $model::class,
-                $model->getKey(),
-                implode('], [', array_values(array_intersect(array_keys($model->getChanges()), array_merge(...array_column($unprepared, 3))))),
-            ));
-
-            self::reportHeldPivotParents(array_intersect_key($positions, $changed));
+            self::reportUpdatedPivotParents($model, $positions);
         });
     }
 
@@ -134,6 +120,36 @@ class Provider extends ServiceProvider
     }
 
     /**
+     * @param  array<int, ReachedParents>  $positions
+     */
+    private static function reportTrashedPivotParents(Model $model, array $positions): void
+    {
+        OrderedRelation::forgetParentsLockedFirst($model);
+
+        self::reportHeldPivotParents($positions);
+    }
+
+    /**
+     * @param  array<int, ReachedParents>  $positions
+     */
+    private static function reportUpdatedPivotParents(Model $model, array $positions): void
+    {
+        OrderedRelation::forgetParentsLockedFirst($model);
+        OrderedRelation::requirePrepared($model);
+        $changed = array_filter(self::pivotParentsOf($model), static fn (array $parent): bool => $model->wasChanged($parent[3]));
+        $unprepared = array_diff_key($changed, $positions);
+
+        throw_if($unprepared !== [], LogicException::class, sprintf(
+            '[%s:%s] changed [%s] without a prepared order write. A listener ran after the package\'s [updating] listener, or stopped it.',
+            $model::class,
+            $model->getKey(),
+            implode('], [', array_values(array_intersect(array_keys($model->getChanges()), array_merge(...array_column($unprepared, 3))))),
+        ));
+
+        self::reportHeldPivotParents(array_intersect_key($positions, $changed));
+    }
+
+    /**
      * @return list<PivotParent>
      */
     private static function pivotParentsOf(Model $related): array
@@ -162,14 +178,12 @@ class Provider extends ServiceProvider
             foreach (OrderedRelation::orderDeclarations($parent) as [$method, $declaration]) {
                 $relation = method_exists($parent, $method) ? $parent->{$method}() : null;
 
-                if (! $relation instanceof BelongsToMany || ($relation instanceof MorphToMany && $relation->getInverse()) || $relation->getRelated()::class !== $related::class) {
-                    continue;
-                }
+                if ($relation instanceof BelongsToMany && ! ($relation instanceof MorphToMany && $relation->getInverse()) && $relation->getRelated()::class === $related::class) {
+                    $columns = OrderedRelation::watchedRelatedColumns($related, $declaration);
 
-                $columns = OrderedRelation::watchedRelatedColumns($related, $declaration);
-
-                if ($columns !== []) {
-                    $reached[] = [$class, $method, $declaration, $columns];
+                    if ($columns !== []) {
+                        $reached[] = [$class, $method, $declaration, $columns];
+                    }
                 }
             }
         }
