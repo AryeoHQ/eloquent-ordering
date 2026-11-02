@@ -51,6 +51,9 @@ use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Listings\NamedListing;
+use Tests\Fixtures\Support\Listings\PivotedListing;
+use Tests\Fixtures\Support\Listings\TitledListing;
+use Tests\Fixtures\Support\Listings\TwoPivotListing;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Sections\Section;
@@ -70,6 +73,13 @@ class OrderedRelationTest extends TestCase
 {
     /** @var list<array{mixed, list<array{int|string, null|int, null|int}>}> */
     private array $reorders = [];
+
+    protected function tearDown(): void
+    {
+        PivotedListing::$pivot = ListingCustomer::class;
+
+        parent::tearDown();
+    }
 
     /**
      * @return iterable<string, array{Shape}>
@@ -610,7 +620,7 @@ class OrderedRelationTest extends TestCase
         $agency = Agency::create(['id' => $listing->id]);
         $listing->customers()->attach($customers);
         $agency->customers()->attach($customers);
-        $parent = $this->parentOfTwoPivotRelations($listing);
+        $parent = TwoPivotListing::query()->findOrFail($listing->id);
         [$listed, $represented] = [$shape->members($listing), $this->agencyMembers($agency)];
 
         $listings = Shape::relationOf($parent, ListingRevision::CustomersOrder)->arrange(array_reverse($listed));
@@ -790,6 +800,19 @@ class OrderedRelationTest extends TestCase
         } catch (LogicException $exception) {
             $this->assertStringContainsString($message, $exception->getMessage());
         }
+    }
+
+    #[Test]
+    public function it_keeps_the_open_transaction_usable_after_it_refuses_a_subquery_filter(): void
+    {
+        DB::transaction(function (): void {
+            try {
+                self::correlatedFolder()->concurrencyRevision(FolderRevision::DocumentsOrder);
+                $this->fail('A relation whose subquery filter reads the row it filters was resolved.');
+            } catch (LogicException) {
+                $this->assertSame(1, DB::scalar('select 1'));
+            }
+        });
     }
 
     /**
@@ -1095,6 +1118,48 @@ class OrderedRelationTest extends TestCase
             }
         }, FolderRevision::DocumentsOrder, '::documents()] filters its members by the parent column [folders.kind] in a form other than [<item column> = folders.kind]'];
 
+        yield 'a parent column with a fallback for a null value' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'playlists';
+
+            /**
+             * @return HasMany<Track, $this>
+             */
+            #[OrdersRelation(PlaylistRevision::TracksOrder, membership: ['tracks.kind', 'playlists.kind'])]
+            public function tracks(): HasMany
+            {
+                return $this->hasMany(Track::class, 'playlist_id')->where('tracks.kind', $this->getAttribute('kind') ?? 'audio');
+            }
+        }, PlaylistRevision::TracksOrder, '::tracks()] filters its members by the parent column [playlists.kind] in a form other than [<item column> = playlists.kind]'];
+
+        yield 'a parent column compared only when it is set' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'playlists';
+
+            /**
+             * @return HasMany<Track, $this>
+             */
+            #[OrdersRelation(PlaylistRevision::TracksOrder, membership: ['tracks.kind', 'playlists.kind'])]
+            public function tracks(): HasMany
+            {
+                $tracks = $this->hasMany(Track::class, 'playlist_id');
+
+                if ($this->getAttribute('kind') !== null) {
+                    $tracks->where('tracks.kind', $this->getAttribute('kind'));
+                }
+
+                return $tracks;
+            }
+        }, PlaylistRevision::TracksOrder, '::tracks()] filters its members by the parent column [playlists.kind] in a form other than [<item column> = playlists.kind]'];
+
+        yield 'a subquery that reads the row it filters' => [self::correlatedFolder(...), FolderRevision::DocumentsOrder, '::documents()] filters its members through a subquery that reads a table outside it'];
+
         yield 'an unqualified pivot column' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
@@ -1276,38 +1341,32 @@ class OrderedRelationTest extends TestCase
             }
         }, SectionRevision::AssetsOrder];
 
-        yield 'a declared pivot column' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'listings';
-
-            /**
-             * @return BelongsToMany<Model, $this, ListingCustomer>
-             */
-            #[OrdersRelation(ListingRevision::CustomersOrder, membership: ['listing_customer.title'])]
-            public function customers(): BelongsToMany
-            {
-                return $this->belongsToMany(OrderedRelationTest::unwatchedCustomer(), 'listing_customer', 'listing_id', 'customer_id')
-                    ->using(ListingCustomer::class)
-                    ->wherePivotNull('deleted_at')
-                    ->wherePivot('title', 'Shown');
-            }
-        }, ListingRevision::CustomersOrder];
+        yield 'a declared pivot column' => [static fn (): Model&OrdersRelations&Revisioned => new TitledListing, ListingRevision::CustomersOrder];
 
         yield 'a declared related column' => [static fn (): Model&OrdersRelations&Revisioned => new NamedListing, ListingRevision::CustomersOrder];
     }
 
-    /**
-     * @return class-string<Model>
-     */
-    public static function unwatchedCustomer(): string
+    public static function correlatedFolder(): Model&OrdersRelations&Revisioned
     {
-        return (new class extends Model
+        return new class extends Model implements OrdersRelations, Revisioned
         {
-            protected $table = 'customers';
-        })::class;
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'folders';
+
+            /**
+             * @return HasMany<KindedDocument, $this>
+             */
+            #[OrdersRelation(FolderRevision::DocumentsOrder, membership: ['documents.home_folder_id'])]
+            public function documents(): HasMany
+            {
+                return $this->hasMany(KindedDocument::class, 'folder_id')->whereIn(
+                    'documents.home_folder_id',
+                    $this->getConnection()->table('folders')->select('folders.id')->whereColumn('folders.kind', 'documents.kind'),
+                );
+            }
+        };
     }
 
     /**
@@ -1366,65 +1425,11 @@ class OrderedRelationTest extends TestCase
     /**
      * @param  class-string<Pivot&Ordered>  $pivot
      */
-    private function parentOfPivot(Model $listing, string $pivot): Model&OrdersRelations&Revisioned
+    private function parentOfPivot(Model $listing, string $pivot): PivotedListing
     {
-        $declared = new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
+        PivotedListing::$pivot = $pivot;
 
-            /** @var class-string<Pivot> */
-            public static string $pivot;
-
-            protected $table = 'listings';
-
-            /**
-             * @return BelongsToMany<Model, $this>
-             */
-            #[OrdersRelation(ListingRevision::CustomersOrder)]
-            public function customers(): BelongsToMany
-            {
-                return $this->belongsToMany(OrderedRelationTest::unwatchedCustomer(), 'listing_customer', 'listing_id', 'customer_id')->using(self::$pivot)->wherePivotNull('deleted_at');
-            }
-        };
-        $declared::$pivot = $pivot;
-
-        $parent = $declared->newQuery()->findOrFail($listing->getKey());
-        assert($parent instanceof OrdersRelations && $parent instanceof Revisioned);
-
-        return $parent;
-    }
-
-    private function parentOfTwoPivotRelations(Listing $listing): Model&OrdersRelations&Revisioned
-    {
-        $parent = (new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'listings';
-
-            /**
-             * @return BelongsToMany<Model, $this, ListingCustomer>
-             */
-            #[OrdersRelation(ListingRevision::CustomersOrder)]
-            public function customers(): BelongsToMany
-            {
-                return $this->belongsToMany(OrderedRelationTest::unwatchedCustomer(), 'listing_customer', 'listing_id', 'customer_id')->using(ListingCustomer::class)->wherePivotNull('deleted_at');
-            }
-
-            /**
-             * @return BelongsToMany<Model, $this, AgencyCustomer>
-             */
-            #[OrdersRelation(ListingRevision::ScenesOrder)]
-            public function agencyCustomers(): BelongsToMany
-            {
-                return $this->belongsToMany(OrderedRelationTest::unwatchedCustomer(), 'agency_customer', 'agency_id', 'customer_id')->using(AgencyCustomer::class)->wherePivotNull('deleted_at');
-            }
-        })->newQuery()->findOrFail($listing->id);
-        assert($parent instanceof OrdersRelations && $parent instanceof Revisioned);
-
-        return $parent;
+        return PivotedListing::query()->findOrFail($listing->getKey());
     }
 
     /**

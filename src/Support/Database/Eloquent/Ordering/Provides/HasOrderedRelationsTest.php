@@ -41,6 +41,7 @@ use Tests\Fixtures\Support\Clips\Clip;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\Customerable;
 use Tests\Fixtures\Support\Events\ModelEvents;
+use Tests\Fixtures\Support\Listings\KeyedListing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Playlists\Playlist;
@@ -51,6 +52,7 @@ use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Shelves\Shelf;
+use Tests\Fixtures\Support\Tours\KeyedTour;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\Fixtures\Support\Tracks\Track;
@@ -265,63 +267,18 @@ class HasOrderedRelationsTest extends TestCase
         }, TourRevision::ScenesOrder, 'scenes()'];
 
         yield 'belongs to many' => [static function (string $ownerKey): Model&OrdersRelations&Revisioned {
-            $parent = new class extends Model implements OrdersRelations, Revisioned
-            {
-                use HasConcurrencyRevisions;
-                use HasOrderedRelations;
-
-                public string $ownerKey = 'id';
-
-                protected $table = 'listings';
-
-                /**
-                 * @return BelongsToMany<Model, $this, ListingCustomer>
-                 */
-                #[OrdersRelation(ListingRevision::CustomersOrder)]
-                public function customers(): BelongsToMany
-                {
-                    return $this->belongsToMany(HasOrderedRelationsTest::unwatchedCustomer(), 'listing_customer', 'listing_id', 'customer_id', $this->ownerKey)->using(ListingCustomer::class);
-                }
-            };
+            $parent = new KeyedListing;
             $parent->ownerKey = $ownerKey;
 
             return $parent;
         }, ListingRevision::CustomersOrder, 'customers()'];
 
         yield 'morph to many' => [static function (string $ownerKey): Model&OrdersRelations&Revisioned {
-            $parent = new class extends Model implements OrdersRelations, Revisioned
-            {
-                use HasConcurrencyRevisions;
-                use HasOrderedRelations;
-
-                public string $ownerKey = 'id';
-
-                protected $table = 'tours';
-
-                /**
-                 * @return MorphToMany<Model, $this, Customerable>
-                 */
-                #[OrdersRelation(TourRevision::CustomersOrder)]
-                public function customers(): MorphToMany
-                {
-                    return $this->morphToMany(HasOrderedRelationsTest::unwatchedCustomer(), 'customerable', 'customerables', relatedPivotKey: 'customer_id', parentKey: $this->ownerKey)->using(Customerable::class);
-                }
-            };
+            $parent = new KeyedTour;
             $parent->ownerKey = $ownerKey;
 
             return $parent;
         }, TourRevision::CustomersOrder, 'customers()'];
-    }
-
-    /**
-     * @return class-string<Model>
-     */
-    public static function unwatchedCustomer(): string
-    {
-        return (new class extends Model
-        {
-            protected $table = 'customers';
-        })::class;
     }
 
     /**

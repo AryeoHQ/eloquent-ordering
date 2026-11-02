@@ -132,7 +132,7 @@ class ProviderTest extends TestCase
     }
 
     #[Test]
-    public function it_needs_no_ordered_through_on_a_related_model_whose_columns_no_order_watches(): void
+    public function it_refuses_a_parent_whose_ordered_pivots_reach_a_model_that_no_order_watches_without_orders_through_pivots(): void
     {
         $related = (new class extends Model
         {
@@ -159,7 +159,10 @@ class ProviderTest extends TestCase
         };
         $parent::$related = $related;
 
-        $this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/D', $parent->concurrencyRevision(ListingRevision::CustomersOrder));
+        $this->assertRefused(
+            sprintf('[%s::customers()] orders the pivots of [%2$s], so [%2$s] must use [%3$s].', $parent::class, $related, OrdersThroughPivots::class),
+            $parent,
+        );
     }
 
     #[Test]

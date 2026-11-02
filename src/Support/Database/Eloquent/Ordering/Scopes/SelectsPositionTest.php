@@ -400,6 +400,20 @@ class SelectsPositionTest extends TestCase
         $this->assertSame([false, false], $assets->map(fn (Asset $asset): bool => array_key_exists(OrderedRelation::POSITION, $asset->getAttributes()))->all());
     }
 
+    #[Test]
+    public function it_selects_no_position_into_any_operand_of_a_nested_union(): void
+    {
+        $section = Section::create();
+        $this->asset($section, title: 'first');
+        $this->asset($section, title: 'second');
+        $this->asset($section, title: 'third');
+
+        $assets = Asset::query()->where('title', 'first')->union(Asset::query()->where('title', 'second')->union(Asset::query()->where('title', 'third')))->get();
+
+        $this->assertCount(3, $assets);
+        $this->assertSame([false, false, false], $assets->map(fn (Asset $asset): bool => array_key_exists(OrderedRelation::POSITION, $asset->getAttributes()))->all());
+    }
+
     /**
      * @param  Closure(): Model  $create
      */

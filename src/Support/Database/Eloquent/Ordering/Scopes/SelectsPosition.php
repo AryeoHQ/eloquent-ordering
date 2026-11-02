@@ -200,6 +200,7 @@ final class SelectsPosition implements Scope
 
                 if ($side instanceof Builder) {
                     $side = (clone $side)->withoutGlobalScope(self::class);
+                    $pending[] = $side->getQuery();
                 } elseif ($side instanceof QueryBuilder) {
                     $side = clone $side;
                     $side->beforeQueryCallbacks = array_values(array_filter(
