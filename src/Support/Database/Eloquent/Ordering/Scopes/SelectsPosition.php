@@ -78,14 +78,14 @@ final class SelectsPosition implements Scope
 
             $own = $item !== null && in_array($row, $columns, true) ? $item : null;
 
-            if ($own !== null && $query->lock !== null) {
-                self::selectPositionsAfter($query, $own);
-            } elseif ($own !== null) {
+            if ($own !== null && $query->lock === null) {
                 $position = OrderedRelation::positionColumn($own, $qualifier, $connection);
 
                 if ($position !== null) {
                     $positions[] = new Expression(sprintf('%s as %s', $position, $grammar->wrap(OrderedRelation::POSITION)));
                 }
+            } elseif ($own !== null && $connection->transactionLevel() > 0) {
+                self::selectPositionsAfter($query, $own);
             }
 
             foreach (self::pivotPositions($pivots, $query, $connection) as $pivot => $position) {
@@ -94,7 +94,7 @@ final class SelectsPosition implements Scope
                 }
             }
 
-            if ($positions !== []) {
+            if ($own !== null || $positions !== []) {
                 $query->columns = [...$columns, ...$positions];
             }
         };

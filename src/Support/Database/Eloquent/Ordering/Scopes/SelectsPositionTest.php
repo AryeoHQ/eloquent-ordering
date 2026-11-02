@@ -246,6 +246,53 @@ class SelectsPositionTest extends TestCase
         $this->assertCount(5, $assets);
     }
 
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function positionQueryAliases(): iterable
+    {
+        yield 'the alias of the counted member' => ['ordering_member'];
+        yield 'the alias of its parent' => ['ordering_parent'];
+        yield 'the alias of its related row' => ['ordering_related'];
+    }
+
+    #[DataProvider('positionQueryAliases')]
+    #[Test]
+    public function it_numbers_the_rows_of_a_read_under_an_alias_that_the_position_query_also_uses(string $alias): void
+    {
+        [$first, $second] = [Section::create(), Section::create()];
+        $assets = [$this->asset($first), $this->asset($first), $this->asset($second)];
+
+        $positions = Asset::query()->withTrashed()->from("assets as {$alias}")
+            ->whereIn("{$alias}.id", array_map(fn (Asset $asset): int => $asset->id, $assets))
+            ->orderBy("{$alias}.id")
+            ->get()
+            ->map(fn (Asset $asset): null|int => $asset->position)
+            ->all();
+
+        $this->assertSame([1, 2, 1], $positions);
+    }
+
+    #[DataProvider('positionQueryAliases')]
+    #[Test]
+    public function it_numbers_the_pivots_of_a_join_under_an_alias_that_the_position_query_also_uses(string $alias): void
+    {
+        [$listing, $other] = [Listing::create(), Listing::create()];
+        $customers = array_map(fn (): Customer => Customer::query()->create(), range(1, 3));
+        $listing->customers()->attach(array_map(fn (Customer $customer): int => $customer->id, $customers));
+        $other->customers()->attach($customers[2]->id);
+
+        $read = Customer::query()
+            ->join("listing_customer as {$alias}", "{$alias}.customer_id", '=', 'customers.id')
+            ->whereIn("{$alias}.listing_id", [$listing->id, $other->id])
+            ->select(['customers.*', "{$alias}.id as pivot_id"])
+            ->orderBy("{$alias}.listing_id")
+            ->orderBy("{$alias}.rank_key")
+            ->get();
+
+        $this->assertSame([1, 2, 3, 1], $read->map(fn (Customer $customer): mixed => $customer->getAttribute(SelectsPosition::PIVOT_ATTRIBUTE))->all());
+    }
+
     #[Test]
     public function it_keeps_the_true_position_of_each_row_that_a_filter_on_a_member_column_keeps(): void
     {
@@ -583,6 +630,53 @@ class SelectsPositionTest extends TestCase
             $reader?->wait();
             $this->finishRace($racer, $section);
         }
+    }
+
+    /**
+     * @return iterable<string, array{Closure(Asset): Asset}>
+     */
+    public static function lockingReadsOutsideATransaction(): iterable
+    {
+        yield 'lockForUpdate()->find()' => [fn (Asset $asset): Asset => Asset::on('racer')->lockForUpdate()->findOrFail($asset->id)];
+        yield 'a shared lock' => [fn (Asset $asset): Asset => Asset::on('racer')->sharedLock()->findOrFail($asset->id)];
+        yield 'refreshForUpdate()' => [fn (Asset $asset): Asset => Asset::on('racer')->findOrFail($asset->id)->refreshForUpdate()];
+    }
+
+    /**
+     * @param  Closure(Asset): Asset  $read
+     */
+    #[DataProvider('lockingReadsOutsideATransaction')]
+    #[Test]
+    public function it_selects_no_position_for_a_locking_read_that_no_transaction_holds(Closure $read): void
+    {
+        $racer = $this->racer();
+        [$section, $assets] = $this->racingSectionWith(2);
+
+        try {
+            $read($assets[1])->getAttribute('position');
+            $this->fail('A locking read outside a transaction read a position.');
+        } catch (UnselectedPosition $exception) {
+            $this->assertSame(0, $racer->transactionLevel());
+            $this->assertStringContainsString('A locking read outside a transaction selects none', $exception->getMessage());
+        } finally {
+            $this->finishRace($racer, $section);
+        }
+    }
+
+    #[Test]
+    public function it_reads_the_own_columns_and_the_position_of_a_locking_read_that_joins_another_table(): void
+    {
+        $section = Section::create();
+        $assets = [$this->asset($section), $this->asset($section)];
+
+        $read = DB::transaction(fn (): Collection => Asset::query()
+            ->join('sections', 'sections.id', '=', 'assets.section_id')
+            ->where('assets.section_id', $section->id)
+            ->orderBy('assets.id')
+            ->lockForUpdate()
+            ->get());
+
+        $this->assertSame([[$assets[0]->id, 1], [$assets[1]->id, 2]], $read->map(fn (Asset $asset): array => [$asset->id, $asset->position])->all());
     }
 
     #[Test]
