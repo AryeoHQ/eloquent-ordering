@@ -687,7 +687,7 @@ final class OrderedRelation
         }
 
         $related->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)
-            ->where($related->qualifyColumn($relation->getRelatedKeyName()), $item->getAttribute($relation->getRelatedPivotKeyName()))
+            ->where($related->qualifyColumn($relation->getRelatedKeyName()), self::relatedKeyOf($relation, $item))
             ->toBase()
             ->lock('for share')
             ->first([$related->qualifyColumn($relation->getRelatedKeyName())]);
@@ -1188,7 +1188,7 @@ final class OrderedRelation
      */
     public static function orderedThrough(Model|string $related): array
     {
-        return array_merge([], ...array_map(static fn (OrderedThrough $declared): array => $declared->parents, self::attributes($related, OrderedThrough::class)));
+        return array_values(array_unique(array_merge([], ...array_map(static fn (OrderedThrough $declared): array => $declared->parents, self::attributes($related, OrderedThrough::class)))));
     }
 
     /**
@@ -1536,6 +1536,26 @@ final class OrderedRelation
         }
 
         return new RelationKeys($relation->getRelated(), $relation->getForeignKeyName(), $relation->getLocalKeyName(), ...$morph);
+    }
+
+    /**
+     * @param  BelongsToMany<Model, Model>  $relation
+     */
+    private static function relatedKeyOf(BelongsToMany $relation, Model $item): mixed
+    {
+        $key = $relation->getRelatedPivotKeyName();
+
+        if (array_key_exists($key, $item->getAttributes()) || ! $item->exists) {
+            return $item->getAttributes()[$key] ?? null;
+        }
+
+        $pivot = self::describe($relation)->item;
+
+        return $pivot->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)
+            ->toBase()
+            ->useWritePdo()
+            ->where($pivot->getQualifiedKeyName(), $item->getKey())
+            ->value($pivot->qualifyColumn($key));
     }
 
     private static function asParent(mixed $model): null|(Model&OrdersRelations&Revisioned)

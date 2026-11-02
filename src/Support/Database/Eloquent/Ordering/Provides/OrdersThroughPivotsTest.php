@@ -25,11 +25,13 @@ use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Customers\TwiceOrderedCustomer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Listings\NamedListing;
+use Tests\Fixtures\Support\Listings\TwiceOrderingListing;
 use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
@@ -190,6 +192,20 @@ class OrdersThroughPivotsTest extends TestCase
             [$tour::class, $tour->id, [$pivots[1]], [[$pivots[1], 1, null]], $attached[1]],
             [$agency::class, $agency->id, [$pivots[2]], [[$pivots[2], 1, null]], $attached[2]],
         ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_reports_once_to_a_listing_that_the_ordered_through_parents_of_a_customer_name_twice(): void
+    {
+        $listing = TwiceOrderingListing::create();
+        $customer = TwiceOrderedCustomer::create();
+        $listing->customers()->attach($customer);
+        $pivot = ListingCustomer::query()->where('customer_id', $customer->id)->sole()->getKey();
+        $this->recordReorders();
+
+        $customer->delete();
+
+        $this->assertSame([[TwiceOrderingListing::class, $listing->id, [], [[$pivot, null, 1]], self::emptyDigest()]], $this->reorders);
     }
 
     #[Test]
@@ -418,6 +434,28 @@ class OrdersThroughPivotsTest extends TestCase
         $shape->customers($parent)->detach($customer);
 
         $this->assertLockedForShareBetween($shape, sprintf('update "%s" set "deleted_at"', $shape->memberTable()));
+    }
+
+    #[Test]
+    public function it_locks_the_customer_of_a_pivot_loaded_without_its_customer_key_for_share(): void
+    {
+        $listing = Listing::create();
+        $customer = Customer::create();
+        $listing->customers()->attach($customer);
+        $pivot = ListingCustomer::query()->select('id')->where('customer_id', $customer->id)->sole();
+        $preventing = Model::preventsAccessingMissingAttributes();
+        Model::preventAccessingMissingAttributes();
+        DB::enableQueryLog();
+
+        try {
+            $pivot->delete();
+        } finally {
+            Model::preventAccessingMissingAttributes($preventing);
+        }
+
+        $share = array_find(DB::getQueryLog(), fn (array $query): bool => str_contains($query['query'], 'from "customers"') && str_ends_with($query['query'], 'for share'));
+        $this->assertIsArray($share);
+        $this->assertSame([$customer->id], $share['bindings']);
     }
 
     #[DataProvider('pivots')]

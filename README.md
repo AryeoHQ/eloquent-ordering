@@ -197,6 +197,12 @@ class Listing extends Model implements OrdersRelations, Revisioned
 
 `attach()` places the new pivot last. `detach()` soft deletes the pivot.
 
+**A pivot order needs at most one live pivot per related row.** The order digest names each member by the related model's key, so it cannot tell two live pivots of one related row apart. Add a partial unique index on `(parent key, related key) where deleted_at is null`, with the morph type column first for a `MorphToMany`, as the `listing_customer` fixture migration does:
+
+```sql
+create unique index listing_customer_listing_id_customer_id_unique on listing_customer (listing_id, customer_id) where deleted_at is null
+```
+
 **A saved pivot keeps its related model.** A save that changes the related key of a saved pivot, such as `customer_id`, throws `LogicException` and writes nothing. Detach the pivot, then attach the new related model.
 
 **An item can order in several parents.** A `Scene` carries `#[OrderedIn(Tour::class)]` and `#[OrderedIn(Listing::class)]`. Each row resolves to the one parent whose foreign key, and morph type, it names.
@@ -504,7 +510,7 @@ Asset::query()->whereKey($id)->delete();                              // changes
 - **A concurrent attach can escape a related model's soft delete.** Suppose another transaction attaches the related model to a new parent between the pivot read and the write. The soft delete does not lock that parent, and reports nothing to it. An attach that reaches the related row after the write waits for the related commit, so it reports what the related write left.
 - **A related model's soft delete without the package's `deleting` listener locks no parent and reports nothing.** A `deleting` listener that runs first and returns a value other than `null` stops the package's listener.
 - **A pivot write locks the related row only when the relation filters on it.** No fixture has a pivot relation whose related model has no `deleted_at` and no declared column, so that skip is untested for a pivot write.
-- **Two live pivots of one related model under one parent dispatch two `Reordered` events** for that parent. A unique index on the pivot's two foreign keys prevents it.
+- **A pivot order with two live pivots of one related model under one parent is unsupported.** Its digest cannot tell the two pivots apart. Add the partial unique index from [Supported shapes](#supported-shapes) to refuse the second pivot.
 - **A hard delete of a related model with pivot rows is unsupported.** Let the pivot table's foreign key refuse it.
 
 ## Exceptions
