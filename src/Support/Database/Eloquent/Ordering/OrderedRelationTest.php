@@ -592,24 +592,7 @@ class OrderedRelationTest extends TestCase
         $section = Section::create();
         $zebra = $this->addAsset($section, 'Zebra');
         $alpha = $this->addAsset($section, 'Alpha');
-
-        $parent = (new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'sections';
-
-            /**
-             * @return HasMany<Asset, $this>
-             */
-            #[OrdersRelation(SectionRevision::AssetsOrder)]
-            public function assets(): HasMany
-            {
-                return $this->hasMany(Asset::class, 'section_id')->orderBy('title');
-            }
-        })->newQuery()->findOrFail($section->id);
-        $relation = $parent->orderedRelation(SectionRevision::AssetsOrder);
+        $relation = $this->titleOrderedSection($section)->orderedRelation(SectionRevision::AssetsOrder);
 
         $this->assertSame([$zebra->id, $alpha->id], $relation->query()->pluck('assets.id')->all());
 
@@ -904,7 +887,9 @@ class OrderedRelationTest extends TestCase
      * @param  Closure(): (Model&OrdersRelations&Revisioned)  $parent
      * @param  Closure(class-string): string  $message
      */
-    #[DataProvider('misdeclaredDigests')]
+    #[DataProvider('omittedMembershipColumns')]
+    #[DataProvider('omittedOrderedThroughParents')]
+    #[DataProvider('unorderableRelationTypes')]
     #[Test]
     public function it_refuses_a_misdeclared_relation_when_it_reads_the_order_digest(Closure $parent, NamesConcurrencyRevision $revision, Closure $message): void
     {
@@ -921,7 +906,7 @@ class OrderedRelationTest extends TestCase
     /**
      * @return iterable<string, array{Closure(): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision, Closure(class-string): string}>
      */
-    public static function misdeclaredDigests(): iterable
+    public static function omittedMembershipColumns(): iterable
     {
         yield 'a watched related column its membership omits' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
@@ -945,7 +930,13 @@ class OrderedRelationTest extends TestCase
             '[%s::customers()] filters its members by [customers.name], which its membership does not declare.',
             $parent,
         )];
+    }
 
+    /**
+     * @return iterable<string, array{Closure(): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision, Closure(class-string): string}>
+     */
+    public static function omittedOrderedThroughParents(): iterable
+    {
         yield 'a related model that omits the parent from #[OrderedThrough]' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
@@ -969,7 +960,13 @@ class OrderedRelationTest extends TestCase
             Customer::class,
             OrderedThrough::class,
         )];
+    }
 
+    /**
+     * @return iterable<string, array{Closure(): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision, Closure(class-string): string}>
+     */
+    public static function unorderableRelationTypes(): iterable
+    {
         yield 'a HasOne method' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
@@ -1327,6 +1324,29 @@ class OrderedRelationTest extends TestCase
 
             protected $keyType = 'string';
         })::class;
+    }
+
+    private function titleOrderedSection(Section $section): Model&OrdersRelations&Revisioned
+    {
+        $parent = (new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder)]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->orderBy('title');
+            }
+        })->newQuery()->findOrFail($section->id);
+        assert($parent instanceof OrdersRelations && $parent instanceof Revisioned);
+
+        return $parent;
     }
 
     /**
