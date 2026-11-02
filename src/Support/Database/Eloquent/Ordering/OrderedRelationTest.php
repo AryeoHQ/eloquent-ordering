@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Ordering;
 
 use Closure;
 use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
+use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
@@ -40,7 +41,10 @@ use Tests\Fixtures\Support\Agencies\AgencyCustomer;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Documents\DocumentKind;
+use Tests\Fixtures\Support\Documents\KindedDocument;
 use Tests\Fixtures\Support\Events\ModelEvents;
+use Tests\Fixtures\Support\Folders\FolderRevision;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Listings\NamedListing;
@@ -1010,6 +1014,31 @@ class OrderedRelationTest extends TestCase
                 return $this->hasMany(Asset::class, 'section_id')->whereIn('assets.title', [$this->getAttribute('name'), 'Shown']);
             }
         }, SectionRevision::AssetsOrder, '::assets()] filters its members by the parent column [sections.name] in a form other than [<item column> = sections.name]'];
+
+        yield 'a parent column read through an accessor that parses it' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'folders';
+
+            /**
+             * @return HasMany<KindedDocument, $this>
+             */
+            #[OrdersRelation(FolderRevision::DocumentsOrder, membership: ['documents.kind', 'folders.kind'])]
+            public function documents(): HasMany
+            {
+                return $this->hasMany(KindedDocument::class, 'folder_id')->where('documents.kind', $this->getAttribute('kind'));
+            }
+
+            /**
+             * @return Attribute<null|DocumentKind, never>
+             */
+            public function kind(): Attribute
+            {
+                return Attribute::make(get: static fn (mixed $value): null|DocumentKind => is_string($value) ? DocumentKind::from($value) : null);
+            }
+        }, FolderRevision::DocumentsOrder, '::documents()] filters its members by the parent column [folders.kind] in a form other than [<item column> = folders.kind]'];
 
         yield 'an unqualified pivot column' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {

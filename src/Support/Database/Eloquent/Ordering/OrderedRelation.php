@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering;
 
 use Closure;
+use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
@@ -84,9 +85,6 @@ final class OrderedRelation
 
     /** @var array<string, array<string, string>> */
     private static array $membershipPairs = [];
-
-    /** @var array<string, null|string> */
-    private static array $positionColumns = [];
 
     /** @var array<class-string, array<string, Model&Ordered>> */
     private static array $orderedPivots = [];
@@ -466,21 +464,15 @@ final class OrderedRelation
     /**
      * @internal
      */
-    public static function positionColumn(Model&Ordered $item, string $qualifier): null|string
+    public static function positionColumn(Model&Ordered $item, string $qualifier, Connection $connection): null|string
     {
-        $cached = implode(':', [$item::class, $item->getTable(), (string) $item->getConnectionName(), $qualifier]);
+        $grammar = $connection->getQueryGrammar();
+        $branches = array_map(
+            static fn (array $membership): string => sprintf('when %s then (%s)', self::namesMembership($membership, $qualifier, $grammar), self::countedMembers($membership, $qualifier, $connection)),
+            self::memberships($item, $connection->getName()),
+        );
 
-        if (! array_key_exists($cached, self::$positionColumns)) {
-            $grammar = $item->getConnection()->getQueryGrammar();
-            $branches = array_map(
-                static fn (array $membership): string => sprintf('when %s then (%s)', self::namesMembership($membership, $qualifier, $grammar), self::countedMembers($membership, $qualifier)),
-                self::memberships($item),
-            );
-
-            self::$positionColumns[$cached] = $branches === [] ? null : sprintf('case %s end', implode(' ', $branches));
-        }
-
-        return self::$positionColumns[$cached];
+        return $branches === [] ? null : sprintf('case %s end', implode(' ', $branches));
     }
 
     /**
@@ -770,7 +762,7 @@ final class OrderedRelation
     /**
      * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
      */
-    private static function countedMembers(array $membership, string $qualifier): string
+    private static function countedMembers(array $membership, string $qualifier, Connection $connection): string
     {
         ['parent' => $parent, 'keys' => $keys] = $membership;
         ['method' => $method, 'relation' => $relation] = self::declaration($parent, $membership['revision']);
@@ -780,7 +772,7 @@ final class OrderedRelation
         $outer = static fn (string $column): string => $qualifier.'.'.$column;
         $aliases = [$parent->getTable() => self::MEMBER_PARENT];
 
-        $members = $item->getConnection()->query()
+        $members = $connection->query()
             ->from($item->getTable().' as '.self::MEMBER)
             ->join($parent->getTable().' as '.self::MEMBER_PARENT, self::MEMBER_PARENT.'.'.$keys->ownerKey, '=', $member($keys->foreignKey))
             ->whereColumn($member($keys->foreignKey), '=', $outer($keys->foreignKey))
@@ -820,7 +812,9 @@ final class OrderedRelation
             ))
             ->selectRaw(sprintf('case when bool_or(%s = %s) then count(*) end', $grammar->wrap($member($key)), $grammar->wrap($outer($key))));
 
-        return $grammar->substituteBindingsIntoRawSql($members->toSql(), $members->getBindings());
+        $bindings = $members->getBindings();
+
+        return $grammar->substituteBindingsIntoRawSql($members->toSql(), array_replace($connection->prepareBindings($bindings), array_filter($bindings, is_bool(...))));
     }
 
     private static function whereLive(Builder $query, Model $model, string $alias): void
@@ -840,10 +834,14 @@ final class OrderedRelation
         $pairs = self::$membershipPairs[sprintf('%s::%s()', $parent::class, $method)] ?? [];
         $base = self::probedRelation($parent, $method, array_keys($pairs))->getBaseQuery();
         $filters = $base->newQuery();
+        $probes = array_map(self::probe(...), array_keys($pairs));
 
         self::copyFilters($base->wheres, $filters, $pairs, $aliases);
 
-        return $filters;
+        return $filters->setBindings(array_values(array_filter(
+            $base->getRawBindings()['where'],
+            static fn (mixed $binding): bool => ! in_array($binding, $probes, true),
+        )));
     }
 
     /**
@@ -898,13 +896,36 @@ final class OrderedRelation
      */
     private static function probedRelation(Model $parent, string $method, array $columns): Relation
     {
-        $variant = clone $parent;
-        $variant->setRawAttributes([...$parent->getAttributes(), ...array_combine($columns, array_map(self::probe(...), $columns))]);
-        $relation = Relation::noConstraints(static fn (): mixed => $variant->{$method}());
+        $variant = self::probed($parent, $columns);
+
+        try {
+            $relation = Relation::noConstraints(static fn (): mixed => $variant->{$method}());
+        } catch (Throwable $exception) {
+            $read = implode('], [', array_map($parent->qualifyColumn(...), $columns));
+
+            throw new LogicException(sprintf(
+                '[%s::%s()] filters its members by the parent column [%s] in a form other than [<item column> = %s], so a position query cannot reproduce the filter for each row.',
+                $parent::class,
+                $method,
+                $read,
+                $read,
+            ), previous: $exception);
+        }
 
         throw_unless($relation instanceof Relation, LogicException::class, sprintf('[%s::%s()] returns no relation.', $parent::class, $method));
 
         return $relation;
+    }
+
+    /**
+     * @param  list<string>  $columns
+     */
+    private static function probed(Model $parent, array $columns): Model
+    {
+        $variant = (clone $parent)->mergeCasts(array_fill_keys($columns, 'string'));
+        $variant->setRawAttributes([...$parent->getAttributes(), ...array_combine($columns, array_map(self::probe(...), $columns))]);
+
+        return $variant;
     }
 
     /**
@@ -958,7 +979,7 @@ final class OrderedRelation
     /**
      * @return list<array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}>
      */
-    private static function memberships(Model&Ordered $item): array
+    private static function memberships(Model&Ordered $item, null|string $connection = null): array
     {
         $memberships = [];
 
@@ -969,7 +990,7 @@ final class OrderedRelation
                 $item::class,
                 $class,
             ));
-            $parent->setConnection($item->getConnectionName());
+            $parent->setConnection($connection ?? $item->getConnectionName());
 
             $declarations = array_values(array_filter(
                 self::declarations($parent),
@@ -1248,10 +1269,11 @@ final class OrderedRelation
         $implicit = [
             ...array_map($item->qualifyColumn(...), [...$keys->columns(), OrderedRelations::DELETED_AT]),
             ...$related !== null && method_exists($related, 'getQualifiedDeletedAtColumn') ? [$related->getQualifiedDeletedAtColumn()] : [],
+            $parent->qualifyColumn($keys->ownerKey),
         ];
         $wheres = $relation->getBaseQuery()->wheres;
 
-        $read = self::parentColumnsRead($parent, $method, $keys->ownerKey);
+        $read = self::parentColumnsRead($parent, $method);
 
         foreach ([...self::filteredColumns($name, $wheres, $item->getTable(), $related !== null), ...$read] as $column) {
             throw_unless(in_array($column, [...$implicit, ...$declaration->membership], true), LogicException::class, sprintf(
@@ -1329,11 +1351,11 @@ final class OrderedRelation
     /**
      * @return list<string>
      */
-    private static function parentColumnsRead(Model $parent, string $relation, string $ownerKey): array
+    private static function parentColumnsRead(Model $parent, string $relation): array
     {
         $build = static function (Model $variant) use ($relation): null|array {
             try {
-                $query = $variant->{$relation}();
+                $query = Relation::noConstraints(static fn (): mixed => $variant->{$relation}());
                 assert($query instanceof Relation);
                 $base = $query->getQuery()->withoutGlobalScope(SelectsPosition::class)->toBase();
 
@@ -1347,22 +1369,11 @@ final class OrderedRelation
         $table = $parent->getTable();
         $columns = self::$parentTableColumns[$connection->getName().':'.$table] ??= $connection->getSchemaBuilder()->getColumnListing($table);
         $expected = $build(clone $parent);
-        $read = [];
 
-        foreach ($columns as $column) {
-            if ($column === $ownerKey || $column === $parent->getKeyName()) {
-                continue;
-            }
-
-            $variant = clone $parent;
-            $variant->setRawAttributes([...$parent->getAttributes(), $column => self::PROBE]);
-
-            if ($build($variant) !== $expected) {
-                $read[] = $parent->qualifyColumn($column);
-            }
-        }
-
-        return $read;
+        return array_values(array_map(
+            $parent->qualifyColumn(...),
+            array_filter($columns, static fn (string $column): bool => $build(self::probed($parent, [$column])) !== $expected),
+        ));
     }
 
     /**

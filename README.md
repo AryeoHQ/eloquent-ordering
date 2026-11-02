@@ -57,6 +57,7 @@ Schema::create('assets', function (Blueprint $table): void {
 - `rankKey()` adds a `rank_key` column: `varchar(64) collate "C" null`.
 - `rank_key` is nullable because a row outside every order has no key: a trashed row, a row whose save left every parent, and a row that existed before the package. Such a row is not a member, so it has no position.
 - `rankKeyIndex()` adds a unique index on the named parent columns and `rank_key`. It adds `where deleted_at is null` when the table has a `deleted_at` column, because a bulk soft delete keeps its rank key. Name both columns of a morph parent: `rankKeyIndex('sceneable_type', 'sceneable_id')`. The position count reads this index.
+- A down migration removes that index by its name: `dropIndex('assets_section_id_rank_key_unique')`. `dropUnique()` does not remove it: on PostgreSQL it drops a constraint of that name, and the macro creates an index, not a constraint.
 
 **3. Declare the relation on the parent.** The parent implements `OrdersRelations` and `Revisioned`, and uses `HasOrderedRelations` and `HasConcurrencyRevisions`. Put `#[OrdersRelation]` on the relation method. It names the revision. It extends eloquent-concurrency's `#[NamedConcurrencyRevision]`, so the parent reads the order digest with `concurrencyRevision()`.
 
@@ -118,6 +119,10 @@ $assets->first()->position;                                                 // n
 
 The scope covers `get()`, `find()`, the paginators, `chunk()`, route binding, eager and lazy loads, `refresh()`, `fresh()`, `refreshForUpdate()`, `Collection::fresh()`, and a queued job's restored model. A query that joins an ordered pivot table, such as `$listing->customers` or `$customer->listings`, also selects `pivot_position`, so each pivot carries `position`. The scope runs on PostgreSQL only.
 
+**A locking read selects the position in a second query.** A row that `lockForUpdate()`, `sharedLock()`, or `refreshForUpdate()` waited on can carry a count from before the wait. So the locking statement selects no `position`. After it returns, one unlocked select by key reads the position of every row it locked.
+
+**A query without a select list selects the item's own columns only.** The scope turns `select *` into `select <table>.*`, so a join adds no columns of the joined table. Name the joined columns in an explicit select list. That query then carries no `position`.
+
 **The position counts the item among the members of the parent that `#[OrderedIn]` names**, in the order that `OrderChange::$order` lists. `null` means the row is not a member:
 
 - the item is unsaved or trashed, or has no rank key;
@@ -125,7 +130,13 @@ The scope covers `get()`, `find()`, the paginators, `chunk()`, route binding, ea
 - a declared relation filter excludes it;
 - for a pivot, its related row is trashed, or a declared related column excludes it.
 
-**A query that cannot carry the column selects no position.** A query with an explicit select list, a group, a having, `distinct`, or a union selects none, because the column would break `withCount()`, `whereIn()` subqueries, and grouped reads. Reading `position` on such a row throws `UnselectedPosition`, and so does reading it after `withoutPositions()`. Call `withoutPositions()` on a query that never reads `position`, to skip the count.
+**A query that cannot carry the column selects no position.** A query with an explicit select list, a group, a having, `distinct`, or a union selects none, because the column would break `withCount()`, `whereIn()` subqueries, and grouped reads. Reading `position` on such a row throws `UnselectedPosition`, and so does reading it after `withoutPositions()`. Call `withoutPositions()` on a query that never reads `position`, to skip the count. These common shapes select none too:
+
+- every query of a model with `$withCount`, because `withCount()` sets the select list;
+- a query after `withoutGlobalScopes()`, because that call removes the scope;
+- `paginate()`, `simplePaginate()`, and `chunk()` on a `BelongsToMany` relation to an ordered model, because the relation sets its select list before the scopes apply.
+
+`isset($item->position)` and `$item->position ?? 0` call the accessor, so they throw on such a row too.
 
 ```php
 Asset::query()->select(['id', 'title'])->first()->position;   // throws UnselectedPosition
@@ -259,7 +270,11 @@ The package checks each relation once per process, when it first resolves. The c
 - the relation reads a column that the declaration does not name;
 - the relation reads a parent column in any form other than one `where('<item column>', $this->column)`, because the position query must compile the filter for each row.
 
-The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The check reads the relation's clauses before any global scope applies, and `query()` removes every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query.
+The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The parent's `id` needs none either, but a filter that reads it must take the pair form, such as `where('assets.root_id', $this->id)`. The check reads the relation's clauses before any global scope applies, and `query()` removes every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query.
+
+The probe bypasses the column's cast, so `where('tracks.kind', $this->kind)` works when `kind` casts to an enum. A relation that reads the column through an accessor, or reads a property of the cast value such as `$this->kind->value`, throws `LogicException`.
+
+Each position query builds the relation's filters again. A filter on a runtime value, such as `app()->getLocale()`, therefore numbers the members by the value at the time of the query.
 
 A change to a declared column changes the order:
 
@@ -521,6 +536,6 @@ Asset::query()->whereKey($id)->delete();                              // changes
 | `MembershipMismatch` (`InvalidArgumentException`) | `reorder()` does not list each current member exactly once. |
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
 | `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
-| `UnselectedPosition` (`LogicException`) | Code reads `position` on an item whose query selected none: an explicit select list, a group, a having, `distinct`, a union, or `withoutPositions()`. The exception names the item. |
+| `UnselectedPosition` (`LogicException`) | Code reads `position` on an item whose query selected none: an explicit select list, a group, a having, `distinct`, a union, `withoutPositions()`, a model's `$withCount`, `withoutGlobalScopes()`, or a `BelongsToMany` paginator or chunk. `isset()` and `??` throw too. The exception names the item. |
 | `WriteHalted` (`RuntimeException`) | A `saving` or `updating` listener returned `false` for a copy that an order write saved. The message names the model and its key. The write rolled back. |
 | `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a membership declares a timestamp that Eloquent sets, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order or a declared parent column after the package prepared the write, a watched related column changed without a prepared order write, or a relation reads a parent column in a form other than `<item column> = <parent column>`. On a parent's first declaration read: an ordered pivot relation reaches a watched related model that does not use `OrdersThroughPivots`, or that omits the parent from `#[OrderedThrough]`. |

@@ -9,9 +9,14 @@ use Illuminate\Database\Eloquent\Model;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Panels\Panel;
+use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
+use Tests\Fixtures\Support\Speakers\Speaker;
 use Tests\TestCase;
 
 #[CoversClass(UnselectedPosition::class)]
@@ -69,5 +74,55 @@ class UnselectedPositionTest extends TestCase
     public static function pivots(): iterable
     {
         return PivotShape::pivots();
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): mixed, string}>
+     */
+    public static function namedShapes(): iterable
+    {
+        yield 'a model with $withCount' => [fn (): mixed => (new class extends Asset
+        {
+            protected $table = 'assets';
+
+            protected $withCount = ['section'];
+        })->newQuery()->findOrFail(self::asset()->id)->getAttribute('position'), '$withCount'];
+
+        yield 'withoutGlobalScopes()' => [fn (): mixed => Asset::query()->withoutGlobalScopes()->findOrFail(self::asset()->id)->position, 'withoutGlobalScopes()'];
+
+        yield 'paginate() on a BelongsToMany relation' => [function (): mixed {
+            $conference = Conference::create();
+            $conference->speakers()->attach(Speaker::query()->create(['panel_id' => Panel::create()->id])->id);
+
+            return $conference->speakers()->paginate()->getCollection()->firstOrFail()->getAttribute('position');
+        }, 'paginate()'];
+
+        yield 'isset()' => [fn (): bool => isset(Asset::query()->select(['assets.id'])->findOrFail(self::asset()->id)->position), 'isset()']; // @phpstan-ignore ergebnis.noIsset
+
+        yield '??' => [fn (): int => Asset::query()->select(['assets.id'])->findOrFail(self::asset()->id)->position ?? 0, '??'];
+    }
+
+    /**
+     * @param  Closure(): mixed  $read
+     */
+    #[DataProvider('namedShapes')]
+    #[Test]
+    public function it_names_each_shape_whose_query_selects_no_position(Closure $read, string $shape): void
+    {
+        try {
+            $read();
+            $this->fail("{$shape} read a position that its query never selected.");
+        } catch (UnselectedPosition $exception) {
+            $this->assertStringContainsString($shape, $exception->getMessage());
+        }
+    }
+
+    private static function asset(): Asset
+    {
+        $asset = new Asset;
+        $asset->section()->associate(Section::create());
+        $asset->save();
+
+        return $asset;
     }
 }

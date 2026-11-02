@@ -28,6 +28,19 @@ use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Boards\Board;
 use Tests\Fixtures\Support\Clips\Clip;
 use Tests\Fixtures\Support\Composed\ComposedItem;
+use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Documents\DatedDocument;
+use Tests\Fixtures\Support\Documents\Document;
+use Tests\Fixtures\Support\Documents\DocumentKind;
+use Tests\Fixtures\Support\Documents\FiledDocument;
+use Tests\Fixtures\Support\Documents\KindedDocument;
+use Tests\Fixtures\Support\Documents\LocalizedDocument;
+use Tests\Fixtures\Support\Folders\DatedFolder;
+use Tests\Fixtures\Support\Folders\FiledFolder;
+use Tests\Fixtures\Support\Folders\Folder;
+use Tests\Fixtures\Support\Folders\KindedFolder;
+use Tests\Fixtures\Support\Folders\LocalizedFolder;
+use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Pages\Page;
 use Tests\Fixtures\Support\Photos\Photo;
 use Tests\Fixtures\Support\Playlists\Playlist;
@@ -69,6 +82,8 @@ class SelectsPositionTest extends TestCase
         yield 'refresh()' => [fn (Section $section, array $assets): iterable => [Asset::query()->findOrFail($assets[1]->id)->refresh()], [2]];
         yield 'fresh()' => [fn (Section $section, array $assets): iterable => [$assets[1]->fresh()], [2]];
         yield 'refreshForUpdate()' => [fn (Section $section, array $assets): iterable => DB::transaction(fn (): array => [Asset::query()->findOrFail($assets[1]->id)->refreshForUpdate()]), [2]];
+        yield 'lockForUpdate()->find()' => [fn (Section $section, array $assets): iterable => DB::transaction(fn (): array => [Asset::query()->lockForUpdate()->findOrFail($assets[1]->id)]), [2]];
+        yield 'a shared lock' => [fn (Section $section, array $assets): iterable => DB::transaction(fn (): iterable => Asset::query()->where('section_id', $section->id)->sharedLock()->orderBy('id')->get()), [1, 2, 3, 4]];
         yield 'a fresh collection' => [fn (Section $section, array $assets): iterable => (new Collection([$assets[3], $assets[0]]))->fresh(), [4, 1]];
         yield 'a restored queued job' => [fn (Section $section, array $assets): iterable => self::restored($assets[2]), [3]];
         yield 'a read through an alias' => [fn (Section $section, array $assets): iterable => Asset::query()->withTrashed()->from('assets as a')->where('a.id', $assets[1]->id)->get(), [2]];
@@ -170,6 +185,7 @@ class SelectsPositionTest extends TestCase
         yield 'exists()' => [fn (): mixed => Asset::query()->exists()];
         yield 'a union' => [fn (): mixed => Asset::query()->where('title', 'first')->union(Asset::query()->where('title', 'second'))->get()->all()];
         yield 'a union of base queries' => [fn (): mixed => Asset::query()->where('title', 'first')->toBase()->union(Asset::query()->where('title', 'second')->toBase())->get()->all()];
+        yield 'a union added after the scopes applied' => [fn (): mixed => Asset::query()->toBase()->union(DB::table('assets'))->get()->all()];
         yield 'a subquery from' => [fn (): mixed => Asset::query()->fromSub(Asset::query(), 'assets')->get()->all()];
     }
 
@@ -516,6 +532,156 @@ class SelectsPositionTest extends TestCase
             $reader?->wait();
             $this->finishRace($racer, $section, $destination);
         }
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function lockingReads(): iterable
+    {
+        yield 'lockForUpdate()->find()' => ['lockForUpdate()->find()'];
+        yield 'refreshForUpdate()' => ['refreshForUpdate()'];
+    }
+
+    #[DataProvider('lockingReads')]
+    #[Test]
+    public function it_reads_the_position_that_a_move_committed_while_a_locking_read_waited_on_the_row(string $read): void
+    {
+        $racer = $this->racer();
+        [$section, $assets] = $this->racingSectionWith(4);
+        $reader = null;
+
+        try {
+            $racer->beginTransaction();
+            Asset::on('racer')->findOrFail($assets[2]->id)->move(Placement::first(), expected: null);
+            $reader = $this->startRival('locked-read.php', (string) $assets[2]->id, $read);
+            $this->awaitLockWait(1, $reader);
+            $racer->commit();
+
+            $result = $reader->wait();
+
+            $this->assertSame(1, json_decode($result->output(), true), $result->errorOutput());
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            $reader?->wait();
+            $this->finishRace($racer, $section);
+        }
+    }
+
+    #[Test]
+    public function it_numbers_the_members_of_a_parent_that_casts_its_paired_column_to_an_enum(): void
+    {
+        $folder = KindedFolder::query()->create(['kind' => DocumentKind::Notes]);
+        $created = array_map(fn (DocumentKind $kind): KindedDocument => KindedDocument::query()->create(['folder_id' => $folder->id, 'kind' => $kind->value]), [DocumentKind::Notes, DocumentKind::Drafts, DocumentKind::Notes]);
+
+        $read = KindedDocument::query()->where('folder_id', $folder->id)->orderBy('id')->get();
+
+        $this->assertSame([1, null, 2], $read->map(fn (KindedDocument $document): null|int => $document->position)->all());
+        $this->assertSame([1, null, 2], array_map(fn (KindedDocument $document): null|int => $document->position, $created));
+    }
+
+    #[Test]
+    public function it_numbers_the_members_that_a_runtime_filter_value_keeps_when_each_query_runs(): void
+    {
+        $folder = LocalizedFolder::query()->create();
+
+        foreach (['en', 'fr', 'en', 'fr'] as $locale) {
+            LocalizedDocument::query()->create(['folder_id' => $folder->id, 'locale' => $locale]);
+        }
+
+        $read = fn (): array => LocalizedDocument::query()->where('folder_id', $folder->id)->orderBy('id')->get()->map(fn (LocalizedDocument $document): null|int => $document->position)->all();
+
+        app()->setLocale('en');
+        $english = $read();
+        app()->setLocale('fr');
+        $french = $read();
+
+        $this->assertSame([1, null, 2, null], $english);
+        $this->assertSame([null, 1, null, 2], $french);
+    }
+
+    #[Test]
+    public function it_numbers_the_members_that_a_filter_on_the_key_of_their_parent_keeps(): void
+    {
+        [$first, $second] = [Folder::query()->create(), Folder::query()->create()];
+        $documents = array_map(fn (array $folders): Document => Document::query()->create(['folder_id' => $folders[0]->id, 'home_folder_id' => $folders[1]->id]), [
+            [$first, $first],
+            [$first, $second],
+            [$first, $first],
+            [$second, $second],
+        ]);
+
+        $positions = Document::query()->whereKey(array_map(fn (Document $document): int => $document->id, $documents))->orderBy('id')->get()->map(fn (Document $document): null|int => $document->position)->all();
+
+        $this->assertSame([1, null, 2, 1], $positions);
+    }
+
+    #[Test]
+    public function it_numbers_the_members_that_a_filter_on_a_date_constant_keeps(): void
+    {
+        $folder = DatedFolder::query()->create();
+
+        foreach (['2025-06-01 00:00:00', '2026-06-01 00:00:00', null, DatedFolder::PUBLISHED_BY] as $published) {
+            DatedDocument::query()->create(['folder_id' => $folder->id, 'published_at' => $published]);
+        }
+
+        $positions = DatedDocument::query()->where('folder_id', $folder->id)->orderBy('id')->get()->map(fn (DatedDocument $document): null|int => $document->position)->all();
+
+        $this->assertSame([1, null, null, 2], $positions);
+    }
+
+    #[Test]
+    public function it_numbers_the_members_that_a_filter_on_a_bound_subquery_keeps(): void
+    {
+        [$archive, $other, $folder] = [FiledFolder::query()->create(['name' => FiledFolder::ARCHIVE]), FiledFolder::query()->create(['name' => 'Other']), FiledFolder::query()->create()];
+
+        foreach ([$archive, $other, $archive] as $home) {
+            FiledDocument::query()->create(['folder_id' => $folder->id, 'home_folder_id' => $home->id]);
+        }
+
+        $positions = FiledDocument::query()->where('folder_id', $folder->id)->orderBy('id')->get()->map(fn (FiledDocument $document): null|int => $document->position)->all();
+
+        $this->assertSame([1, null, 2], $positions);
+    }
+
+    #[Test]
+    public function it_selects_the_position_under_the_alias_that_a_later_scope_gives_the_table(): void
+    {
+        [$first] = $this->playlist('audio', ['audio', 'audio']);
+
+        $positions = Track::query()
+            ->withGlobalScope('aliased', static function (Builder $query): void {
+                $query->from('tracks as listed_tracks');
+            })
+            ->where('listed_tracks.playlist_id', $first->playlist_id)
+            ->orderBy('listed_tracks.id')
+            ->get()
+            ->map(fn (Track $track): null|int => $track->position)
+            ->all();
+
+        $this->assertSame([1, 2], $positions);
+    }
+
+    #[Test]
+    public function it_selects_the_pivot_position_beside_an_ordered_pivot_join_that_a_later_scope_adds(): void
+    {
+        $listing = Listing::create();
+        $customers = array_map(fn (): Customer => Customer::query()->create(), range(1, 3));
+        $listing->customers()->attach(array_map(fn (Customer $customer): int => $customer->id, $customers));
+
+        $read = Customer::query()
+            ->withGlobalScope('listed', static function (Builder $query) use ($listing): void {
+                $query->join('listing_customer', 'listing_customer.customer_id', '=', 'customers.id')
+                    ->where('listing_customer.listing_id', $listing->id)
+                    ->select(['customers.*', 'listing_customer.id as pivot_id']);
+            })
+            ->orderBy('listing_customer.rank_key')
+            ->get();
+
+        $this->assertSame([1, 2, 3], $read->map(fn (Customer $customer): mixed => $customer->getAttribute(SelectsPosition::PIVOT_ATTRIBUTE))->all());
     }
 
     #[Test]

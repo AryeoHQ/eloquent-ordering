@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering\Schema;
 
 use Closure;
+use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -75,6 +76,34 @@ class MacrosTest extends TestCase
             sprintf('CREATE UNIQUE INDEX %s ON public.ranked USING btree (%s)%s', $name, implode(', ', $indexed), $where),
             DB::scalar('select indexdef from pg_indexes where tablename = ? and indexname = ?', ['ranked', $name]),
         );
+    }
+
+    #[Test]
+    public function it_drops_a_rank_key_index_through_drop_index_and_not_through_drop_unique(): void
+    {
+        Schema::create('ranked', function (Blueprint $table): void {
+            $table->id();
+            $table->foreignId('section_id');
+            $table->rankKey();
+            $table->rankKeyIndex('section_id'); // @phpstan-ignore staticMethod.dynamicCall
+        });
+
+        try {
+            DB::transaction(static function (): void {
+                Schema::table('ranked', static function (Blueprint $table): void {
+                    $table->dropUnique(['section_id', 'rank_key']);
+                });
+            });
+            $this->fail('dropUnique() dropped an index that is no constraint.');
+        } catch (QueryException $exception) {
+            $this->assertStringContainsString('constraint "ranked_section_id_rank_key_unique" of relation "ranked" does not exist', $exception->getMessage());
+        }
+
+        Schema::table('ranked', static function (Blueprint $table): void {
+            $table->dropIndex('ranked_section_id_rank_key_unique');
+        });
+
+        $this->assertSame([], DB::select('select indexname from pg_indexes where tablename = ? and indexname = ?', ['ranked', 'ranked_section_id_rank_key_unique']));
     }
 
     #[Test]

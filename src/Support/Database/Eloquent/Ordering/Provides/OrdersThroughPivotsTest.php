@@ -25,12 +25,14 @@ use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Customers\ShortlistedCustomer;
 use Tests\Fixtures\Support\Customers\TwiceOrderedCustomer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Listings\NamedListing;
+use Tests\Fixtures\Support\Listings\Shortlist;
 use Tests\Fixtures\Support\Listings\TwiceOrderingListing;
 use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
@@ -103,6 +105,18 @@ class OrdersThroughPivotsTest extends TestCase
         $pivots = Customer::query()->withTrashed()->findOrFail($customer->id)->{$inverse}()->get()->map(fn (Model $parent): mixed => $parent->getRelation('pivot'));
 
         $this->assertSame([null], $pivots->map(fn (Model $pivot): mixed => $pivot->getAttribute('position'))->all());
+    }
+
+    #[Test]
+    public function it_selects_no_pivot_position_for_a_pivot_whose_related_row_a_declared_related_column_excludes(): void
+    {
+        $shortlist = Shortlist::create();
+        $customers = array_map(fn (string $name): ShortlistedCustomer => ShortlistedCustomer::query()->create(['name' => $name]), [Shortlist::NAME, 'Grace', Shortlist::NAME]);
+        $shortlist->customers()->attach(array_map(fn (ShortlistedCustomer $customer): int => $customer->id, $customers));
+
+        $positions = array_map(fn (ShortlistedCustomer $customer): mixed => $customer->shortlists()->get()->firstOrFail()->getRelation('pivot')->getAttribute('position'), $customers);
+
+        $this->assertSame([1, null, 2], $positions);
     }
 
     #[Test]
