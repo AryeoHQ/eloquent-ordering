@@ -368,6 +368,28 @@ class OrdersThroughPivotsTest extends TestCase
         $this->assertLockedForShareBetween($shape, sprintf('update "%s" set "deleted_at"', $shape->memberTable()));
     }
 
+    #[Test]
+    public function it_locks_the_customer_of_a_pivot_loaded_without_its_customer_key_for_share(): void
+    {
+        $listing = Listing::create();
+        $customer = Customer::create();
+        $listing->customers()->attach($customer);
+        $pivot = ListingCustomer::query()->select('id')->where('customer_id', $customer->id)->sole();
+        $preventing = Model::preventsAccessingMissingAttributes();
+        Model::preventAccessingMissingAttributes();
+        DB::enableQueryLog();
+
+        try {
+            $pivot->delete();
+        } finally {
+            Model::preventAccessingMissingAttributes($preventing);
+        }
+
+        $share = array_find(DB::getQueryLog(), fn (array $query): bool => str_contains($query['query'], 'from "customers"') && str_ends_with($query['query'], 'for share'));
+        $this->assertIsArray($share);
+        $this->assertSame([$customer->id], $share['bindings']);
+    }
+
     #[DataProvider('pivots')]
     #[Test]
     public function it_locks_the_customer_of_a_pivot_restore_for_share_after_the_parent_and_before_the_pivot(PivotShape $shape): void
