@@ -212,7 +212,7 @@ final class OrderedRelation
         $parent = self::asParent($relation->getParent());
         $declaration = $item === null || $parent === null
             ? null
-            : array_find(self::declarations($parent), static fn (array $declared): bool => self::itemClass($declared['relation']) === $item);
+            : array_find(self::declarations($parent), static fn (array $declared): bool => self::itemClass($declared['relation']) === $item && self::sameKeys($relation, $declared['relation']));
 
         if ($declaration === null) {
             throw new LogicException(sprintf('The [%s] relation of [%s] to [%s] orders nothing.', $relation::class, $relation->getParent()::class, $item ?? $relation->getRelated()::class));
@@ -1546,6 +1546,27 @@ final class OrderedRelation
         }
 
         return new RelationKeys($relation->getRelated(), $relation->getForeignKeyName(), $relation->getLocalKeyName(), ...$morph);
+    }
+
+    /**
+     * @param  Relation<*, *, *>  $relation
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $declared
+     */
+    private static function sameKeys(Relation $relation, HasMany|MorphMany|BelongsToMany $declared): bool
+    {
+        if (! $relation instanceof HasMany && ! $relation instanceof MorphMany && ! $relation instanceof BelongsToMany) {
+            return false;
+        }
+
+        $keys = self::describe($relation);
+        $expected = self::describe($declared);
+
+        return $keys->item->getTable() === $expected->item->getTable()
+            && $keys->foreignKey === $expected->foreignKey
+            && $keys->ownerKey === $expected->ownerKey
+            && $keys->morphType === $expected->morphType
+            && $keys->morphClass === $expected->morphClass
+            && $keys->relatedKey === $expected->relatedKey;
     }
 
     /**

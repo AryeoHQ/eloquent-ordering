@@ -8,10 +8,12 @@ use Closure;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\MorphMany;
 use Illuminate\Database\Eloquent\Relations\MorphPivot;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
@@ -445,15 +447,69 @@ class HasOrderedRelationsTest extends TestCase
         $section->concurrencyRevision(SectionRevision::FeaturedAssetsOrder);
     }
 
-    #[Test]
-    public function it_rejects_an_arrangement_of_a_relation_that_orders_nothing(): void
+    /**
+     * @return iterable<string, array{Closure(): Relation<*, *, *>, string}>
+     */
+    public static function relationsThatOrderNothing(): iterable
     {
+        yield 'an undeclared has many' => [
+            static fn (): Relation => Section::create()->hasMany(Clip::class),
+            sprintf('The [%s] relation of [%s] to [%s] orders nothing.', HasMany::class, Section::class, Clip::class),
+        ];
+
+        yield 'a has one' => [
+            static fn (): Relation => Section::create()->hasOne(Asset::class),
+            sprintf('The [%s] relation of [%s] to [%s] orders nothing.', HasOne::class, Section::class, Asset::class),
+        ];
+
+        yield 'a has many of a parent that orders no relation' => [
+            static fn (): Relation => Customer::create()->hasMany(Asset::class, 'section_id'),
+            sprintf('The [%s] relation of [%s] to [%s] orders nothing.', HasMany::class, Customer::class, Asset::class),
+        ];
+
+        yield 'a belongs to many without an ordered pivot' => [
+            static fn (): Relation => Section::create()->belongsToMany(Asset::class, 'section_asset'),
+            sprintf('The [%s] relation of [%s] to [%s] orders nothing.', BelongsToMany::class, Section::class, Pivot::class),
+        ];
+
+        yield 'a has many of the declared item by another owner key' => [
+            static fn (): Relation => Section::create()->hasMany(Asset::class, 'section_id', 'concurrency_revision'),
+            sprintf('The [%s] relation of [%s] to [%s] orders nothing.', HasMany::class, Section::class, Asset::class),
+        ];
+    }
+
+    /**
+     * @param  Closure(): Relation<*, *, *>  $relation
+     */
+    #[DataProvider('relationsThatOrderNothing')]
+    #[Test]
+    public function it_rejects_an_arrangement_of_a_relation_that_orders_nothing(Closure $relation, string $message): void
+    {
+        $relation = $relation();
+
         try {
-            Section::create()->hasMany(Clip::class)->arrange([]);
+            $relation->arrange([]);
             $this->fail('A relation that orders nothing was arranged.');
         } catch (LogicException $exception) {
-            $this->assertSame(sprintf('The [%s] relation of [%s] to [%s] orders nothing.', HasMany::class, Section::class, Clip::class), $exception->getMessage());
+            $this->assertSame($message, $exception->getMessage());
         }
+    }
+
+    #[Test]
+    public function it_rejects_an_arrangement_of_the_declared_item_by_another_foreign_key(): void
+    {
+        $section = Section::create();
+        $first = Asset::create(['section_id' => $section->id]);
+        $second = Asset::create(['section_id' => $section->id]);
+
+        try {
+            $section->hasMany(Asset::class, 'gallery_section_id')->arrange([$second->id, $first->id]);
+            $this->fail('A relation by another foreign key arranged the declared order.');
+        } catch (LogicException $exception) {
+            $this->assertSame(sprintf('The [%s] relation of [%s] to [%s] orders nothing.', HasMany::class, Section::class, Asset::class), $exception->getMessage());
+        }
+
+        $this->assertSame([$first->id, $second->id], Shape::inOrder($section, SectionRevision::AssetsOrder)->pluck('id')->all());
     }
 
     #[Test]

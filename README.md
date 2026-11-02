@@ -167,7 +167,7 @@ $asset->move(Placement::first(), expected: $digest);
 $section->assets()->arrange([$thirdId, $firstId, $secondId], expected: $digest);
 ```
 
-`arrange()` is a macro on every Eloquent relation. It resolves the declaration by the ordered item class: the related class of a HasMany or MorphMany, and the pivot class of a BelongsToMany or MorphToMany. A relation that orders nothing throws `LogicException`.
+`arrange()` is a macro on every Eloquent relation. It resolves the declaration by the ordered item class: the related class of a HasMany or MorphMany, and the pivot class of a BelongsToMany or MorphToMany. The relation must also match the declared relation's keys: the foreign key, the owner key, the morph type and class, and the pivot table. A relation that orders nothing throws `LogicException`.
 
 ## Supported shapes
 
@@ -287,11 +287,11 @@ While it holds the lock, the package writes each stored declared parent column i
 ## Reading an order
 
 ```php
-$section->assets()->orderBy('rank_key')->get();                // members in order, each with its position
+$section->assets()->reorder('assets.rank_key')->get();         // members in order, each with its position
 $section->concurrencyRevision(SectionRevision::AssetsOrder);   // the order digest, one query
 ```
 
-Read the members through the parent's Eloquent relation. It keeps the order and the global scopes that its method and the related model declare, so order by `rank_key` to list the members in their order. Each `position` counts the row among every member, including a member that a global scope hides. For a pivot relation the pivot carries the position.
+Read the members through the parent's Eloquent relation. It keeps the global scopes that the related model declares. `reorder()` replaces any order that the relation method declares. Qualify `rank_key` with the item table, because a pivot query also joins the related table. For a pivot relation, order by the pivot table's `rank_key`, and the pivot carries the position. Each `position` counts the row among every member, including a member that a global scope hides.
 
 **A row the relation excludes keeps its rank key.** A declared `where()` on the relation method excludes rows, and so does a soft delete of a pivot's related model. Such a row has no `position` and cannot be an anchor. It still holds its key in the unique index, so every new key and every rebalance avoids that key, and the row keeps its place.
 
@@ -389,6 +389,22 @@ $section->assets()->arrange([$thirdId, $firstId, $secondId], expected: $digest);
 ```
 
 The name leaves the query builder's `reorder()` alone, so `$section->assets()->reorder()` still clears the orders of a relation query.
+
+**List the members that a global scope hides.** `arrange()` takes every member, including one that a global scope of the related model hides, but no trashed member. Read that set through the relation without the hiding scopes. Keep `SoftDeletingScope` and `SelectsPosition`:
+
+```php
+use Illuminate\Database\Eloquent\SoftDeletingScope;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
+
+$related = $section->assets()->getRelated();
+$hiding = array_diff(array_keys($related->getGlobalScopes()), [SoftDeletingScope::class, SelectsPosition::class]);
+
+$section->assets()->withoutGlobalScopes($hiding)->reorder('assets.rank_key')->orderBy('assets.id')->get();
+```
+
+A plain `withoutGlobalScopes()` also drops `SoftDeletingScope`, so the list then names trashed rows and `arrange()` throws `MembershipMismatch`.
+
+**`arrange()` writes the declared relation.** It ignores any constraint that the caller adds to the relation, and checks the list against the members of the declared relation.
 
 `expected` is the order revision of this parent. `null` skips the check. A list that omits a member, repeats one, or names a stranger throws `MembershipMismatch` (`InvalidArgumentException`). `arrange()` and an anchor match a UUID id in either letter case, and `OrderChange` reports each id in the database's letter case. A trashed member, a member with no rank key, and a row the relation excludes are not current members. `arrange()` keeps an excluded row directly after the member that precedes it now. It rewrites only the keys that change, and returns an `OrderChange`.
 

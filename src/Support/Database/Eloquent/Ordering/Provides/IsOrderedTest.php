@@ -1135,8 +1135,8 @@ class IsOrderedTest extends TestCase
         $this->assertSame($shape->digest($destination), $destination->concurrencyRevision($shape->revision()));
         $this->assertFalse($source->isDirty());
         $this->assertFalse($destination->isDirty());
-        $this->assertSame($destination, $moved->move(Placement::last(), expected: null)->parent);
         $this->assertSame(2, $moved->getAttribute('position'));
+        $this->assertSame($destination, $moved->getRelation($shape->parentRelation()));
     }
 
     #[DataProvider('shapes')]
@@ -1252,9 +1252,9 @@ class IsOrderedTest extends TestCase
         $this->assertSame($revisions, [$shape->digest($source), $shape->digest($destination)]);
         $this->assertSame($destination->getKey(), $stale->getAttribute($shape->foreignKey()));
         $this->assertSame($destination->getKey(), $stale->getRawOriginal($shape->foreignKey()));
-        $this->assertTrue($destination->is($stale->move(Placement::last(), expected: null)->parent));
         $this->assertSame(2, $stale->getAttribute('position'));
         $this->assertFalse($stale->isDirty());
+        $this->assertTrue($destination->is($stale->move(Placement::last(), expected: null)->parent));
         $this->assertOrder($shape, [$holder->getKey(), $member->getKey()], $destination);
         $this->assertOrder($shape, [], $source);
     }
@@ -1535,7 +1535,6 @@ class IsOrderedTest extends TestCase
 
         $this->assertSame($destination->getKey(), $moved->getAttribute($shape->foreignKey()));
         $this->assertSame($destination, $moved->getRelation($shape->parentRelation()));
-        $this->assertSame($destination, $moved->move(Placement::after($this->key($anchor)), expected: null)->parent);
         $this->assertSame(2, $moved->getAttribute('position'));
         $this->assertFalse($moved->isDirty());
     }
@@ -1682,7 +1681,6 @@ class IsOrderedTest extends TestCase
         $this->assertSame($destination->getKey(), $stale->getRawOriginal($shape->foreignKey()));
         $this->assertSame(['title' => 'Dusk'], $stale->getDirty());
         $this->assertSame($change->parent, $stale->getRelation($shape->parentRelation()));
-        $this->assertSame($change->parent, $stale->move($position === 1 ? Placement::first() : Placement::last(), expected: null)->parent);
         $this->assertSame($position, $stale->getAttribute('position'));
         $this->assertOrder($shape, $position === 1 ? [$member->getKey(), $holder->getKey()] : [$holder->getKey(), $member->getKey()], $destination);
         $this->assertOrder($shape, [], $source);
@@ -2027,8 +2025,8 @@ class IsOrderedTest extends TestCase
         $this->assertSame($listing->id, $moved->sceneable_id);
         $this->assertSame(['sceneable_type' => $listing->getMorphClass(), 'sceneable_id' => $listing->id], (array) DB::table('scenes')->where('id', $moved->id)->first(['sceneable_type', 'sceneable_id']));
         $this->assertFalse($moved->relationLoaded('sceneable'));
-        $this->assertSame($listing, $moved->move(Placement::first(), expected: null)->parent);
         $this->assertSame(1, $moved->position);
+        $this->assertSame($listing, $moved->move(Placement::first(), expected: null)->parent);
     }
 
     #[Test]

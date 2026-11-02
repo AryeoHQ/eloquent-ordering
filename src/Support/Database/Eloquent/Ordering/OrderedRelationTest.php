@@ -42,6 +42,7 @@ use Tests\Fixtures\Support\Agencies\AgencyCustomer;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Documents\Document;
 use Tests\Fixtures\Support\Documents\DocumentKind;
 use Tests\Fixtures\Support\Documents\KindedDocument;
 use Tests\Fixtures\Support\Events\ModelEvents;
@@ -848,6 +849,26 @@ class OrderedRelationTest extends TestCase
             '[%s::customers()] filters its members by [customers.name], which its membership does not declare.',
             $parent,
         )];
+
+        yield 'the second column of a column clause its membership omits' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'folders';
+
+            /**
+             * @return HasMany<Document, $this>
+             */
+            #[OrdersRelation(FolderRevision::DocumentsOrder, membership: ['documents.kind'])]
+            public function documents(): HasMany
+            {
+                return $this->hasMany(Document::class, 'folder_id')->whereColumn('documents.kind', '!=', 'documents.locale');
+            }
+        }, FolderRevision::DocumentsOrder, static fn (string $parent): string => sprintf(
+            '[%s::documents()] filters its members by [documents.locale], which its membership does not declare.',
+            $parent,
+        )];
     }
 
     /**
@@ -1182,7 +1203,7 @@ class OrderedRelationTest extends TestCase
      */
     public static function inspectableMemberships(): iterable
     {
-        yield 'basic, null, in and column clauses on declared item columns' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        yield 'basic, null and in clauses on declared item columns' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
             use HasOrderedRelations;
@@ -1198,10 +1219,26 @@ class OrderedRelationTest extends TestCase
                 return $this->hasMany(Asset::class, 'section_id')
                     ->where('title', 'Shown')
                     ->whereNotNull('assets.title')
-                    ->whereIn('assets.visible', [true])
-                    ->whereColumn('assets.visible', '=', 'assets.visible');
+                    ->whereIn('assets.visible', [true]);
             }
         }, SectionRevision::AssetsOrder];
+
+        yield 'a column clause on two declared item columns' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'folders';
+
+            /**
+             * @return HasMany<Document, $this>
+             */
+            #[OrdersRelation(FolderRevision::DocumentsOrder, membership: ['documents.kind', 'documents.locale'])]
+            public function documents(): HasMany
+            {
+                return $this->hasMany(Document::class, 'folder_id')->whereColumn('documents.kind', '!=', 'documents.locale');
+            }
+        }, FolderRevision::DocumentsOrder];
 
         yield 'an or inside a nested clause' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
