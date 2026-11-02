@@ -21,11 +21,13 @@ use Support\Database\Eloquent\Ordering\Providers\Provider;
 use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Customers\TwiceOrderedCustomer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Listings\NamedListing;
+use Tests\Fixtures\Support\Listings\TwiceOrderingListing;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Tours\Tour;
@@ -122,6 +124,20 @@ class OrdersThroughPivotsTest extends TestCase
             [$tour::class, $tour->id, [$pivots[1]], [[$pivots[1], 1, null]], $attached[1]],
             [$agency::class, $agency->id, [$pivots[2]], [[$pivots[2], 1, null]], $attached[2]],
         ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_reports_once_to_a_listing_that_the_ordered_through_parents_of_a_customer_name_twice(): void
+    {
+        $listing = TwiceOrderingListing::create();
+        $customer = TwiceOrderedCustomer::create();
+        $listing->customers()->attach($customer);
+        $pivot = ListingCustomer::query()->where('customer_id', $customer->id)->sole()->getKey();
+        $this->recordReorders();
+
+        $customer->delete();
+
+        $this->assertSame([[TwiceOrderingListing::class, $listing->id, [], [[$pivot, null, 1]], self::emptyDigest()]], $this->reorders);
     }
 
     #[Test]

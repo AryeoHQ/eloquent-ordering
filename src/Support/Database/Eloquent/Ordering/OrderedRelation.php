@@ -1052,7 +1052,7 @@ final class OrderedRelation
      */
     public static function orderedThrough(Model $related): array
     {
-        return array_merge([], ...array_map(static fn (OrderedThrough $declared): array => $declared->parents, self::attributes($related, OrderedThrough::class)));
+        return array_values(array_unique(array_merge([], ...array_map(static fn (OrderedThrough $declared): array => $declared->parents, self::attributes($related, OrderedThrough::class)))));
     }
 
     /**
