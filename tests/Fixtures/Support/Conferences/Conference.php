@@ -15,10 +15,8 @@ use Tests\Fixtures\Support\Speakers\Speaker;
 
 /**
  * @property int $id
- * @property int $concurrency_revision
- * @property int $speakers_order_concurrency_revision
+ * @property string $concurrency_revision
  */
-#[OrdersRelation(ConferenceRevision::SpeakersOrder, relation: 'speakers')]
 class Conference extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -29,6 +27,7 @@ class Conference extends Model implements OrdersRelations, Revisioned
     /**
      * @return BelongsToMany<Speaker, $this, ConferenceSpeaker>
      */
+    #[OrdersRelation(ConferenceRevision::SpeakersOrder)]
     public function speakers(): BelongsToMany
     {
         return $this->belongsToMany(Speaker::class, 'conference_speaker')

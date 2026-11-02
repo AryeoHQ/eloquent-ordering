@@ -13,7 +13,7 @@ interface Ordered extends LocksParentsFirst
 {
     public function placeAt(Placement $placement): static;
 
-    public function move(Placement $placement, null|int $expected): OrderChange;
+    public function move(Placement $placement, null|string $expected): OrderChange;
 
     public function orderingRelation(): OrderedRelation;
 }

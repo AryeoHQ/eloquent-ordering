@@ -4,12 +4,10 @@ declare(strict_types=1);
 
 namespace Tests;
 
-use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Query\Expression;
-use Illuminate\Database\QueryException;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
@@ -51,43 +49,6 @@ abstract class TestCase extends Testbench\TestCase
     }
 
     /**
-     * @template TResult
-     *
-     * @param  Closure(): TResult  $write
-     * @return TResult
-     */
-    protected function runDeferredChecks(Closure $write): mixed
-    {
-        try {
-            return DB::transaction(static function () use ($write): mixed {
-                $result = $write();
-
-                DB::statement('set constraints all immediate');
-
-                return $result;
-            });
-        } finally {
-            DB::statement('set constraints all deferred');
-        }
-    }
-
-    /**
-     * @param  Closure(): mixed  $write
-     */
-    protected function assertRefused(Closure $write): void
-    {
-        try {
-            $this->runDeferredChecks($write);
-        } catch (QueryException $exception) {
-            $this->assertSame('23514', $exception->getCode(), $exception->getMessage());
-
-            return;
-        }
-
-        $this->fail('The write was not refused.');
-    }
-
-    /**
      * @param  array<string, mixed>  $before
      * @param  array<string, mixed>  $after
      * @return list<array{string, class-string, mixed, array<string, mixed>, array<string, mixed>}>
@@ -103,19 +64,6 @@ abstract class TestCase extends Testbench\TestCase
             ['updated', $model::class, $model->getKey(), array_intersect_key($before, $changed), array_intersect_key($after, $changed)],
             ['saved', $model::class, $model->getKey(), array_intersect_key($before, $changed), array_intersect_key($after, $changed)],
         ];
-    }
-
-    /**
-     * @return list<array{string, class-string, mixed, array<string, mixed>, array<string, mixed>}>
-     */
-    protected static function raisedEvents(Model $parent, string $column, int $from): array
-    {
-        $raised = [$column => sprintf('"%s" + 1', $column)];
-
-        return array_map(
-            static fn (string $event): array => [$event, $parent::class, $parent->getKey(), [$column => $from], $raised],
-            ['saving', 'updating', 'updated', 'saved'],
-        );
     }
 
     /**

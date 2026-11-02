@@ -7,18 +7,18 @@ namespace Support\Database\Eloquent\Ordering\Provides;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
-use Orchestra\Testbench\Attributes\DefineEnvironment;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Tests\Fixtures\Support\Conferences\Conference;
+use Tests\Fixtures\Support\Conferences\ConferenceRevision;
 use Tests\Fixtures\Support\Panels\Panel;
+use Tests\Fixtures\Support\Panels\PanelRevision;
 use Tests\Fixtures\Support\Speakers\Speaker;
 use Tests\TestCase;
 
 #[CoversTrait(LocksOrderedParentsFirst::class)]
-#[DefineEnvironment('orderTheSpeakersOfEveryConference')]
 class LocksOrderedParentsFirstTest extends TestCase
 {
     #[Test]
@@ -53,7 +53,7 @@ class LocksOrderedParentsFirstTest extends TestCase
     }
 
     #[Test]
-    public function it_raises_both_panels_and_no_conference_when_a_save_moves_the_model_to_another_panel(): void
+    public function it_changes_both_panel_digests_and_no_conference_digest_when_a_save_moves_the_model_to_another_panel(): void
     {
         [$panel, $destination] = [Panel::create(), Panel::create()];
         $speaker = $panel->speakers()->create();
@@ -61,14 +61,15 @@ class LocksOrderedParentsFirstTest extends TestCase
         $conference->speakers()->attach($speaker);
         $before = $this->revisions($panel, $destination, $conference);
 
-        $this->runDeferredChecks(fn (): bool => $speaker->update(['panel_id' => $destination->id]));
+        $speaker->update(['panel_id' => $destination->id]);
+        $after = $this->revisions($panel, $destination, $conference);
 
-        $this->assertSame([$before[0] + 1, $before[1] + 1, $before[2]], $this->revisions($panel, $destination, $conference));
+        $this->assertSame([true, true, false], [$before[0] !== $after[0], $before[1] !== $after[1], $before[2] !== $after[2]]);
         $this->assertSame(1, $speaker->refresh()->position);
     }
 
     #[Test]
-    public function it_raises_the_panel_and_every_conference_when_the_model_is_soft_deleted_or_restored(): void
+    public function it_changes_the_panel_digest_and_every_conference_digest_when_the_model_is_soft_deleted_or_restored(): void
     {
         $panel = Panel::create();
         $speaker = $panel->speakers()->create();
@@ -77,14 +78,14 @@ class LocksOrderedParentsFirstTest extends TestCase
         $second->speakers()->attach($speaker);
         $before = $this->revisions($panel, $first, $second);
 
-        $this->runDeferredChecks(fn (): mixed => $speaker->delete());
+        $speaker->delete();
 
-        $this->assertSame(array_map(fn (int $revision): int => $revision + 1, $before), $this->revisions($panel, $first, $second));
+        $this->assertSame([], array_intersect($before, $this->revisions($panel, $first, $second)));
         $this->assertSame([], $first->speakers()->pluck('speakers.id')->all());
 
-        $this->runDeferredChecks(fn (): mixed => self::restore($speaker));
+        self::restore($speaker);
 
-        $this->assertSame(array_map(fn (int $revision): int => $revision + 2, $before), $this->revisions($panel, $first, $second));
+        $this->assertSame($before, $this->revisions($panel, $first, $second));
         $this->assertSame([$speaker->id], $first->speakers()->pluck('speakers.id')->all());
         $this->assertSame(1, $speaker->refresh()->position);
     }
@@ -98,11 +99,11 @@ class LocksOrderedParentsFirstTest extends TestCase
         $conference->speakers()->attach($speaker);
         DB::enableQueryLog();
 
-        $this->runDeferredChecks(fn (): mixed => $speaker->delete());
+        $speaker->delete();
         $deleted = $this->lockedParentTables();
         DB::flushQueryLog();
 
-        $this->runDeferredChecks(fn (): mixed => self::restore($speaker));
+        self::restore($speaker);
 
         $this->assertSame([['conferences', 'panels'], ['conferences', 'panels']], [$deleted, $this->lockedParentTables()]);
     }
@@ -136,11 +137,6 @@ class LocksOrderedParentsFirstTest extends TestCase
         } finally {
             $this->finishRace($rivals, $panel, $conference);
         }
-    }
-
-    protected function orderTheSpeakersOfEveryConference(): void
-    {
-        config()->set('concurrency.models', [Conference::class]);
     }
 
     /**
@@ -190,12 +186,12 @@ class LocksOrderedParentsFirstTest extends TestCase
     }
 
     /**
-     * @return list<int>
+     * @return list<string>
      */
-    private function revisions(Model ...$parents): array
+    private function revisions(Panel|Conference ...$parents): array
     {
         return array_map(
-            fn (Model $parent): int => (int) DB::table($parent->getTable())->where('id', $parent->getKey())->value('speakers_order_concurrency_revision'),
+            fn (Panel|Conference $parent): string => $parent::query()->findOrFail($parent->id)->concurrencyRevision($parent instanceof Panel ? PanelRevision::SpeakersOrder : ConferenceRevision::SpeakersOrder),
             array_values($parents),
         );
     }

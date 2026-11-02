@@ -8,12 +8,9 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
-use Illuminate\Database\Eloquent\SoftDeletes;
-use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\ServiceProvider;
 use LogicException;
-use ReflectionClass;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
@@ -24,7 +21,7 @@ use Support\Database\Eloquent\Ordering\Schema\Macros;
 use WeakMap;
 
 /**
- * @phpstan-type PivotParent array{class-string<Model>, OrdersRelation, non-empty-list<string>}
+ * @phpstan-type PivotParent array{class-string<Model>, string, OrdersRelation, non-empty-list<string>}
  * @phpstan-type ReachedParents list<array{OrderedRelation, list<array{Model&Ordered, null|int}>}>
  */
 class Provider extends ServiceProvider
@@ -41,13 +38,51 @@ class Provider extends ServiceProvider
         });
 
         Event::listen(['eloquent.creating: *', 'eloquent.updating: *'], self::requirePreparedOrder(...));
+    }
 
-        $this->app->booted(static function (): void {
-            self::$parentsByRelated = self::pivotParents();
+    /**
+     * @internal
+     *
+     * @param  class-string<Model>  $related
+     */
+    public static function listenToPivotParentsOf(string $related): void
+    {
+        /** @var WeakMap<Model, array<int, ReachedParents>> $held */
+        $held = new WeakMap;
 
-            foreach (self::$parentsByRelated as $related => $parents) {
-                self::raisePivotParentsOf($related, $parents);
-            }
+        Event::listen("eloquent.deleting: {$related}", static function (Model $model) use ($held): void {
+            $held[$model] = self::trashes($model) ? self::lockPivotParents($model, self::pivotParentsOf($model)) : [];
+        });
+
+        Event::listen("eloquent.trashed: {$related}", static function (Model $model) use ($held): void {
+            $positions = $held[$model] ?? [];
+            unset($held[$model]);
+
+            self::reportHeldPivotParents($positions);
+        });
+
+        Event::listen("eloquent.updating: {$related}", static function (Model $model) use ($held): void {
+            $parents = self::pivotParentsOf($model);
+
+            $held[$model] = self::lockPivotParents($model, array_filter($parents, static fn (array $parent): bool => $model->isDirty($parent[3])));
+            OrderedRelation::preparedRelated($model, array_values(array_unique(array_merge(...array_column($parents, 3)))));
+        });
+
+        Event::listen("eloquent.updated: {$related}", static function (Model $model) use ($held): void {
+            $positions = $held[$model] ?? [];
+            unset($held[$model]);
+            OrderedRelation::requirePrepared($model);
+            $changed = array_filter(self::pivotParentsOf($model), static fn (array $parent): bool => $model->wasChanged($parent[3]));
+            $unprepared = array_diff_key($changed, $positions);
+
+            throw_if($unprepared !== [], LogicException::class, sprintf(
+                '[%s:%s] changed [%s] without a prepared order write. A listener ran after the package\'s [updating] listener, or stopped it.',
+                $model::class,
+                $model->getKey(),
+                implode('], [', array_values(array_intersect(array_keys($model->getChanges()), array_merge(...array_column($unprepared, 3))))),
+            ));
+
+            self::reportHeldPivotParents(array_intersect_key($positions, $changed));
         });
     }
 
@@ -60,7 +95,7 @@ class Provider extends ServiceProvider
     {
         $parents = [];
 
-        foreach (self::$parentsByRelated[$related::class] ?? [] as $parent) {
+        foreach (self::pivotParentsOf($related) as $parent) {
             foreach (self::pivotsOf($related, $parent) as [$relation]) {
                 if (! array_any($parents, static fn (Model $named): bool => $named->is($relation->parent))) {
                     $parents[] = $relation->parent;
@@ -76,11 +111,11 @@ class Provider extends ServiceProvider
      */
     public static function locksPivotParentsOf(Model $related, bool $deleting): bool
     {
-        $parents = self::$parentsByRelated[$related::class] ?? [];
+        $parents = self::pivotParentsOf($related);
 
         return $deleting
             ? $parents !== [] && self::trashes($related)
-            : array_any($parents, static fn (array $parent): bool => $related->isDirty($parent[2]));
+            : array_any($parents, static fn (array $parent): bool => $related->isDirty($parent[3]));
     }
 
     /**
@@ -96,93 +131,47 @@ class Provider extends ServiceProvider
     }
 
     /**
-     * @return array<class-string<Model>, list<PivotParent>>
+     * @return list<PivotParent>
      */
-    private static function pivotParents(): array
+    private static function pivotParentsOf(Model $related): array
     {
+        return self::$parentsByRelated[$related::class] ??= self::pivotParents($related);
+    }
+
+    /**
+     * @return list<PivotParent>
+     */
+    private static function pivotParents(Model $related): array
+    {
+        if (! in_array(OrdersThroughPivots::class, class_uses_recursive($related), true)) {
+            return [];
+        }
+
         $reached = [];
 
-        foreach (Arr::wrap(config('concurrency.models')) as $class) {
-            if (! is_string($class) || ! is_a($class, Model::class, true) || ! is_a($class, OrdersRelations::class, true)) {
+        foreach (OrderedRelation::orderedThrough($related) as $class) {
+            if (! is_a($class, Model::class, true) || ! is_a($class, OrdersRelations::class, true)) {
                 continue;
             }
 
             $parent = new $class;
 
-            for ($reflection = new ReflectionClass($class); $reflection !== false; $reflection = $reflection->getParentClass()) {
-                foreach ($reflection->getAttributes(OrdersRelation::class) as $attribute) {
-                    $declaration = $attribute->newInstance();
-                    $relation = method_exists($parent, $declaration->relation) ? $parent->{$declaration->relation}() : null;
+            foreach (OrderedRelation::orderDeclarations($parent) as [$method, $declaration]) {
+                $relation = method_exists($parent, $method) ? $parent->{$method}() : null;
 
-                    if (! $relation instanceof BelongsToMany || ($relation instanceof MorphToMany && $relation->getInverse())) {
-                        continue;
-                    }
+                if (! $relation instanceof BelongsToMany || ($relation instanceof MorphToMany && $relation->getInverse()) || $relation->getRelated()::class !== $related::class) {
+                    continue;
+                }
 
-                    $related = $relation->getRelated();
+                $columns = OrderedRelation::watchedRelatedColumns($related, $declaration);
 
-                    throw_unless(in_array(OrdersThroughPivots::class, class_uses_recursive($related), true), LogicException::class, sprintf(
-                        '[%s::%s()] orders the pivots of [%s], so [%s] must use [%s].',
-                        $class,
-                        $declaration->relation,
-                        $related::class,
-                        $related::class,
-                        OrdersThroughPivots::class,
-                    ));
-
-                    $columns = [...self::softDeleteColumnOf($related), ...$declaration->membershipOf($related->getTable())];
-
-                    if ($columns !== []) {
-                        $reached[$related::class][] = [$class, $declaration, $columns];
-                    }
+                if ($columns !== []) {
+                    $reached[] = [$class, $method, $declaration, $columns];
                 }
             }
         }
 
         return $reached;
-    }
-
-    /**
-     * @param  class-string<Model>  $related
-     * @param  list<PivotParent>  $parents
-     */
-    private static function raisePivotParentsOf(string $related, array $parents): void
-    {
-        /** @var WeakMap<Model, array<int, ReachedParents>> $held */
-        $held = new WeakMap;
-        $watched = array_values(array_unique(array_merge(...array_column($parents, 2))));
-
-        Event::listen("eloquent.deleting: {$related}", static function (Model $model) use ($parents, $held): void {
-            $held[$model] = self::trashes($model) ? self::lockPivotParents($model, $parents) : [];
-        });
-
-        Event::listen("eloquent.trashed: {$related}", static function (Model $model) use ($parents, $held): void {
-            $positions = $held[$model] ?? [];
-            unset($held[$model]);
-
-            self::raiseHeldPivotParents($model, $parents, $positions);
-        });
-
-        Event::listen("eloquent.updating: {$related}", static function (Model $model) use ($parents, $held, $watched): void {
-            $held[$model] = self::lockPivotParents($model, array_filter($parents, static fn (array $parent): bool => $model->isDirty($parent[2])));
-            OrderedRelation::preparedRelated($model, $watched);
-        });
-
-        Event::listen("eloquent.updated: {$related}", static function (Model $model) use ($parents, $held): void {
-            $positions = $held[$model] ?? [];
-            unset($held[$model]);
-            OrderedRelation::requirePrepared($model);
-            $changed = array_filter($parents, static fn (array $parent): bool => $model->wasChanged($parent[2]));
-            $unprepared = array_diff_key($changed, $positions);
-
-            throw_if($unprepared !== [], LogicException::class, sprintf(
-                '[%s:%s] changed [%s] without a prepared order write. A listener ran after the package\'s [updating] listener, or stopped it.',
-                $model::class,
-                $model->getKey(),
-                implode('], [', array_values(array_intersect(array_keys($model->getChanges()), array_merge(...array_column($unprepared, 2))))),
-            ));
-
-            self::raiseHeldPivotParents($model, $changed, $positions);
-        });
     }
 
     /**
@@ -209,22 +198,15 @@ class Provider extends ServiceProvider
     }
 
     /**
-     * @param  array<int, PivotParent>  $parents
      * @param  array<int, ReachedParents>  $positions
      */
-    private static function raiseHeldPivotParents(Model $related, array $parents, array $positions): void
+    private static function reportHeldPivotParents(array $positions): void
     {
-        $reached = [];
-
-        foreach ($parents as $index => $parent) {
-            array_push($reached, ...$positions[$index] ?? array_map(static fn (array $reach): array => [$reach[0], []], self::pivotsOf($related, $parent)));
-        }
-
-        OrderedRelation::raiseAll(array_map(static fn (array $reach): OrderedRelation => $reach[0], $reached));
-
-        foreach ($reached as [$relation, $pivots]) {
-            foreach ($pivots as [$pivot, $previous]) {
-                $relation->refiltered($pivot, $previous);
+        foreach ($positions as $reached) {
+            foreach ($reached as [$relation, $pivots]) {
+                foreach ($pivots as [$pivot, $previous]) {
+                    $relation->refiltered($pivot, $previous);
+                }
             }
         }
     }
@@ -235,9 +217,9 @@ class Provider extends ServiceProvider
      */
     private static function pivotsOf(Model $related, array $parent): array
     {
-        [$class, $declaration] = $parent;
+        [$class, $method, $declaration] = $parent;
         $template = (new $class)->setConnection($related->getConnectionName());
-        $relation = $template->{$declaration->relation}();
+        $relation = $template->{$method}();
         assert($relation instanceof BelongsToMany);
 
         $pivotClass = $relation->getPivotClass();
@@ -269,16 +251,6 @@ class Provider extends ServiceProvider
         }
 
         return $reached;
-    }
-
-    /**
-     * @return list<string>
-     */
-    private static function softDeleteColumnOf(Model $related): array
-    {
-        $column = in_array(SoftDeletes::class, class_uses_recursive($related), true) && method_exists($related, 'getDeletedAtColumn') ? $related->getDeletedAtColumn() : null;
-
-        return is_string($column) ? [$column] : [];
     }
 
     private static function trashes(Model $related): bool

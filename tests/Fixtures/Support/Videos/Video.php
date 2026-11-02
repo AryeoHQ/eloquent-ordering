@@ -23,12 +23,10 @@ use Tests\Fixtures\Support\Sections\Section;
  * @property int $section_id
  * @property string|null $rank_key
  * @property string|null $title
- * @property int $concurrency_revision
- * @property int $clips_order_concurrency_revision
+ * @property string $concurrency_revision
  * @property-read int|null $position
  */
 #[OrderedIn(Section::class)]
-#[OrdersRelation(VideoRevision::ClipsOrder, relation: 'clips')]
 class Video extends Model implements Ordered, OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -48,6 +46,7 @@ class Video extends Model implements Ordered, OrdersRelations, Revisioned
     /**
      * @return HasMany<Clip, $this>
      */
+    #[OrdersRelation(VideoRevision::ClipsOrder)]
     public function clips(): HasMany
     {
         return $this->hasMany(Clip::class);

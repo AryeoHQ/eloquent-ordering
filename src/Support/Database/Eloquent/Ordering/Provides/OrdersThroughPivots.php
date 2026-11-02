@@ -19,6 +19,11 @@ trait OrdersThroughPivots
     use LocksOrderedParentsFirst;
     use WritesInTransactions;
 
+    public static function bootOrdersThroughPivots(): void
+    {
+        Provider::listenToPivotParentsOf(static::class);
+    }
+
     /**
      * @return list<Model>
      */

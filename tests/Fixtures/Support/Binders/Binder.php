@@ -23,12 +23,10 @@ use Tests\Fixtures\Support\Shelves\Shelf;
  * @property int $shelf_id
  * @property string|null $kind
  * @property string|null $rank_key
- * @property int $concurrency_revision
- * @property int $pages_order_concurrency_revision
+ * @property string $concurrency_revision
  * @property-read int|null $position
  */
 #[OrderedIn(Shelf::class)]
-#[OrdersRelation(BinderRevision::PagesOrder, relation: 'pages', membership: ['pages.kind', 'binders.kind'])]
 class Binder extends Model implements Ordered, OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -48,6 +46,7 @@ class Binder extends Model implements Ordered, OrdersRelations, Revisioned
     /**
      * @return HasMany<Page, $this>
      */
+    #[OrdersRelation(BinderRevision::PagesOrder, membership: ['pages.kind', 'binders.kind'])]
     public function pages(): HasMany
     {
         return $this->hasMany(Page::class)->where('pages.kind', $this->kind);

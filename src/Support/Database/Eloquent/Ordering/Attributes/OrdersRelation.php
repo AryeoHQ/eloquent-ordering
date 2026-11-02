@@ -5,16 +5,19 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering\Attributes;
 
 use Attribute;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Support\Database\Eloquent\Concurrency\Attributes\NamedConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
+use Support\Database\Eloquent\Ordering\OrderedRelation;
 
-#[Attribute(Attribute::TARGET_CLASS | Attribute::IS_REPEATABLE)]
+#[Attribute(Attribute::TARGET_METHOD | Attribute::IS_REPEATABLE)]
 final class OrdersRelation extends NamedConcurrencyRevision
 {
     /**
      * @param  list<string>  $membership
      */
-    public function __construct(NamesConcurrencyRevision $revision, public readonly string $relation, public readonly array $membership = [])
+    public function __construct(NamesConcurrencyRevision $revision, public readonly array $membership = [])
     {
         parent::__construct($revision);
     }
@@ -35,5 +38,14 @@ final class OrdersRelation extends NamedConcurrencyRevision
         }
 
         return $columns;
+    }
+
+    /**
+     * @param  Relation<*, *, *>  $relation
+     * @return Builder<*>
+     */
+    public function digestQuery(Relation $relation): Builder
+    {
+        return OrderedRelation::memberQuery($relation);
     }
 }

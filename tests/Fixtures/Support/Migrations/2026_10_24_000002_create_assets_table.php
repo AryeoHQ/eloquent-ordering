@@ -5,8 +5,6 @@ declare(strict_types=1);
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
-use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
-use Tests\Fixtures\Support\Sections\SectionRevision;
 
 return new class extends Migration
 {
@@ -25,8 +23,6 @@ return new class extends Migration
         Schema::getConnection()->statement(
             'create unique index assets_section_id_rank_key_unique on assets (section_id, rank_key) where deleted_at is null',
         );
-
-        OrderedRelations::createTrigger('assets', 'sections', 'section_id', SectionRevision::AssetsOrder->value);
     }
 
     public function down(): void

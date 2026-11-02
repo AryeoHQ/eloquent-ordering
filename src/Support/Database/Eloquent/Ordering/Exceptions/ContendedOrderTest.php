@@ -68,8 +68,8 @@ class ContendedOrderTest extends TestCase
     {
         return [
             (array) DB::table($shape->memberTable())->where('id', $member->getKey())->first(),
-            $shape->storedRevision($source),
-            $shape->storedRevision($other),
+            $shape->digest($source),
+            $shape->digest($other),
             $shape->rankKeys($source),
             $shape->rankKeys($other),
         ];

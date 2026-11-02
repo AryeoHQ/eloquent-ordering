@@ -15,10 +15,8 @@ use Tests\Fixtures\Support\Photos\Photo;
 
 /**
  * @property int $id
- * @property int $concurrency_revision
- * @property int $photos_order_concurrency_revision
+ * @property string $concurrency_revision
  */
-#[OrdersRelation(BoardRevision::PhotosOrder, relation: 'photos')]
 class Board extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -29,6 +27,7 @@ class Board extends Model implements OrdersRelations, Revisioned
     /**
      * @return HasMany<Photo, $this>
      */
+    #[OrdersRelation(BoardRevision::PhotosOrder)]
     public function photos(): HasMany
     {
         return $this->hasMany(Photo::class);

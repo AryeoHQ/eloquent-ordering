@@ -6,28 +6,23 @@ namespace Support\Database\Eloquent\Ordering\Providers;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
-use Illuminate\Database\Eloquent\Relations\MorphMany;
-use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
+use Support\Database\Eloquent\Concurrency\Providers\Provider as ConcurrencyProvider;
 use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
+use Support\Database\Eloquent\Ordering\Attributes\OrderedThrough;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
-use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Customers\Customer;
-use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
-use Tests\Fixtures\Support\Playlists\Playlist;
-use Tests\Fixtures\Support\Scenes\Scene;
-use Tests\Fixtures\Support\Sections\Section;
-use Tests\Fixtures\Support\Tours\Tour;
 use Tests\TestCase;
 
 #[CoversClass(Provider::class)]
@@ -42,7 +37,7 @@ class ProviderTest extends TestCase
     #[Test]
     public function it_loads_the_eloquent_concurrency_provider(): void
     {
-        $this->assertTrue(Blueprint::hasMacro('concurrencyRevision'));
+        $this->assertTrue($this->app->providerIsLoaded(ConcurrencyProvider::class));
     }
 
     #[Test]
@@ -66,92 +61,99 @@ class ProviderTest extends TestCase
     }
 
     #[Test]
-    public function it_refuses_to_boot_with_a_model_whose_ordered_pivots_reach_a_model_without_orders_through_pivots(): void
+    public function it_refuses_a_parent_whose_ordered_pivots_reach_a_model_without_orders_through_pivots_on_its_first_declaration_read(): void
     {
-        $parent = new #[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')] class extends Model implements OrdersRelations, Revisioned
+        $related = (new class extends Model
+        {
+            use SoftDeletes;
+
+            protected $table = 'customers';
+        })::class;
+        $parent = $this->listingOrderingThePivotsOf($related);
+
+        $this->assertRefused(
+            sprintf('[%s::customers()] orders the pivots of [%2$s], so [%2$s] must use [%3$s].', $parent::class, $related, OrdersThroughPivots::class),
+            $parent,
+        );
+    }
+
+    #[Test]
+    public function it_refuses_a_parent_whose_related_model_omits_it_from_ordered_through_on_its_first_declaration_read(): void
+    {
+        $parent = $this->listingOrderingThePivotsOf(Customer::class);
+
+        $this->assertRefused(
+            sprintf('[%s::customers()] orders the pivots of [%2$s], so [%2$s] must name [%1$s] in #[%3$s].', $parent::class, Customer::class, OrderedThrough::class),
+            $parent,
+        );
+    }
+
+    #[Test]
+    public function it_needs_no_ordered_through_on_a_related_model_whose_columns_no_order_watches(): void
+    {
+        $related = (new class extends Model
+        {
+            protected $table = 'customers';
+        })::class;
+
+        $this->assertSame(ListingRevision::CustomersOrder, $this->listingOrderingThePivotsOf($related)->orderedRelation(ListingRevision::CustomersOrder)->revision);
+    }
+
+    #[Test]
+    public function it_listens_to_a_model_that_orders_through_pivots_once_the_model_boots(): void
+    {
+        $viewer = new class extends Model
+        {
+            protected $table = 'customers';
+        };
+
+        $this->assertFalse(Event::hasListeners('eloquent.trashed: '.Customer::class));
+
+        new Customer;
+
+        $this->assertTrue(Event::hasListeners('eloquent.trashed: '.Customer::class));
+        $this->assertFalse(Event::hasListeners('eloquent.trashed: '.$viewer::class));
+    }
+
+    /**
+     * @param  class-string<Model>  $related
+     */
+    private function listingOrderingThePivotsOf(string $related): Model&OrdersRelations&Revisioned
+    {
+        $parent = new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
             use HasOrderedRelations;
+
+            /** @var class-string<Model> */
+            public static string $related;
 
             protected $table = 'listings';
 
             /**
              * @return BelongsToMany<Model, $this, ListingCustomer>
              */
+            #[OrdersRelation(ListingRevision::CustomersOrder)]
             public function customers(): BelongsToMany
             {
-                return $this->belongsToMany(self::customer(), 'listing_customer', 'listing_id', 'customer_id')->using(ListingCustomer::class)->wherePivotNull('deleted_at');
-            }
-
-            /**
-             * @return class-string<Model>
-             */
-            public static function customer(): string
-            {
-                return (new class extends Model
-                {
-                    protected $table = 'customers';
-                })::class;
+                return $this->belongsToMany(self::$related, 'listing_customer', 'listing_id', 'customer_id')->using(ListingCustomer::class)->wherePivotNull('deleted_at');
             }
         };
-        config()->set('concurrency.models', [Listing::class, $parent::class]);
+        $parent::$related = $related;
 
+        return $parent;
+    }
+
+    private function assertRefused(string $message, Model&OrdersRelations $parent): void
+    {
         try {
-            $this->app->register(Provider::class, force: true);
+            $parent->orderedRelation(ListingRevision::CustomersOrder);
         } catch (LogicException $exception) {
-            $this->assertSame(
-                sprintf('[%s::customers()] orders the pivots of [%2$s], so [%2$s] must use [%3$s].', $parent::class, $parent::customer(), OrdersThroughPivots::class),
-                $exception->getMessage(),
-            );
+            $this->assertSame($message, $exception->getMessage());
 
             return;
         }
 
-        $this->fail('The provider booted.');
-    }
-
-    #[Test]
-    public function it_listens_only_to_the_models_that_the_ordered_pivots_of_the_listed_models_reach(): void
-    {
-        $unordered = new #[OrdersRelation(ListingRevision::ScenesOrder, relation: 'scenes')] class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'listings';
-
-            /**
-             * @return MorphMany<Scene, $this>
-             */
-            public function scenes(): MorphMany
-            {
-                return $this->morphMany(Scene::class, 'sceneable');
-            }
-
-            /**
-             * @return BelongsToMany<Model, $this>
-             */
-            public function viewers(): BelongsToMany
-            {
-                return $this->belongsToMany(self::viewer(), 'listing_customer', 'listing_id', 'customer_id');
-            }
-
-            /**
-             * @return class-string<Model>
-             */
-            public static function viewer(): string
-            {
-                return (new class extends Model
-                {
-                    protected $table = 'customers';
-                })::class;
-            }
-        };
-        config()->set('concurrency.models', [Section::class, Playlist::class, $unordered::class, Listing::class, Tour::class, Agency::class]);
-
-        $this->app->register(Provider::class, force: true);
-
-        $this->assertTrue(Event::hasListeners('eloquent.trashed: '.Customer::class));
-        $this->assertFalse(Event::hasListeners('eloquent.trashed: '.$unordered::viewer()));
+        $this->fail('The declaration was read.');
     }
 }

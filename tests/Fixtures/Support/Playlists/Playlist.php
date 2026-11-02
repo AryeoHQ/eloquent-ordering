@@ -16,10 +16,8 @@ use Tests\Fixtures\Support\Tracks\Track;
 /**
  * @property int $id
  * @property string|null $kind
- * @property int $concurrency_revision
- * @property int $tracks_order_concurrency_revision
+ * @property string $concurrency_revision
  */
-#[OrdersRelation(PlaylistRevision::TracksOrder, relation: 'tracks', membership: ['tracks.kind', 'playlists.kind'])]
 class Playlist extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -30,6 +28,7 @@ class Playlist extends Model implements OrdersRelations, Revisioned
     /**
      * @return HasMany<Track, $this>
      */
+    #[OrdersRelation(PlaylistRevision::TracksOrder, membership: ['tracks.kind', 'playlists.kind'])]
     public function tracks(): HasMany
     {
         return $this->hasMany(Track::class)->where('tracks.kind', $this->kind);

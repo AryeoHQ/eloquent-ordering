@@ -19,12 +19,8 @@ use Tests\Fixtures\Support\Scenes\Scene;
 /**
  * @property int $id
  * @property string|null $title
- * @property int $concurrency_revision
- * @property int $customers_order_concurrency_revision
- * @property int $scenes_order_concurrency_revision
+ * @property string $concurrency_revision
  */
-#[OrdersRelation(ListingRevision::CustomersOrder, relation: 'customers')]
-#[OrdersRelation(ListingRevision::ScenesOrder, relation: 'scenes')]
 class Listing extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -37,6 +33,7 @@ class Listing extends Model implements OrdersRelations, Revisioned
     /**
      * @return BelongsToMany<Customer, $this, ListingCustomer>
      */
+    #[OrdersRelation(ListingRevision::CustomersOrder)]
     public function customers(): BelongsToMany
     {
         return $this->belongsToMany(Customer::class, 'listing_customer')
@@ -48,6 +45,7 @@ class Listing extends Model implements OrdersRelations, Revisioned
     /**
      * @return MorphMany<Scene, $this>
      */
+    #[OrdersRelation(ListingRevision::ScenesOrder)]
     public function scenes(): MorphMany
     {
         return $this->morphMany(Scene::class, 'sceneable');

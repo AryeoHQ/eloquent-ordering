@@ -48,9 +48,6 @@ trait IsOrdered
     /** @var list<OrderedRelation> */
     private array $lockedOrderedRelations = [];
 
-    /** @var null|array<string, mixed> */
-    private null|array $storedOrderedRow = null;
-
     /** @var null|array{OrderedRelation, null|int} */
     private null|array $refilteredPosition = null;
 
@@ -88,8 +85,6 @@ trait IsOrdered
             $relations = $item->lockedOrderedRelations;
             $item->lockedOrderedRelations = [];
 
-            OrderedRelation::raiseAll($relations);
-
             foreach ($relations as $relation) {
                 $relation->placed($item);
                 $relation->announceRebalance();
@@ -102,6 +97,7 @@ trait IsOrdered
             }
 
             [$current, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations();
+            $item->lockRelatedOfOrderedRelations();
             $item->vacatedPosition = $current?->position($item);
         });
 
@@ -121,19 +117,13 @@ trait IsOrdered
 
             $restored = $item->restoredInto;
             $reparented = $item->reparented;
-            $stored = $item->storedOrderedRow;
             $refiltered = $item->refilteredPosition;
             $relations = $item->lockedOrderedRelations;
             $item->restoredInto = null;
             $item->reparented = null;
-            $item->storedOrderedRow = null;
             $item->refilteredPosition = null;
             $item->lockedOrderedRelations = [];
             $item->assignedRankKey = null;
-
-            if ($stored !== null && $item->storedOrderedAttributes(array_keys($stored)) !== $stored) {
-                OrderedRelation::raiseAll($relations);
-            }
 
             if ($refiltered !== null) {
                 $refiltered[0]->refiltered($item, $refiltered[1]);
@@ -175,8 +165,6 @@ trait IsOrdered
             $item->lockedOrderedRelations = [];
             $item->forgetPosition();
 
-            OrderedRelation::raiseAll($relations);
-
             foreach ($relations as $relation) {
                 if ($vacated !== null) {
                     $relation->removed($item, $vacated);
@@ -202,7 +190,7 @@ trait IsOrdered
         return $this;
     }
 
-    public function move(Placement $placement, null|int $expected): OrderChange
+    public function move(Placement $placement, null|string $expected): OrderChange
     {
         throw_unless($this->exists, LogicException::class, sprintf('[%s] must be saved before it moves.', static::class));
 
@@ -288,7 +276,6 @@ trait IsOrdered
         $uncommitted = $item->reparented !== null;
         $item->restoredInto = null;
         $item->reparented = null;
-        $item->storedOrderedRow = null;
         $item->refilteredPosition = null;
         $item->lockedOrderedRelations = [];
 
@@ -298,10 +285,7 @@ trait IsOrdered
 
         if (! $item->exists) {
             $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
-
-            foreach ($item->lockedOrderedRelations as $relation) {
-                $relation->lockRelatedOf($item);
-            }
+            $item->lockRelatedOfOrderedRelations();
         } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
             [$current, $item->lockedOrderedRelations, $next, $membership] = $item->lockCurrentOrderedRelations(
                 static fn (null|array $stored): null|OrderedRelation => OrderedRelation::of(
@@ -310,10 +294,11 @@ trait IsOrdered
                     $item->heldOrderedParents(),
                 ),
             );
+            $item->lockRelatedOfOrderedRelations();
 
             $softDeletes = in_array(SoftDeletes::class, class_uses_recursive($item), true);
             $declared = OrderedRelation::declaredColumns($item);
-            $item->storedOrderedRow = $stored = $item->storedOrderedAttributes([
+            $stored = $item->storedOrderedAttributes([
                 OrderedRelation::RANK_KEY,
                 ...OrderedRelation::membershipColumns($item),
                 ...$declared,
@@ -361,6 +346,13 @@ trait IsOrdered
             ...OrderedRelation::namedParents($this, $this->getRawOriginal(), $this->heldOrderedParents()),
             ...OrderedRelation::namedParents($this, $this->getAttributes(), $this->heldOrderedParents()),
         ];
+    }
+
+    private function lockRelatedOfOrderedRelations(): void
+    {
+        foreach ($this->lockedOrderedRelations as $relation) {
+            $relation->lockRelatedOf($this);
+        }
     }
 
     private function forgetPosition(): void

@@ -15,10 +15,8 @@ use Tests\Fixtures\Support\Customers\Customer;
 
 /**
  * @property int $id
- * @property int $concurrency_revision
- * @property int $customers_order_concurrency_revision
+ * @property string $concurrency_revision
  */
-#[OrdersRelation(AgencyRevision::CustomersOrder, relation: 'customers')]
 class Agency extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -29,6 +27,7 @@ class Agency extends Model implements OrdersRelations, Revisioned
     /**
      * @return BelongsToMany<Customer, $this, AgencyCustomer>
      */
+    #[OrdersRelation(AgencyRevision::CustomersOrder)]
     public function customers(): BelongsToMany
     {
         return $this->belongsToMany(Customer::class, 'agency_customer')

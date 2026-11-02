@@ -10,9 +10,12 @@ use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
+use Support\Database\Eloquent\Ordering\Attributes\OrderedThrough;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
+use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
+use Tests\Fixtures\Support\Listings\NamedListing;
 use Tests\Fixtures\Support\Tours\Tour;
 
 /**
@@ -20,6 +23,7 @@ use Tests\Fixtures\Support\Tours\Tour;
  * @property string|null $name
  * @property bool $visible
  */
+#[OrderedThrough(Listing::class, Tour::class, Agency::class, NamedListing::class)]
 class Customer extends Model implements LocksParentsFirst
 {
     use OrdersThroughPivots;

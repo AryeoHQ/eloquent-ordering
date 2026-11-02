@@ -18,12 +18,8 @@ use Tests\Fixtures\Support\Videos\Video;
 /**
  * @property int $id
  * @property string|null $name
- * @property int $concurrency_revision
- * @property int $assets_order_concurrency_revision
- * @property int $videos_order_concurrency_revision
+ * @property string $concurrency_revision
  */
-#[OrdersRelation(SectionRevision::AssetsOrder, relation: 'assets')]
-#[OrdersRelation(SectionRevision::VideosOrder, relation: 'videos')]
 class Section extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -36,6 +32,7 @@ class Section extends Model implements OrdersRelations, Revisioned
     /**
      * @return HasMany<Asset, $this>
      */
+    #[OrdersRelation(SectionRevision::AssetsOrder)]
     public function assets(): HasMany
     {
         return $this->hasMany(Asset::class);
@@ -44,6 +41,7 @@ class Section extends Model implements OrdersRelations, Revisioned
     /**
      * @return HasMany<Video, $this>
      */
+    #[OrdersRelation(SectionRevision::VideosOrder)]
     public function videos(): HasMany
     {
         return $this->hasMany(Video::class);

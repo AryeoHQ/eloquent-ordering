@@ -21,14 +21,18 @@ use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Query\JoinClause;
 use Illuminate\Support\Str;
 use LogicException;
+use ReflectionAttribute;
 use ReflectionClass;
 use ReflectionMethod;
 use ReflectionNamedType;
+use Support\Database\Eloquent\Concurrency\Attributes\NamedConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
+use Support\Database\Eloquent\Concurrency\Scopes\SelectsConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
+use Support\Database\Eloquent\Ordering\Attributes\OrderedThrough;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
@@ -37,6 +41,7 @@ use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
+use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
 use Throwable;
 use WeakMap;
@@ -55,6 +60,9 @@ final class OrderedRelation
 
     /** @var array<class-string, array<class-string, list<object>>> */
     private static array $attributes = [];
+
+    /** @var array<class-string, list<array{string, OrdersRelation}>> */
+    private static array $orderDeclarations = [];
 
     /** @var array<string, bool> */
     private static array $declaredRelations = [];
@@ -98,7 +106,7 @@ final class OrderedRelation
             $revision->value,
         ));
 
-        $this->relationName = $declaration['declaration']->relation;
+        $this->relationName = $declaration['method'];
         $this->keys = self::describe($declaration['relation']);
         $this->parentColumns = array_values(array_unique(array_merge(
             ...array_map(static fn (array $declared): array => $declared['declaration']->membershipOf($parent->getTable()), array_values($declarations)),
@@ -257,21 +265,53 @@ final class OrderedRelation
     /**
      * @internal
      *
-     * @param  list<self>  $relations
+     * @return list<array{string, OrdersRelation}>
      */
-    public static function raiseAll(array $relations): void
+    public static function orderDeclarations(Model $model): array
     {
-        $unique = [];
+        if (! array_key_exists($model::class, self::$orderDeclarations)) {
+            $declarations = [];
 
-        foreach ($relations as $relation) {
-            if (! array_any($unique, static fn (self $raised): bool => $raised->is($relation))) {
-                $unique[] = $relation;
+            foreach ((new ReflectionClass($model))->getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
+                foreach ($method->getAttributes(NamedConcurrencyRevision::class, ReflectionAttribute::IS_INSTANCEOF) as $attribute) {
+                    $declaration = $attribute->newInstance();
+
+                    if ($declaration instanceof OrdersRelation) {
+                        $declarations[] = [$method->getName(), $declaration];
+                    }
+                }
             }
+
+            self::$orderDeclarations[$model::class] = $declarations;
         }
 
-        foreach (self::inLockOrder($unique) as $relation) {
-            $relation->raise();
-        }
+        return self::$orderDeclarations[$model::class];
+    }
+
+    /**
+     * @internal
+     *
+     * @param  Relation<*, *, *>  $relation
+     * @return EloquentBuilder<*>
+     */
+    public static function memberQuery(Relation $relation): EloquentBuilder
+    {
+        throw_unless($relation instanceof HasMany || $relation instanceof MorphMany || $relation instanceof BelongsToMany, LogicException::class, sprintf(
+            '[%s] orders a [%s], which is not a HasMany, MorphMany, BelongsToMany, or MorphToMany relation.',
+            OrdersRelation::class,
+            $relation::class,
+        ));
+
+        $item = self::describe($relation)->item;
+        $rankKey = $item->qualifyColumn(self::RANK_KEY);
+        $scopes = array_keys($relation->getRelated()->getGlobalScopes());
+
+        return $relation->getQuery()->clone()
+            ->withoutGlobalScopes(array_values(array_diff($scopes, [SoftDeletingScope::class])))
+            ->reorder()
+            ->whereNotNull($rankKey)
+            ->orderBy($rankKey)
+            ->orderBy($item->getQualifiedKeyName());
     }
 
     /**
@@ -386,7 +426,7 @@ final class OrderedRelation
         $stored = null;
         $relations = [];
 
-        foreach (self::attributes($parent, OrdersRelation::class) as $declaration) {
+        foreach (self::orderDeclarations($parent) as [, $declaration]) {
             $columns = $declaration->membershipOf($parent->getTable());
 
             if ($columns !== [] && $parent->isDirty($columns)) {
@@ -408,9 +448,9 @@ final class OrderedRelation
         return self::timestamps($item, self::membershipNamedBy($item, $item->getAttributes())['keys']->item ?? $item);
     }
 
-    public function concurrencyRevision(): int
+    public function concurrencyRevision(): string
     {
-        return intval($this->parentRow()->useWritePdo()->value($this->column()));
+        return $this->parent->concurrencyRevision($this->revision);
     }
 
     /**
@@ -534,7 +574,7 @@ final class OrderedRelation
     /**
      * @param  list<int|string>  $ids
      */
-    public function reorder(array $ids, null|int $expected): OrderChange
+    public function reorder(array $ids, null|string $expected): OrderChange
     {
         return $this->parent->getConnection()->transaction(function () use ($ids, $expected): OrderChange {
             self::lockAll([$this]);
@@ -551,7 +591,6 @@ final class OrderedRelation
             $sequence = $this->sequence(array_keys($keys), $members, $order);
 
             $this->rewrite($keys, array_combine($sequence, FractionalIndex::keysBetween(null, null, count($sequence))));
-            $this->raise();
 
             $before = array_flip($members);
             $moved = [];
@@ -580,7 +619,6 @@ final class OrderedRelation
             }
 
             $this->write($item, [self::RANK_KEY => $this->keyAt($placement, $id)]);
-            $this->raise();
 
             return $this->announce($this->change([$id => $previous]));
         }
@@ -590,7 +628,6 @@ final class OrderedRelation
             ...$this->keys->pointingAt($this->parent),
             self::RANK_KEY => $this->keyAt($placement),
         ]);
-        self::raiseAll([$source, $this]);
 
         return $this->entered($item, $source, $previous);
     }
@@ -719,7 +756,7 @@ final class OrderedRelation
     /**
      * @internal
      */
-    public function compareConcurrencyRevision(null|int $expected): void
+    public function compareConcurrencyRevision(null|string $expected): void
     {
         if ($expected !== null && $this->parent->concurrencyRevision($this->revision) !== $expected) {
             throw new StaleConcurrencyRevision($this->parent, $this->revision, $expected);
@@ -729,7 +766,7 @@ final class OrderedRelation
     /**
      * @internal
      */
-    public function announceRebalance(null|int $revision = null): void
+    public function announceRebalance(null|string $revision = null): void
     {
         if ($this->rebalanced === []) {
             return;
@@ -936,15 +973,15 @@ final class OrderedRelation
     }
 
     /**
-     * @return array<string, array{declaration: OrdersRelation, relation: HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>}>
+     * @return array<string, array{method: string, declaration: OrdersRelation, relation: HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>}>
      */
     private static function declarations(Model $parent): array
     {
         $declarations = [];
         $relations = [];
 
-        foreach (self::attributes($parent, OrdersRelation::class) as $declaration) {
-            $relation = self::relation($parent, $declaration->relation);
+        foreach (self::orderDeclarations($parent) as [$method, $declaration]) {
+            $relation = self::relation($parent, $method);
             $item = self::itemClass($relation);
 
             throw_if(array_key_exists($declaration->name(), $declarations), LogicException::class, sprintf(
@@ -958,24 +995,77 @@ final class OrderedRelation
                 $parent::class,
                 $item,
                 $relations[$item] ?? '',
-                $declaration->relation,
+                $method,
             ));
 
-            self::requireVerifiableMembership($parent, $declaration, $relation);
+            self::requireVerifiableMembership($parent, $method, $declaration, $relation);
 
-            $declarations[$declaration->name()] = ['declaration' => $declaration, 'relation' => $relation];
-            $relations[$item] = $declaration->relation;
+            $declarations[$declaration->name()] = ['method' => $method, 'declaration' => $declaration, 'relation' => $relation];
+            $relations[$item] = $method;
         }
 
         return $declarations;
     }
 
     /**
+     * @param  BelongsToMany<Model, Model>  $relation
+     */
+    private static function requireOrderedThrough(Model $parent, string $method, OrdersRelation $declaration, BelongsToMany $relation): void
+    {
+        $related = $relation->getRelated();
+
+        if (self::watchedRelatedColumns($related, $declaration) === []) {
+            return;
+        }
+
+        throw_unless(in_array(OrdersThroughPivots::class, class_uses_recursive($related), true), LogicException::class, sprintf(
+            '[%s::%s()] orders the pivots of [%s], so [%s] must use [%s].',
+            $parent::class,
+            $method,
+            $related::class,
+            $related::class,
+            OrdersThroughPivots::class,
+        ));
+
+        throw_unless(in_array($parent::class, self::orderedThrough($related), true), LogicException::class, sprintf(
+            '[%s::%s()] orders the pivots of [%s], so [%s] must name [%s] in #[%s].',
+            $parent::class,
+            $method,
+            $related::class,
+            $related::class,
+            $parent::class,
+            OrderedThrough::class,
+        ));
+    }
+
+    /**
+     * @internal
+     *
+     * @return list<class-string<Model>>
+     */
+    public static function orderedThrough(Model $related): array
+    {
+        return array_merge([], ...array_map(static fn (OrderedThrough $declared): array => $declared->parents, self::attributes($related, OrderedThrough::class)));
+    }
+
+    /**
+     * @internal
+     *
+     * @return list<string>
+     */
+    public static function watchedRelatedColumns(Model $related, OrdersRelation $declaration): array
+    {
+        $deletedAt = in_array(SoftDeletes::class, class_uses_recursive($related), true) && method_exists($related, 'getDeletedAtColumn') ? $related->getDeletedAtColumn() : null;
+
+        return [...is_string($deletedAt) ? [$deletedAt] : [], ...$declaration->membershipOf($related->getTable())];
+    }
+
+    /**
      * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
      */
-    private static function requireVerifiableMembership(Model $parent, OrdersRelation $declaration, HasMany|MorphMany|BelongsToMany $relation): void
+    private static function requireVerifiableMembership(Model $parent, string $method, OrdersRelation $declaration, HasMany|MorphMany|BelongsToMany $relation): void
     {
-        $name = sprintf('%s::%s()', $parent::class, $declaration->relation);
+        $name = sprintf('%s::%s()', $parent::class, $method);
 
         if (array_key_exists($name, self::$verifiedMemberships)) {
             return;
@@ -1018,12 +1108,16 @@ final class OrderedRelation
         ];
         $wheres = $relation->getBaseQuery()->wheres;
 
-        foreach ([...self::filteredColumns($name, $wheres, $item->getTable(), $related !== null), ...self::parentColumnsRead($parent, $declaration->relation, $keys->ownerKey)] as $column) {
+        foreach ([...self::filteredColumns($name, $wheres, $item->getTable(), $related !== null), ...self::parentColumnsRead($parent, $method, $keys->ownerKey)] as $column) {
             throw_unless(in_array($column, [...$implicit, ...$declaration->membership], true), LogicException::class, sprintf(
                 '[%s] filters its members by [%s], which its membership does not declare.',
                 $name,
                 $column,
             ));
+        }
+
+        if ($relation instanceof BelongsToMany) {
+            self::requireOrderedThrough($parent, $method, $declaration, $relation);
         }
 
         self::$verifiedMemberships[$name] = true;
@@ -1209,7 +1303,7 @@ final class OrderedRelation
         $column = $item->getDeletedAtColumn();
 
         throw_unless($column === OrderedRelations::DELETED_AT, LogicException::class, sprintf(
-            '[%s::%s()] orders [%s], which soft deletes through [%s]. Ordered relations require the soft delete column [%s], because the order trigger and the rank key queries name it.',
+            '[%s::%s()] orders [%s], which soft deletes through [%s]. Ordered relations require the soft delete column [%s], because the queries that read and clear rank keys name it.',
             $parent::class,
             $name,
             $item::class,
@@ -1231,7 +1325,7 @@ final class OrderedRelation
             'the primary key of the item' => $item->getKeyName(),
         ] as $role => $key) {
             throw_unless($key === self::KEY_NAME, LogicException::class, sprintf(
-                '[%s::%s()] uses [%s] as %s. Ordered relations require the key [%s], because the named revision trigger matches the parent by it.',
+                '[%s::%s()] uses [%s] as %s. Ordered relations require the key [%s].',
                 $parent::class,
                 $name,
                 $key,
@@ -1364,7 +1458,7 @@ final class OrderedRelation
     private static function parentMembershipColumns(Model&OrdersRelations&Revisioned $parent): array
     {
         return array_values(array_unique(array_merge(
-            ...array_map(static fn (OrdersRelation $declaration): array => $declaration->membershipOf($parent->getTable()), self::attributes($parent, OrdersRelation::class)),
+            ...array_map(static fn (array $declared): array => $declared[1]->membershipOf($parent->getTable()), self::orderDeclarations($parent)),
         )));
     }
 
@@ -1557,24 +1651,11 @@ final class OrderedRelation
     {
         $copy = OrderWrite::copy($item, self::timestamps($item, $this->keys->item))
             ?? throw new LogicException(sprintf('[%s:%s] has no row to write.', $item::class, self::keyOf($item)));
-        $written = OrderWrite::save($copy, $attributes);
+        $written = [
+            ...OrderWrite::save($copy, $attributes),
+            ...array_intersect_key($copy->getAttributes(), [SelectsConcurrencyRevision::ATTRIBUTE => true]),
+        ];
         $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
-
-        if ($item instanceof Revisioned) {
-            $item->refreshConcurrencyRevisions();
-        }
-    }
-
-    private function raise(): void
-    {
-        $column = $this->column();
-        $copy = OrderWrite::copy($this->parent, timestamps: false);
-
-        if ($copy !== null) {
-            OrderWrite::save($copy, [$column => new Expression(sprintf('%s + 1', $copy->getConnection()->getQueryGrammar()->wrap($column)))]);
-        }
-
-        $this->fillParent($this->parentRow()->useWritePdo()->value($column));
     }
 
     /**
@@ -1750,24 +1831,10 @@ final class OrderedRelation
             $this->parent->setRawAttributes(array_replace($this->parent->getAttributes(), $declared));
             $this->parent->syncOriginalAttributes(array_keys($declared));
         }
-
-        $this->fillParent($row[$this->column()] ?? null);
     }
 
     private function parentRow(): Builder
     {
         return $this->parent->newQueryWithoutScopes()->whereKey($this->parent->getKey())->toBase();
-    }
-
-    private function column(): string
-    {
-        return $this->parent->concurrencyRevisionColumn($this->revision);
-    }
-
-    private function fillParent(mixed $revision): void
-    {
-        $column = $this->column();
-
-        $this->parent->forceFill([$column => intval($revision)])->syncOriginalAttributes([$column]);
     }
 }
