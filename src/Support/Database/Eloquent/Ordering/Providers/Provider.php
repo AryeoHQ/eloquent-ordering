@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Support\Facades\Event;
 use Illuminate\Support\ServiceProvider;
 use LogicException;
@@ -15,6 +16,7 @@ use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
+use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Support\Database\Eloquent\Ordering\Schema\Macros;
@@ -36,6 +38,10 @@ class Provider extends ServiceProvider
 
         Builder::macro('withoutPositions', function (): Builder {
             return $this->withoutGlobalScope(SelectsPosition::class);
+        });
+
+        Relation::macro('arrange', /** @param list<int|string> $ids */ function (array $ids, null|string $expected = null): OrderChange {
+            return OrderedRelation::ordering($this)->arrange($ids, $expected);
         });
 
         Event::listen(['eloquent.creating: *', 'eloquent.updating: *'], self::requirePreparedOrder(...));

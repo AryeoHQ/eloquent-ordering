@@ -12,6 +12,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\Pivot;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
@@ -45,6 +46,7 @@ use Tests\Fixtures\Support\Documents\DocumentKind;
 use Tests\Fixtures\Support\Documents\KindedDocument;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Folders\FolderRevision;
+use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Listings\NamedListing;
@@ -118,8 +120,8 @@ class OrderedRelationTest extends TestCase
     public static function positionedQueries(): iterable
     {
         return Shape::crossed([
-            'a filter' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->whereIn($column, $ids)->get()],
-            'a filter and another order' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->whereIn($column, $ids)->reorder($column, 'desc')->get()],
+            'a filter' => [fn (Relation $relation, string $column, array $ids): iterable => $relation->whereIn($column, $ids)->get()],
+            'a filter and another order' => [fn (Relation $relation, string $column, array $ids): iterable => $relation->whereIn($column, $ids)->reorder($column, 'desc')->get()],
         ]);
     }
 
@@ -129,7 +131,7 @@ class OrderedRelationTest extends TestCase
     public static function untimedPivotWrites(): iterable
     {
         yield 'a reorder' => [
-            fn (Agency $agency, array $ids, Agency $other): OrderChange => $agency->orderedRelation(AgencyRevision::CustomersOrder)->reorder(array_reverse($ids), expected: null),
+            fn (Agency $agency, array $ids, Agency $other): OrderChange => $agency->customers()->arrange(array_reverse($ids)),
             [2, 1, 0],
             [],
         ];
@@ -139,7 +141,7 @@ class OrderedRelationTest extends TestCase
                 $prefix = 'a0'.str_repeat('V', OrderedRelation::MAX_KEY_LENGTH - 3);
                 DB::table('agency_customer')->where('id', $ids[0])->update([OrderedRelation::RANK_KEY => $prefix.'V']);
                 DB::table('agency_customer')->where('id', $ids[1])->update([OrderedRelation::RANK_KEY => $prefix.'W']);
-                $pivot = $agency->orderedRelation(AgencyRevision::CustomersOrder)->query()->get()->all()[2]->getRelation('pivot');
+                $pivot = Shape::inOrder($agency, AgencyRevision::CustomersOrder)->get()->all()[2]->getRelation('pivot');
                 assert($pivot instanceof AgencyCustomer);
 
                 return $pivot->move(Placement::after($ids[0]), expected: null);
@@ -174,10 +176,10 @@ class OrderedRelationTest extends TestCase
         [$parent, $members] = $shape->with(4);
         $shape->add($parent, hidden: true);
         $change = $members[2]->move(Placement::first(), expected: null);
-        $shape->orderedRelation($parent)->query()->get();
+        $shape->ordered($parent)->get();
         DB::enableQueryLog();
 
-        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->get());
+        $positions = $shape->selectedPositions($shape->ordered($parent)->get());
 
         $this->assertCount(1, DB::getQueryLog());
         $this->assertSame(array_combine($change->order, range(1, count($change->order))), $positions);
@@ -190,7 +192,7 @@ class OrderedRelationTest extends TestCase
     {
         [$parent, [, $second, , $fourth]] = $shape->with(4);
 
-        $positions = $shape->selectedPositions($query($shape->orderedRelation($parent), $shape->memberTable().'.id', [$second->getKey(), $fourth->getKey()]));
+        $positions = $shape->selectedPositions($query($shape->ordered($parent), $shape->memberTable().'.id', [$second->getKey(), $fourth->getKey()]));
 
         $this->assertEquals([$second->getKey() => 2, $fourth->getKey() => 4], $positions);
     }
@@ -201,7 +203,7 @@ class OrderedRelationTest extends TestCase
     {
         [$parent, $members] = $shape->with(5);
 
-        $page = $shape->orderedRelation($parent)->query()->paginate(2, page: 2);
+        $page = $shape->ordered($parent)->paginate(2, page: 2);
 
         $this->assertSame(5, $page->total());
         $this->assertSame([$members[2]->getKey() => 3, $members[3]->getKey() => 4], $shape->selectedPositions($page->items()));
@@ -214,7 +216,7 @@ class OrderedRelationTest extends TestCase
         [$parent, [$first, $second, $third]] = $shape->with(3);
         $second->delete();
 
-        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->get());
+        $positions = $shape->selectedPositions($shape->ordered($parent)->get());
 
         $this->assertSame([$first->getKey() => 1, $third->getKey() => 2], $positions);
     }
@@ -226,7 +228,7 @@ class OrderedRelationTest extends TestCase
         [$parent, [$first, $second, $third]] = $shape->with(3);
         Customer::query()->findOrFail($second->getAttribute('customer_id'))->delete();
 
-        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->get());
+        $positions = $shape->selectedPositions($shape->ordered($parent)->get());
 
         $this->assertSame([$first->getKey() => 1, $third->getKey() => 2], $positions);
         $this->assertNull($shape->find($this->key($second))->getAttribute('position'));
@@ -239,7 +241,7 @@ class OrderedRelationTest extends TestCase
         [$parent, [$first, $second, $third]] = $shape->with(3);
         DB::table($shape->memberTable())->where('id', $first->getKey())->update([OrderedRelation::RANK_KEY => null]);
 
-        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->get());
+        $positions = $shape->selectedPositions($shape->ordered($parent)->get());
 
         $this->assertSame([$second->getKey() => 1, $third->getKey() => 2, $first->getKey() => null], $positions);
         $this->assertNull($shape->find($this->key($first))->getAttribute('position'));
@@ -252,7 +254,7 @@ class OrderedRelationTest extends TestCase
         [$listing, [$first, $second, $third]] = $shape->with(3);
         Customer::query()->whereKey([$first->getAttribute('customer_id'), $third->getAttribute('customer_id')])->update(['name' => 'Kept']);
 
-        $results = $shape->orderedRelation($listing)->query()
+        $results = $shape->ordered($listing)
             ->leftJoin('customers as kept', fn (JoinClause $join): JoinClause => $join->on('kept.id', '=', 'customers.id')->where('kept.name', '=', 'Kept'))
             ->addSelect('kept.name as kept_name')
             ->get();
@@ -296,19 +298,26 @@ class OrderedRelationTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_queries_through_the_parents_relation(Shape $shape): void
+    public function it_arranges_through_the_parents_relation_beside_the_reorder_of_its_query(Shape $shape): void
     {
-        $parent = $shape->createParent();
+        [$parent, [$first, $second]] = $shape->with(2);
+        $relation = $shape->relation($parent);
 
-        $query = $shape->orderedRelation($parent)->query();
+        $cleared = $relation->orderByDesc('id')->reorder();
+        $change = $shape->relation($parent)->arrange([$this->key($second), $this->key($first)]);
 
-        $this->assertSame($shape->relationClass(), $query::class);
-        $this->assertSame($parent, $query->getParent());
+        $this->assertSame($shape->relationClass(), $relation::class);
+        $this->assertSame($relation, $cleared);
+        $this->assertSame([], $cleared->getBaseQuery()->orders ?? []);
+        $this->assertSame($parent, $change->parent);
+        $this->assertSame($shape->revision(), $change->revision);
+        $this->assertSame([$second->getKey(), $first->getKey()], $change->order);
+        $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($parent));
     }
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_drops_every_global_scope_except_soft_deletes(Shape $shape): void
+    public function it_arranges_every_member_a_global_scope_hides_but_no_trashed_member(Shape $shape): void
     {
         $parent = $shape->createParent();
         $hidden = $shape->add($parent, hidden: true);
@@ -316,8 +325,11 @@ class OrderedRelationTest extends TestCase
         $visible = $shape->add($parent);
 
         $trashed->delete();
+        $change = $shape->arrange($parent, [$this->key($visible), $this->key($hidden)]);
 
-        $this->assertSame([$hidden->getKey(), $visible->getKey()], $shape->members($parent));
+        $this->assertSame([$visible->getKey(), $hidden->getKey()], $change->order);
+        $this->assertSame([$visible->getKey(), $hidden->getKey()], $shape->members($parent));
+        $this->assertRejected($shape, MembershipMismatch::class, $parent, fn (): OrderChange => $shape->arrange($parent, [$this->key($visible)]));
     }
 
     #[DataProvider('shapes')]
@@ -326,10 +338,9 @@ class OrderedRelationTest extends TestCase
     {
         [$parent] = $shape->with(2);
 
-        $digest = $shape->orderedRelation($parent)->concurrencyRevision();
+        $digest = $parent->concurrencyRevision($shape->revision());
 
         $this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/D', $digest);
-        $this->assertSame($parent->concurrencyRevision($shape->revision()), $digest);
         $this->assertNotSame(substr(hash('sha256', ''), 0, 32), $digest);
     }
 
@@ -339,7 +350,7 @@ class OrderedRelationTest extends TestCase
     {
         $parent = $shape->createParent();
 
-        $this->assertSame(substr(hash('sha256', ''), 0, 32), $shape->orderedRelation($parent)->concurrencyRevision());
+        $this->assertSame(substr(hash('sha256', ''), 0, 32), $parent->concurrencyRevision($shape->revision()));
     }
 
     #[DataProvider('shapes')]
@@ -347,10 +358,9 @@ class OrderedRelationTest extends TestCase
     public function it_reorders_every_member(Shape $shape): void
     {
         [$parent, [$first, $second, $third, $fourth]] = $shape->with(4);
-        $relation = $shape->orderedRelation($parent);
         $digest = $shape->digest($parent);
 
-        $change = $relation->reorder([(string) $this->key($third), (string) $this->key($second), (string) $this->key($first), (string) $this->key($fourth)], expected: $digest);
+        $change = $shape->arrange($parent, [(string) $this->key($third), (string) $this->key($second), (string) $this->key($first), (string) $this->key($fourth)], expected: $digest);
 
         $this->assertSame([$third->getKey(), $second->getKey(), $first->getKey(), $fourth->getKey()], $shape->members($parent));
         $this->assertSame([$third->getKey(), $second->getKey(), $first->getKey(), $fourth->getKey()], $change->order);
@@ -358,11 +368,12 @@ class OrderedRelationTest extends TestCase
             ['id' => $this->key($third), 'position' => 1, 'previousPosition' => 3],
             ['id' => $this->key($first), 'position' => 3, 'previousPosition' => 1],
         ], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($relation, $change->relation);
+        $this->assertSame($parent, $change->parent);
+        $this->assertSame($shape->revision(), $change->revision);
         $this->assertNull($change->source);
-        $this->assertNotSame($digest, $change->revision);
-        $this->assertSame($shape->digest($parent), $change->revision);
-        $this->assertSame($change->revision, $parent->concurrencyRevision($shape->revision()));
+        $this->assertNotSame($digest, $change->digest);
+        $this->assertSame($shape->digest($parent), $change->digest);
+        $this->assertSame($change->digest, $parent->concurrencyRevision($shape->revision()));
         $this->assertFalse($parent->isDirty());
     }
 
@@ -373,7 +384,7 @@ class OrderedRelationTest extends TestCase
         [$parent, [$first, $second]] = $shape->with(2);
         DB::enableQueryLog();
 
-        $shape->orderedRelation($parent)->reorder([$this->key($second), $this->key($first)], expected: $shape->digest($parent));
+        $shape->arrange($parent, [$this->key($second), $this->key($first)], expected: $shape->digest($parent));
 
         $statements = array_column(DB::getQueryLog(), 'query');
         $lock = array_find_key($statements, fn (string $statement): bool => str_contains($statement, sprintf('from "%s"', $shape->parentTable())) && str_ends_with($statement, 'for no key update'));
@@ -395,7 +406,7 @@ class OrderedRelationTest extends TestCase
         [, [$foreign]] = $shape->with(1);
         $keys = array_map(fn (Model $member): int|string => $this->key($member), $members);
 
-        $this->assertRejected($shape, MembershipMismatch::class, $parent, fn (): OrderChange => $shape->orderedRelation($parent)->reorder($ids($keys, $this->key($foreign)), expected: $shape->digest($parent)));
+        $this->assertRejected($shape, MembershipMismatch::class, $parent, fn (): OrderChange => $shape->arrange($parent, $ids($keys, $this->key($foreign)), expected: $shape->digest($parent)));
         $this->assertSame($keys, $shape->members($parent));
     }
 
@@ -407,7 +418,7 @@ class OrderedRelationTest extends TestCase
         $trashed->delete();
         $revision = $shape->digest($parent);
 
-        $this->assertRejected($shape, MembershipMismatch::class, $parent, fn (): OrderChange => $shape->orderedRelation($parent)->reorder([$this->key($third), $this->key($trashed), $this->key($first)], expected: $revision));
+        $this->assertRejected($shape, MembershipMismatch::class, $parent, fn (): OrderChange => $shape->arrange($parent, [$this->key($third), $this->key($trashed), $this->key($first)], expected: $revision));
     }
 
     #[DataProvider('shapes')]
@@ -416,7 +427,7 @@ class OrderedRelationTest extends TestCase
     {
         [$parent, $first, $second, $stale] = $this->withStaleDigest($shape);
 
-        $this->assertRejected($shape, StaleConcurrencyRevision::class, $parent, fn (): OrderChange => $shape->orderedRelation($parent)->reorder([$this->key($second), $this->key($first)], expected: $stale));
+        $this->assertRejected($shape, StaleConcurrencyRevision::class, $parent, fn (): OrderChange => $shape->arrange($parent, [$this->key($second), $this->key($first)], expected: $stale));
         $this->assertSame([$first->getKey(), $second->getKey()], $shape->members($parent));
     }
 
@@ -426,7 +437,7 @@ class OrderedRelationTest extends TestCase
     {
         [$parent, $first, $second, $stale] = $this->withStaleDigest($shape);
 
-        $this->assertRejected($shape, StaleConcurrencyRevision::class, $parent, fn (): OrderChange => $shape->orderedRelation($parent)->reorder([$this->key($first), $this->key($second)], expected: $stale));
+        $this->assertRejected($shape, StaleConcurrencyRevision::class, $parent, fn (): OrderChange => $shape->arrange($parent, [$this->key($first), $this->key($second)], expected: $stale));
     }
 
     #[DataProvider('shapes')]
@@ -435,11 +446,11 @@ class OrderedRelationTest extends TestCase
     {
         [$parent, $first, $second, $stale] = $this->withStaleDigest($shape);
 
-        $change = $shape->orderedRelation($parent)->reorder([$this->key($second), $this->key($first)], expected: null);
+        $change = $shape->arrange($parent, [$this->key($second), $this->key($first)], expected: null);
 
         $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($parent));
-        $this->assertNotSame($stale, $change->revision);
-        $this->assertSame($shape->digest($parent), $change->revision);
+        $this->assertNotSame($stale, $change->digest);
+        $this->assertSame($shape->digest($parent), $change->digest);
     }
 
     /**
@@ -450,17 +461,16 @@ class OrderedRelationTest extends TestCase
     public function it_writes_nothing_for_a_reorder_that_keeps_the_order(Shape $shape, int $count, Closure $reorder, bool $compare): void
     {
         [$parent, $members] = $shape->with($count);
-        $relation = $shape->orderedRelation($parent);
         $revision = $shape->digest($parent);
         $keys = $shape->rankKeys($parent);
         $ids = array_map(fn (Model $member): int|string => $this->key($member), $members);
         DB::enableQueryLog();
 
-        $change = $relation->reorder($reorder($ids), $compare ? $revision : null);
+        $change = $shape->arrange($parent, $reorder($ids), $compare ? $revision : null);
 
         $this->assertSame([], $this->writes());
         $this->assertSame([], $change->changed);
-        $this->assertSame($revision, $change->revision);
+        $this->assertSame($revision, $change->digest);
         $this->assertSame($ids, $change->order);
         $this->assertSame($revision, $shape->digest($parent));
         $this->assertSame($keys, $shape->rankKeys($parent));
@@ -472,23 +482,23 @@ class OrderedRelationTest extends TestCase
         $section = Section::create();
         $zebra = $this->addAsset($section, 'Zebra');
         $alpha = $this->addAsset($section, 'Alpha');
-        $relation = $this->titleOrderedSection($section)->orderedRelation(SectionRevision::AssetsOrder);
+        $parent = $this->titleOrderedSection($section);
 
-        $this->assertSame([$zebra->id, $alpha->id], $relation->query()->pluck('assets.id')->all());
+        $this->assertSame([$alpha->id => 2, $zebra->id => 1], Shape::relationOf($parent, SectionRevision::AssetsOrder)->get()->pluck('position', 'id')->all());
 
-        $unchanged = $relation->reorder([$zebra->id, $alpha->id], expected: null);
+        $unchanged = Shape::relationOf($parent, SectionRevision::AssetsOrder)->arrange([$zebra->id, $alpha->id]);
 
         $this->assertSame([], $unchanged->changed);
         $this->assertSame([$zebra->id, $alpha->id], $unchanged->order);
 
-        $change = $relation->reorder([$alpha->id, $zebra->id], expected: null);
+        $change = Shape::relationOf($parent, SectionRevision::AssetsOrder)->arrange([$alpha->id, $zebra->id]);
 
         $this->assertSame([$alpha->id, $zebra->id], $change->order);
         $this->assertSame([
             ['id' => $alpha->id, 'position' => 1, 'previousPosition' => 2],
             ['id' => $zebra->id, 'position' => 2, 'previousPosition' => 1],
         ], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame([$alpha->id, $zebra->id], $relation->query()->pluck('assets.id')->all());
+        $this->assertSame([$alpha->id => 1, $zebra->id => 2], Shape::relationOf($parent, SectionRevision::AssetsOrder)->get()->pluck('position', 'id')->all());
     }
 
     #[Test]
@@ -516,7 +526,7 @@ class OrderedRelationTest extends TestCase
             }
         })->newQuery()->findOrFail($section->id);
 
-        $change = $parent->orderedRelation(SectionRevision::AssetsOrder)->reorder([$last->id, $first->id], expected: null);
+        $change = Shape::relationOf($parent, SectionRevision::AssetsOrder)->arrange([$last->id, $first->id], expected: null);
 
         $this->assertSame([$last->id, $first->id], $change->order);
         $this->assertSame([$last->id, $first->id, $excluded->id], DB::table('assets')->where('section_id', $section->id)->orderBy('rank_key')->pluck('id')->all());
@@ -547,7 +557,7 @@ class OrderedRelationTest extends TestCase
             }
         })->newQuery()->findOrFail($section->id);
 
-        $change = $parent->orderedRelation(SectionRevision::AssetsOrder)->reorder([$trashed->id, $first->id], expected: null);
+        $change = Shape::relationOf($parent, SectionRevision::AssetsOrder)->arrange([$trashed->id, $first->id], expected: null);
 
         $this->assertSame([$trashed->id, $first->id], $change->order);
     }
@@ -558,7 +568,7 @@ class OrderedRelationTest extends TestCase
     {
         [$parent, [$first, $second]] = $shape->with(2);
 
-        $change = $shape->orderedRelation($parent)->reorder([strtoupper((string) $this->key($second)), strtoupper((string) $this->key($first))], expected: $shape->digest($parent));
+        $change = $shape->arrange($parent, [strtoupper((string) $this->key($second)), strtoupper((string) $this->key($first))], expected: $shape->digest($parent));
 
         $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($parent));
         $this->assertSame([$second->getKey(), $first->getKey()], $change->order);
@@ -571,7 +581,7 @@ class OrderedRelationTest extends TestCase
         [$listing, [$first, $second]] = $shape->with(2);
         $parent = $this->parentOfPivot($listing, $this->integerKeyedPivot());
 
-        $change = $parent->orderedRelation(ListingRevision::CustomersOrder)->reorder([(string) $this->key($second), (string) $this->key($first)], expected: null);
+        $change = Shape::relationOf($parent, ListingRevision::CustomersOrder)->arrange([(string) $this->key($second), (string) $this->key($first)], expected: null);
 
         $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($listing));
         $this->assertSame([$second->getKey(), $first->getKey()], $change->order);
@@ -584,10 +594,37 @@ class OrderedRelationTest extends TestCase
         [$listing, [$first, $second]] = $shape->with(2);
         $parent = $this->parentOfPivot($listing, $this->stringKeyedPivot());
 
-        $change = $parent->orderedRelation(ListingRevision::CustomersOrder)->reorder([strtoupper((string) $this->key($second)), strtoupper((string) $this->key($first))], expected: null);
+        $change = Shape::relationOf($parent, ListingRevision::CustomersOrder)->arrange([strtoupper((string) $this->key($second)), strtoupper((string) $this->key($first))], expected: null);
 
         $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($listing));
         $this->assertSame([$second->getKey(), $first->getKey()], $change->order);
+    }
+
+    #[Test]
+    public function it_arranges_each_of_two_pivot_relations_to_one_related_class_in_its_own_order(): void
+    {
+        $shape = new BelongsToManyShape;
+        $customers = [Customer::create()->id, Customer::create()->id, Customer::create()->id];
+        $listing = Listing::create();
+        $agency = Agency::create(['id' => $listing->id]);
+        $listing->customers()->attach($customers);
+        $agency->customers()->attach($customers);
+        $parent = $this->parentOfTwoPivotRelations($listing);
+        [$listed, $represented] = [$shape->members($listing), $this->agencyMembers($agency)];
+
+        $listings = Shape::relationOf($parent, ListingRevision::CustomersOrder)->arrange(array_reverse($listed));
+
+        $this->assertSame(ListingRevision::CustomersOrder, $listings->revision);
+        $this->assertSame(array_reverse($listed), $listings->order);
+        $this->assertSame(array_reverse($listed), $shape->members($listing));
+        $this->assertSame($represented, $this->agencyMembers($agency));
+
+        $agencies = Shape::relationOf($parent, ListingRevision::ScenesOrder)->arrange([$represented[1], $represented[2], $represented[0]]);
+
+        $this->assertSame(ListingRevision::ScenesOrder, $agencies->revision);
+        $this->assertSame([$represented[1], $represented[2], $represented[0]], $agencies->order);
+        $this->assertSame([$represented[1], $represented[2], $represented[0]], $this->agencyMembers($agency));
+        $this->assertSame(array_reverse($listed), $shape->members($listing));
     }
 
     #[DataProvider('pivots')]
@@ -599,13 +636,13 @@ class OrderedRelationTest extends TestCase
         config()->set('database.default', 'sqlite');
 
         try {
-            $change = $shape->orderedRelation($parent)->reorder([$this->key($second), $this->key($first)], expected: null);
+            $change = $shape->arrange($parent, [$this->key($second), $this->key($first)], expected: null);
         } finally {
             config()->set('database.default', $default);
         }
 
         $this->assertSame([$second->getKey(), $first->getKey()], $shape->members($parent));
-        $this->assertSame($shape->digest($parent), $change->revision);
+        $this->assertSame($shape->digest($parent), $change->digest);
     }
 
     #[DataProvider('shapes')]
@@ -618,7 +655,7 @@ class OrderedRelationTest extends TestCase
         $revision = $shape->digest($parent);
         $events = ModelEvents::record();
 
-        $shape->orderedRelation($parent)->reorder([$this->key($third), $this->key($second), $this->key($first)], expected: null);
+        $shape->arrange($parent, [$this->key($third), $this->key($second), $this->key($first)], expected: null);
 
         $this->assertSame($rows[1], ModelEvents::row($second));
         $this->assertSame([
@@ -662,7 +699,7 @@ class OrderedRelationTest extends TestCase
         $before = $stamps();
         $this->travel(1)->minutes();
 
-        $shape->orderedRelation($parent)->reorder([$this->key($third), $this->key($second), $this->key($first)], expected: null);
+        $shape->arrange($parent, [$this->key($third), $this->key($second), $this->key($first)], expected: null);
 
         $this->assertSame([now()->toDateTimeString(), $before[1], now()->toDateTimeString(), $before[3]], $stamps());
     }
@@ -694,7 +731,7 @@ class OrderedRelationTest extends TestCase
         $moving->playlist()->associate($video);
 
         $this->assertTrue($moving->save());
-        $this->assertNull($video->orderedRelation(PlaylistRevision::TracksOrder)->memberPosition($moving));
+        $this->assertNull(Track::query()->findOrFail($moving->id)->position);
         $this->assertNull($moving->position);
         $this->assertSame([[$audio->id, [[$moving->id, null, 2]]]], $this->reorders);
         $this->assertNotSame($revisions[0], $this->tracksRevision($audio));
@@ -714,10 +751,10 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([[$audio->id, [[$moving->id, null, 2]]]], $this->reorders);
         $this->assertNotSame($revisions[0], $this->tracksRevision($audio));
         $this->assertSame($revisions[1], $this->tracksRevision($video));
-        $this->assertSame($video, $change->relation->parent);
+        $this->assertSame($video, $change->parent);
         $this->assertSame([$held->id], $change->order);
         $this->assertSame([[$moving->id, null, null]], array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $change->changed));
-        $this->assertSame($audio->id, $change->source?->relation->parent->getKey());
+        $this->assertSame($audio->id, $change->source?->parent->getKey());
     }
 
     #[Test]
@@ -731,7 +768,7 @@ class OrderedRelationTest extends TestCase
         $rebalanced = [];
 
         Event::listen(Rebalanced::class, function (Rebalanced $event) use (&$rebalanced): void {
-            $rebalanced[] = [$event->relation->parent->getKey(), $event->ids];
+            $rebalanced[] = [$event->parent->getKey(), $event->ids];
         });
 
         $moving->move(Placement::after($first->id)->in($video), expected: null);
@@ -747,7 +784,7 @@ class OrderedRelationTest extends TestCase
     public function it_refuses_a_relation_whose_membership_filter_it_cannot_verify(Closure $parent, NamesConcurrencyRevision $revision, string $message): void
     {
         try {
-            $parent()->orderedRelation($revision);
+            $parent()->concurrencyRevision($revision);
             $this->fail('A relation whose membership filter cannot be verified was resolved.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString($message, $exception->getMessage());
@@ -761,7 +798,7 @@ class OrderedRelationTest extends TestCase
     #[Test]
     public function it_resolves_a_relation_whose_membership_filter_it_verifies(Closure $parent, NamesConcurrencyRevision $revision): void
     {
-        $this->assertSame($revision, $parent()->orderedRelation($revision)->revision);
+        $this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/D', $parent()->concurrencyRevision($revision));
     }
 
     /**
@@ -1162,7 +1199,7 @@ class OrderedRelationTest extends TestCase
                     ->where('title', 'Shown')
                     ->whereNotNull('assets.title')
                     ->whereIn('assets.visible', [true])
-                    ->whereColumn('assets.title', '!=', 'assets.visible');
+                    ->whereColumn('assets.visible', '=', 'assets.visible');
             }
         }, SectionRevision::AssetsOrder];
 
@@ -1321,12 +1358,44 @@ class OrderedRelationTest extends TestCase
         return $parent;
     }
 
+    private function parentOfTwoPivotRelations(Listing $listing): Model&OrdersRelations&Revisioned
+    {
+        $parent = (new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Model, $this, ListingCustomer>
+             */
+            #[OrdersRelation(ListingRevision::CustomersOrder)]
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(OrderedRelationTest::unwatchedCustomer(), 'listing_customer', 'listing_id', 'customer_id')->using(ListingCustomer::class)->wherePivotNull('deleted_at');
+            }
+
+            /**
+             * @return BelongsToMany<Model, $this, AgencyCustomer>
+             */
+            #[OrdersRelation(ListingRevision::ScenesOrder)]
+            public function agencyCustomers(): BelongsToMany
+            {
+                return $this->belongsToMany(OrderedRelationTest::unwatchedCustomer(), 'agency_customer', 'agency_id', 'customer_id')->using(AgencyCustomer::class)->wherePivotNull('deleted_at');
+            }
+        })->newQuery()->findOrFail($listing->id);
+        assert($parent instanceof OrdersRelations && $parent instanceof Revisioned);
+
+        return $parent;
+    }
+
     /**
      * @return list<string>
      */
     private function agencyMembers(Agency $agency): array
     {
-        return $agency->orderedRelation(AgencyRevision::CustomersOrder)->query()->get()->map(function (Model $customer): string {
+        return Shape::inOrder($agency, AgencyRevision::CustomersOrder)->get()->map(function (Model $customer): string {
             $key = $customer->getRelation('pivot')?->getKey();
             assert(is_string($key));
 
@@ -1360,7 +1429,7 @@ class OrderedRelationTest extends TestCase
     {
         Event::listen(Reordered::class, function (Reordered $event): void {
             $this->reorders[] = [
-                $event->change->relation->parent->getKey(),
+                $event->change->parent->getKey(),
                 array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $event->change->changed),
             ];
         });

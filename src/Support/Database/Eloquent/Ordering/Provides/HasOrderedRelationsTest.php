@@ -64,11 +64,11 @@ class HasOrderedRelationsTest extends TestCase
     private array $reorders = [];
 
     /**
-     * @return iterable<string, array{Closure(): (Model&OrdersRelations), NamesConcurrencyRevision, string}>
+     * @return iterable<string, array{Closure(): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision, string}>
      */
     public static function softDeleteColumns(): iterable
     {
-        yield 'has many' => [static function (): Model&OrdersRelations {
+        yield 'has many' => [static function (): Model&OrdersRelations&Revisioned {
             $item = new class extends Model implements Ordered
             {
                 use IsOrdered;
@@ -103,7 +103,7 @@ class HasOrderedRelationsTest extends TestCase
             return $parent;
         }, SectionRevision::AssetsOrder, 'assets()'];
 
-        yield 'morph many' => [static function (): Model&OrdersRelations {
+        yield 'morph many' => [static function (): Model&OrdersRelations&Revisioned {
             $item = new class extends Model implements Ordered
             {
                 use IsOrdered;
@@ -138,7 +138,7 @@ class HasOrderedRelationsTest extends TestCase
             return $parent;
         }, TourRevision::ScenesOrder, 'scenes()'];
 
-        yield 'belongs to many' => [static function (): Model&OrdersRelations {
+        yield 'belongs to many' => [static function (): Model&OrdersRelations&Revisioned {
             $pivot = new class extends Pivot implements Ordered
             {
                 use IsOrdered;
@@ -173,7 +173,7 @@ class HasOrderedRelationsTest extends TestCase
             return $parent;
         }, ListingRevision::CustomersOrder, 'customers()'];
 
-        yield 'morph to many' => [static function (): Model&OrdersRelations {
+        yield 'morph to many' => [static function (): Model&OrdersRelations&Revisioned {
             $pivot = new class extends MorphPivot implements Ordered
             {
                 use IsOrdered;
@@ -210,11 +210,11 @@ class HasOrderedRelationsTest extends TestCase
     }
 
     /**
-     * @return iterable<string, array{Closure(string): (Model&OrdersRelations), NamesConcurrencyRevision, string}>
+     * @return iterable<string, array{Closure(string): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision, string}>
      */
     public static function ownerKeys(): iterable
     {
-        yield 'has many' => [static function (string $ownerKey): Model&OrdersRelations {
+        yield 'has many' => [static function (string $ownerKey): Model&OrdersRelations&Revisioned {
             $parent = new class extends Model implements OrdersRelations, Revisioned
             {
                 use HasConcurrencyRevisions;
@@ -238,7 +238,7 @@ class HasOrderedRelationsTest extends TestCase
             return $parent;
         }, SectionRevision::AssetsOrder, 'assets()'];
 
-        yield 'morph many' => [static function (string $ownerKey): Model&OrdersRelations {
+        yield 'morph many' => [static function (string $ownerKey): Model&OrdersRelations&Revisioned {
             $parent = new class extends Model implements OrdersRelations, Revisioned
             {
                 use HasConcurrencyRevisions;
@@ -262,7 +262,7 @@ class HasOrderedRelationsTest extends TestCase
             return $parent;
         }, TourRevision::ScenesOrder, 'scenes()'];
 
-        yield 'belongs to many' => [static function (string $ownerKey): Model&OrdersRelations {
+        yield 'belongs to many' => [static function (string $ownerKey): Model&OrdersRelations&Revisioned {
             $parent = new class extends Model implements OrdersRelations, Revisioned
             {
                 use HasConcurrencyRevisions;
@@ -286,7 +286,7 @@ class HasOrderedRelationsTest extends TestCase
             return $parent;
         }, ListingRevision::CustomersOrder, 'customers()'];
 
-        yield 'morph to many' => [static function (string $ownerKey): Model&OrdersRelations {
+        yield 'morph to many' => [static function (string $ownerKey): Model&OrdersRelations&Revisioned {
             $parent = new class extends Model implements OrdersRelations, Revisioned
             {
                 use HasConcurrencyRevisions;
@@ -419,18 +419,18 @@ class HasOrderedRelationsTest extends TestCase
         $this->assertSame($digests[0], $video->fresh()?->concurrencyRevision());
         $this->assertNotSame($digests[1], $video->concurrencyRevision(VideoRevision::ClipsOrder));
         $this->assertSame([], array_values(array_filter(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => str_contains($query, 'from "sections"'))));
-        $this->assertSame([$moved->id, $first->id], $video->orderedRelation(VideoRevision::ClipsOrder)->query()->pluck('id')->all());
+        $this->assertSame([$moved->id, $first->id], Shape::inOrder($video, VideoRevision::ClipsOrder)->pluck('id')->all());
     }
 
     #[Test]
-    public function it_returns_the_ordered_relation_of_a_revision(): void
+    public function it_arranges_the_order_its_relation_declares(): void
     {
         $section = Section::create();
 
-        $relation = $section->orderedRelation(SectionRevision::AssetsOrder);
+        $change = $section->assets()->arrange([]);
 
-        $this->assertSame($section, $relation->parent);
-        $this->assertSame(SectionRevision::AssetsOrder, $relation->revision);
+        $this->assertSame($section, $change->parent);
+        $this->assertSame(SectionRevision::AssetsOrder, $change->revision);
     }
 
     #[Test]
@@ -446,11 +446,14 @@ class HasOrderedRelationsTest extends TestCase
     }
 
     #[Test]
-    public function it_rejects_a_revision_that_orders_no_relation(): void
+    public function it_rejects_an_arrangement_of_a_relation_that_orders_nothing(): void
     {
-        $this->expectException(LogicException::class);
-
-        Section::create()->orderedRelation(SectionRevision::FeaturedAssetsOrder);
+        try {
+            Section::create()->hasMany(Clip::class)->arrange([]);
+            $this->fail('A relation that orders nothing was arranged.');
+        } catch (LogicException $exception) {
+            $this->assertSame(sprintf('The [%s] relation of [%s] to [%s] orders nothing.', HasMany::class, Section::class, Clip::class), $exception->getMessage());
+        }
     }
 
     #[Test]
@@ -470,8 +473,8 @@ class HasOrderedRelationsTest extends TestCase
         $section = Section::create();
         $video = $this->addVideo($section);
 
-        $item = $video->orderingRelation();
-        $parent = $video->orderedRelation(VideoRevision::ClipsOrder);
+        $item = $video->move(Placement::last(), expected: null);
+        $parent = $video->clips()->arrange([]);
 
         $this->assertSame($section, $item->parent);
         $this->assertSame(SectionRevision::VideosOrder, $item->revision);
@@ -497,16 +500,16 @@ class HasOrderedRelationsTest extends TestCase
         $this->assertSame($digests[0], $section->concurrencyRevision(SectionRevision::VideosOrder));
         $this->assertSame($digests[1], $video->fresh()?->concurrencyRevision());
         $this->assertNotSame($digests[2], $video->concurrencyRevision(VideoRevision::ClipsOrder));
-        $this->assertSame([$clip->id], $video->orderedRelation(VideoRevision::ClipsOrder)->query()->pluck('id')->all());
+        $this->assertSame([$clip->id], Shape::inOrder($video, VideoRevision::ClipsOrder)->pluck('id')->all());
     }
 
     #[Test]
-    public function it_gives_each_role_only_its_own_relation_method(): void
+    public function it_gives_neither_role_a_method_that_returns_its_order(): void
     {
-        $this->assertTrue((new ReflectionClass(Section::class))->hasMethod('orderedRelation'));
-        $this->assertFalse((new ReflectionClass(Section::class))->hasMethod('orderingRelation'));
-        $this->assertTrue((new ReflectionClass(Asset::class))->hasMethod('orderingRelation'));
-        $this->assertFalse((new ReflectionClass(Asset::class))->hasMethod('orderedRelation'));
+        $this->assertSame([], (new ReflectionClass(OrdersRelations::class))->getMethods());
+        $this->assertFalse((new ReflectionClass(Section::class))->hasMethod('orderedRelation'));
+        $this->assertFalse((new ReflectionClass(Video::class))->hasMethod('orderingRelation'));
+        $this->assertFalse((new ReflectionClass(Asset::class))->hasMethod('orderingRelation'));
     }
 
     #[Test]
@@ -539,7 +542,7 @@ class HasOrderedRelationsTest extends TestCase
         };
 
         try {
-            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $parent->concurrencyRevision(SectionRevision::AssetsOrder);
             $this->fail('A parent that orders one item class in two relations was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString('in more than one relation', $exception->getMessage());
@@ -568,7 +571,7 @@ class HasOrderedRelationsTest extends TestCase
 
         $this->expectException(LogicException::class);
 
-        $parent->orderedRelation(SectionRevision::AssetsOrder);
+        $parent->concurrencyRevision(SectionRevision::AssetsOrder);
     }
 
     #[Test]
@@ -591,7 +594,7 @@ class HasOrderedRelationsTest extends TestCase
         $parent->save();
 
         try {
-            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $parent->hasMany(Asset::class, 'section_id')->arrange([]);
             $this->fail('A method that declares no HasMany relation was accepted.');
         } catch (LogicException) {
             $this->assertTrue(DB::table('sections')->where('id', $parent->getKey())->exists());
@@ -619,7 +622,7 @@ class HasOrderedRelationsTest extends TestCase
         };
 
         try {
-            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $parent->concurrencyRevision(SectionRevision::AssetsOrder);
             $this->fail('A BelongsToMany relation without an Ordered pivot was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString('must name an Ordered pivot class through using()', $exception->getMessage());
@@ -647,7 +650,7 @@ class HasOrderedRelationsTest extends TestCase
         };
 
         try {
-            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $parent->concurrencyRevision(SectionRevision::AssetsOrder);
             $this->fail('The inverse side of a MorphToMany relation was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString('inverse side of a MorphToMany relation', $exception->getMessage());
@@ -675,7 +678,7 @@ class HasOrderedRelationsTest extends TestCase
         };
 
         try {
-            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $parent->concurrencyRevision(SectionRevision::AssetsOrder);
             $this->fail('A HasMany relation with a custom owner key was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString($parent::class, $exception->getMessage());
@@ -707,7 +710,7 @@ class HasOrderedRelationsTest extends TestCase
         };
 
         try {
-            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $parent->concurrencyRevision(SectionRevision::AssetsOrder);
             $this->fail('A parent whose primary key is not named id was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString($parent::class, $exception->getMessage());
@@ -752,7 +755,7 @@ class HasOrderedRelationsTest extends TestCase
         $parent->itemClass = $item::class;
 
         try {
-            $parent->orderedRelation(SectionRevision::AssetsOrder);
+            $parent->concurrencyRevision(SectionRevision::AssetsOrder);
             $this->fail('An item whose primary key is not named id was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString($parent::class, $exception->getMessage());
@@ -782,7 +785,7 @@ class HasOrderedRelationsTest extends TestCase
         };
 
         try {
-            $parent->orderedRelation(ListingRevision::CustomersOrder);
+            $parent->concurrencyRevision(ListingRevision::CustomersOrder);
             $this->fail('A BelongsToMany relation with a custom parent key was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString($parent::class, $exception->getMessage());
@@ -827,7 +830,7 @@ class HasOrderedRelationsTest extends TestCase
         $parent->pivotClass = $pivot::class;
 
         try {
-            $parent->orderedRelation(ListingRevision::CustomersOrder);
+            $parent->concurrencyRevision(ListingRevision::CustomersOrder);
             $this->fail('A pivot whose primary key is not named id was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString($parent::class, $exception->getMessage());
@@ -837,7 +840,7 @@ class HasOrderedRelationsTest extends TestCase
     }
 
     /**
-     * @param  Closure(): (Model&OrdersRelations)  $parent
+     * @param  Closure(): (Model&OrdersRelations&Revisioned)  $parent
      */
     #[DataProvider('softDeleteColumns')]
     #[Test]
@@ -847,7 +850,7 @@ class HasOrderedRelationsTest extends TestCase
 
         foreach (['first', 'second'] as $call) {
             try {
-                $parent->orderedRelation($revision);
+                $parent->concurrencyRevision($revision);
                 $this->fail(sprintf('The %s call accepted an item that soft deletes through [removed_at].', $call));
             } catch (LogicException $exception) {
                 $this->assertStringContainsString($parent::class, $exception->getMessage());
@@ -879,7 +882,7 @@ class HasOrderedRelationsTest extends TestCase
 
         foreach (['first', 'second', 'third'] as $call) {
             try {
-                $parent->orderedRelation(SectionRevision::AssetsOrder);
+                $parent->concurrencyRevision(SectionRevision::AssetsOrder);
                 $this->fail(sprintf('The %s call accepted a HasMany relation with a custom owner key.', $call));
             } catch (LogicException $exception) {
                 $this->assertStringContainsString('legacy_id', $exception->getMessage());
@@ -888,16 +891,16 @@ class HasOrderedRelationsTest extends TestCase
     }
 
     /**
-     * @param  Closure(string): (Model&OrdersRelations)  $parent
+     * @param  Closure(string): (Model&OrdersRelations&Revisioned)  $parent
      */
     #[DataProvider('ownerKeys')]
     #[Test]
     public function it_validates_a_relation_again_when_another_instance_returns_other_keys(Closure $parent, NamesConcurrencyRevision $revision, string $relation): void
     {
-        $this->assertSame($revision, $parent('id')->orderedRelation($revision)->revision);
+        $this->assertMatchesRegularExpression('/^[0-9a-f]{32}$/D', $parent('id')->concurrencyRevision($revision));
 
         try {
-            $parent('legacy_id')->orderedRelation($revision);
+            $parent('legacy_id')->concurrencyRevision($revision);
             $this->fail('A second instance that returns the owner key [legacy_id] was accepted.');
         } catch (LogicException $exception) {
             $this->assertStringContainsString($relation, $exception->getMessage());
@@ -1010,7 +1013,7 @@ class HasOrderedRelationsTest extends TestCase
         $this->recordReorders();
 
         try {
-            $stale->orderedRelation(PlaylistRevision::TracksOrder)->reorder([$secondVideo->id, $firstVideo->id], $expected);
+            $stale->tracks()->arrange([$secondVideo->id, $firstVideo->id], $expected);
             $this->fail('The reorder accepted the digest of a membership the parent row no longer holds.');
         } catch (StaleConcurrencyRevision) {
         }
@@ -1029,10 +1032,10 @@ class HasOrderedRelationsTest extends TestCase
         $expected = $this->tracksRevision($playlist);
         $this->recordReorders();
 
-        $change = $stale->orderedRelation(PlaylistRevision::TracksOrder)->reorder([$secondVideo->id, $firstVideo->id], $expected);
+        $change = $stale->tracks()->arrange([$secondVideo->id, $firstVideo->id], $expected);
 
         $this->assertSame([$secondVideo->id, $firstVideo->id], $change->order);
-        $this->assertSame([$secondVideo->id, $firstVideo->id], Playlist::query()->findOrFail($playlist->id)->orderedRelation(PlaylistRevision::TracksOrder)->query()->pluck('tracks.id')->all());
+        $this->assertSame([$secondVideo->id, $firstVideo->id], Shape::inOrder(Playlist::query()->findOrFail($playlist->id), PlaylistRevision::TracksOrder)->pluck('tracks.id')->all());
         $this->assertCount(1, $this->reorders);
     }
 
@@ -1178,10 +1181,10 @@ class HasOrderedRelationsTest extends TestCase
         Event::listen(Reordered::class, function (Reordered $event): void {
             $change = $event->change;
             $this->reorders[] = [
-                $change->relation->parent->getKey(),
+                $change->parent->getKey(),
                 $change->order,
                 array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $change->changed),
-                $change->revision,
+                $change->digest,
             ];
         });
     }

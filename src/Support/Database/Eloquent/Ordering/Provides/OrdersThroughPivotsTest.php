@@ -820,11 +820,11 @@ class OrdersThroughPivotsTest extends TestCase
         Event::listen(Reordered::class, function (Reordered $event): void {
             $change = $event->change;
             $this->reorders[] = [
-                $change->relation->parent::class,
-                $change->relation->parent->getKey(),
+                $change->parent::class,
+                $change->parent->getKey(),
                 $change->order,
                 array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $change->changed),
-                $change->revision,
+                $change->digest,
             ];
         });
     }

@@ -5,7 +5,6 @@ declare(strict_types=1);
 use Orchestra\Testbench\Foundation\Application;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
 use Tests\Fixtures\Support\Shelves\Shelf;
-use Tests\Fixtures\Support\Shelves\ShelfRevision;
 
 require __DIR__.'/../../../../vendor/autoload.php';
 
@@ -14,7 +13,7 @@ require __DIR__.'/../../../../vendor/autoload.php';
 Application::create(options: ['extra' => ['providers' => [Provider::class]]]);
 
 try {
-    Shelf::query()->findOrFail($shelf)->orderedRelation(ShelfRevision::BindersOrder)->reorder(array_map(intval(...), explode(',', $ids)), expected: null);
+    Shelf::query()->findOrFail($shelf)->binders()->arrange(array_map(intval(...), explode(',', $ids)));
 
     echo 'reordered';
 } catch (PDOException $exception) {

@@ -42,14 +42,9 @@ trait HasOrderedRelations
             $parent->refilteredOrders = [];
 
             foreach ($refiltered as [$revision, $before]) {
-                $parent->orderedRelation($revision)->refilteredFrom($before);
+                (new OrderedRelation($parent, $revision))->refilteredFrom($before);
             }
         });
-    }
-
-    public function orderedRelation(NamesConcurrencyRevision $revision): OrderedRelation
-    {
-        return new OrderedRelation($this, $revision);
     }
 
     private static function lockOrderingParentsFirst(Model $parent): void

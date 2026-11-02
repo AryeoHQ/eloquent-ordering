@@ -66,9 +66,10 @@ class RebalancedTest extends TestCase
         $rebalanced = $this->dispatched[0];
 
         $this->assertInstanceOf(Rebalanced::class, $rebalanced);
-        $this->assertSame($change->relation, $rebalanced->relation);
+        $this->assertSame($change->parent, $rebalanced->parent);
         $this->assertSame($change->revision, $rebalanced->revision);
-        $this->assertSame($shape->digest($parent), $rebalanced->revision);
+        $this->assertSame($change->digest, $rebalanced->digest);
+        $this->assertSame($shape->digest($parent), $rebalanced->digest);
         $this->assertSame([$first->getKey(), $second->getKey(), $third->getKey()], $rebalanced->ids);
     }
 
@@ -91,7 +92,8 @@ class RebalancedTest extends TestCase
         $this->assertInstanceOf(Rebalanced::class, $rebalanced);
         $this->assertInstanceOf(Reordered::class, $entered);
         $this->assertSame($change->source, $left->change);
-        $this->assertSame($change->relation, $rebalanced->relation);
+        $this->assertSame($change->parent, $rebalanced->parent);
+        $this->assertSame($change->revision, $rebalanced->revision);
         $this->assertSame([$first->getKey(), $second->getKey()], $rebalanced->ids);
         $this->assertSame($change, $entered->change);
     }
@@ -117,9 +119,9 @@ class RebalancedTest extends TestCase
         $rebalanced = $this->dispatched[0];
 
         $this->assertInstanceOf(Rebalanced::class, $rebalanced);
-        $this->assertTrue($parent->is($rebalanced->relation->parent));
-        $this->assertSame($shape->revision(), $rebalanced->relation->revision);
-        $this->assertSame([$digest, $digest], [$rebalanced->revision, $shape->digest($parent)]);
+        $this->assertTrue($parent->is($rebalanced->parent));
+        $this->assertSame($shape->revision(), $rebalanced->revision);
+        $this->assertSame([$digest, $digest], [$rebalanced->digest, $shape->digest($parent)]);
         $this->assertSame([$first->getKey(), $second->getKey()], $rebalanced->ids);
     }
 

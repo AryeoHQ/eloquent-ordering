@@ -52,7 +52,7 @@ class WriteHaltedTest extends TestCase
             'a reorder' => [static function (Shape $shape): array {
                 [$parent, [$first, $second]] = $shape->with(2);
 
-                return [$parent, $second, [$parent], fn (): mixed => $shape->orderedRelation($parent)->reorder([self::keyOf($second), self::keyOf($first)], expected: null)];
+                return [$parent, $second, [$parent], fn (): mixed => $shape->arrange($parent, [self::keyOf($second), self::keyOf($first)], expected: null)];
             }],
             'a soft delete' => [static function (Shape $shape): array {
                 [$parent, [, $member]] = $shape->with(2);

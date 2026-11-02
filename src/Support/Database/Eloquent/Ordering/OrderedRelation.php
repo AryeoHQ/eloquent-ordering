@@ -47,6 +47,9 @@ use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 use Throwable;
 use WeakMap;
 
+/**
+ * @internal
+ */
 final class OrderedRelation
 {
     public const string RANK_KEY = 'rank_key';
@@ -198,6 +201,24 @@ final class OrderedRelation
         self::requireConnectionOf($item, $candidate);
 
         return new self($candidate, $membership['revision']);
+    }
+
+    /**
+     * @param  Relation<*, *, *>  $relation
+     */
+    public static function ordering(Relation $relation): self
+    {
+        $item = $relation instanceof HasMany || $relation instanceof MorphMany || $relation instanceof BelongsToMany ? self::itemClass($relation) : null;
+        $parent = self::asParent($relation->getParent());
+        $declaration = $item === null || $parent === null
+            ? null
+            : array_find(self::declarations($parent), static fn (array $declared): bool => self::itemClass($declared['relation']) === $item);
+
+        if ($declaration === null) {
+            throw new LogicException(sprintf('The [%s] relation of [%s] to [%s] orders nothing.', $relation::class, $relation->getParent()::class, $item ?? $relation->getRelated()::class));
+        }
+
+        return new self($parent, $declaration['declaration']->revision);
     }
 
     /**
@@ -456,11 +477,6 @@ final class OrderedRelation
         return self::timestamps($item, self::membershipNamedBy($item, $item->getAttributes())['keys']->item ?? $item);
     }
 
-    public function concurrencyRevision(): string
-    {
-        return $this->parent->concurrencyRevision($this->revision);
-    }
-
     /**
      * @internal
      */
@@ -507,26 +523,9 @@ final class OrderedRelation
     }
 
     /**
-     * @return HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>
-     */
-    public function query(): Relation
-    {
-        $relation = $this->scopedRelation();
-        $relation->getQuery()->withGlobalScope(SelectsPosition::class, new SelectsPosition);
-
-        if ($relation instanceof BelongsToMany) {
-            $relation->withPivot($this->keys->item->getKeyName());
-        }
-
-        return $relation
-            ->orderBy($this->keys->item->qualifyColumn(self::RANK_KEY))
-            ->orderBy($this->keys->item->getQualifiedKeyName());
-    }
-
-    /**
      * @param  list<int|string>  $ids
      */
-    public function reorder(array $ids, null|string $expected): OrderChange
+    public function arrange(array $ids, null|string $expected): OrderChange
     {
         return $this->parent->getConnection()->transaction(function () use ($ids, $expected): OrderChange {
             self::lockAll([$this]);
@@ -597,7 +596,7 @@ final class OrderedRelation
             return $this->announce($change);
         }
 
-        $this->announceRebalance($change->revision);
+        $this->announceRebalance($change->digest);
 
         return $change;
     }
@@ -727,7 +726,7 @@ final class OrderedRelation
         $ids = $this->rebalanced;
         $this->rebalanced = [];
 
-        event(new Rebalanced($this, $revision ?? $this->concurrencyRevision(), $ids));
+        event(new Rebalanced($this->parent, $this->revision, $revision ?? $this->parent->concurrencyRevision($this->revision), $ids));
     }
 
     /**
@@ -1674,7 +1673,7 @@ final class OrderedRelation
         $id = $this->memberKey($anchor);
         $key = $id === null ? null : $members->where($this->keys->item->getQualifiedKeyName(), $id)->value($this->keys->item->qualifyColumn(self::RANK_KEY));
 
-        throw_unless(is_string($key), new InvalidAnchor($this, $anchor));
+        throw_unless(is_string($key), new InvalidAnchor($this->parent, $this->revision, $anchor));
 
         return $key;
     }
@@ -1746,12 +1745,12 @@ final class OrderedRelation
         foreach ($ids as $id) {
             $key = $this->memberKey($id);
 
-            throw_unless($key !== null && array_key_exists($key, $byKey) && ! array_key_exists($key, $order), new MembershipMismatch($this));
+            throw_unless($key !== null && array_key_exists($key, $byKey) && ! array_key_exists($key, $order), new MembershipMismatch($this->parent, $this->revision));
 
             $order[$key] = $byKey[$key];
         }
 
-        throw_unless(count($order) === count($members), new MembershipMismatch($this));
+        throw_unless(count($order) === count($members), new MembershipMismatch($this->parent, $this->revision));
 
         return array_values($order);
     }
@@ -1788,7 +1787,7 @@ final class OrderedRelation
 
     private function announce(OrderChange $change): OrderChange
     {
-        $this->announceRebalance($change->revision);
+        $this->announceRebalance($change->digest);
         event(new Reordered($change));
 
         return $change;
@@ -1804,7 +1803,8 @@ final class OrderedRelation
         $positions = array_flip($ids);
 
         return new OrderChange(
-            relation: $this,
+            parent: $this->parent,
+            revision: $this->revision,
             order: $ids,
             changed: array_map(
                 static fn (int|string $id, null|int $previous): PositionChange => new PositionChange(
@@ -1815,7 +1815,7 @@ final class OrderedRelation
                 array_keys($moved),
                 array_values($moved),
             ),
-            revision: $this->parent->concurrencyRevision($this->revision),
+            digest: $this->parent->concurrencyRevision($this->revision),
             source: $source,
         );
     }

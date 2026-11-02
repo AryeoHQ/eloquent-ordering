@@ -160,14 +160,14 @@ class Asset extends Model implements Ordered
 }
 ```
 
-The parent resolves a relation with `orderedRelation()`, and the item with `orderingRelation()`:
+Every order write starts from the item or from the parent's Eloquent relation. `move()` writes through the item, and `arrange()` writes through the relation:
 
 ```php
-$section->orderedRelation(SectionRevision::AssetsOrder);   // OrderedRelation of this parent
-$asset->orderingRelation();                                // the OrderedRelation the asset sits in
+$asset->move(Placement::first(), expected: $digest);
+$section->assets()->arrange([$thirdId, $firstId, $secondId], expected: $digest);
 ```
 
-`orderedRelation()` throws `LogicException` when the parent declares no ordered relation for the revision. `orderingRelation()` throws `LogicException` when the item has no parent.
+`arrange()` is a macro on every Eloquent relation. It resolves the declaration by the ordered item class: the related class of a HasMany or MorphMany, and the pivot class of a BelongsToMany or MorphToMany. A relation that orders nothing throws `LogicException`.
 
 ## Supported shapes
 
@@ -178,7 +178,7 @@ $asset->orderingRelation();                                // the OrderedRelatio
 | `BelongsToMany` with `->using()` | The pivot | `Listing::customers()` |
 | `MorphToMany` with `->using()` | The pivot | `Tour::customers()` |
 
-**A pivot is the item.** Name an `Ordered` pivot class through `using()`, and give the pivot table its own `rank_key`, a UUID or integer `id`, and `deleted_at`. The member id is the pivot id, not the related model id. `Placement::before()`, `reorder()`, and `OrderChange` all take pivot ids. Hide soft deleted pivots with `wherePivotNull('deleted_at')`.
+**A pivot is the item.** Name an `Ordered` pivot class through `using()`, and give the pivot table its own `rank_key`, a UUID or integer `id`, and `deleted_at`. The member id is the pivot id, not the related model id. `Placement::before()`, `arrange()`, and `OrderChange` all take pivot ids. Hide soft deleted pivots with `wherePivotNull('deleted_at')`.
 
 ```php
 #[OrderedIn(Listing::class)]
@@ -218,7 +218,7 @@ create unique index listing_customer_listing_id_customer_id_unique on listing_cu
 
 **An item can order in several parents.** A `Scene` carries `#[OrderedIn(Tour::class)]` and `#[OrderedIn(Listing::class)]`. Each row resolves to the one parent whose foreign key, and morph type, it names.
 
-**One model can be both item and parent.** A `Video` sits in a `Section` and orders its own `Clip` items. It uses both traits and declares both attributes. `orderingRelation()` returns the section side. `orderedRelation(VideoRevision::ClipsOrder)` returns the clip side.
+**One model can be both item and parent.** A `Video` sits in a `Section` and orders its own `Clip` items. It uses both traits and declares both attributes. `$video->move()` writes the section order. `$video->clips()->arrange()` writes the clip order.
 
 ```php
 #[OrderedIn(Section::class)]
@@ -270,7 +270,7 @@ The package checks each relation once per process, when it first resolves. The c
 - the relation reads a column that the declaration does not name;
 - the relation reads a parent column in any form other than one `where('<item column>', $this->column)`, because the position query must compile the filter for each row.
 
-The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The parent's `id` needs none either, but a filter that reads it must take the pair form, such as `where('assets.root_id', $this->id)`. The check reads the relation's clauses before any global scope applies, and `query()` removes every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query.
+The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The parent's `id` needs none either, but a filter that reads it must take the pair form, such as `where('assets.root_id', $this->id)`. The check reads the relation's clauses before any global scope applies, and an order write ignores every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query.
 
 The probe bypasses the column's cast, so `where('tracks.kind', $this->kind)` works when `kind` casts to an enum. A relation that reads the column through an accessor, or reads a property of the cast value such as `$this->kind->value`, throws `LogicException`.
 
@@ -287,13 +287,11 @@ While it holds the lock, the package writes each stored declared parent column i
 ## Reading an order
 
 ```php
-$assets = $section->orderedRelation(SectionRevision::AssetsOrder);
-
-$assets->query()->get();                 // members in order, scoped by the parent relation
-$assets->concurrencyRevision();          // the order digest, one query
+$section->assets()->orderBy('rank_key')->get();                // members in order, each with its position
+$section->concurrencyRevision(SectionRevision::AssetsOrder);   // the order digest, one query
 ```
 
-`query()` returns the parent's relation ordered by `rank_key`, then by key, and drops any order the relation method declares. It removes every global scope of the related model except `SoftDeletingScope`, so an item that a global scope hides still holds its place. For a pivot relation each result carries the pivot id.
+Read the members through the parent's Eloquent relation. It keeps the order and the global scopes that its method and the related model declare, so order by `rank_key` to list the members in their order. Each `position` counts the row among every member, including a member that a global scope hides. For a pivot relation the pivot carries the position.
 
 **A row the relation excludes keeps its rank key.** A declared `where()` on the relation method excludes rows, and so does a soft delete of a pivot's related model. Such a row has no `position` and cannot be an anchor. It still holds its key in the unique index, so every new key and every rebalance avoids that key, and the row keeps its place.
 
@@ -371,30 +369,32 @@ Both outcomes leave the data unchanged. A move that keeps the order writes nothi
 
 | Property | Meaning |
 |---|---|
-| `relation` | The `OrderedRelation` that changed. |
+| `parent` | The parent whose order changed. |
+| `revision` | The `NamesConcurrencyRevision` that names that order. |
 | `order` | The id of every member after the write, in order. A member's position is its index plus 1. |
 | `changed` | A `PositionChange` for each member that moved: `id`, `position` (`null` when it left this order), and `previousPosition` (`null` when it is new to this order). |
-| `revision` | The order digest after the write, read inside the write's transaction. |
+| `digest` | The order digest after the write, read inside the write's transaction. |
 | `source` | For a move between parents, the `OrderChange` of the parent the item left. Otherwise `null`. |
 
-After a move between parents, `$asset->orderingRelation()` returns the destination.
+After a move between parents, the item's loaded parent relation holds the destination.
 
 A save through Eloquent that changes the parent, such as `$asset->update(['section_id' => $other->id])`, moves the item to the end of the new parent without an `expected` check, so use `move()` when the caller needs one. Such a save is no substitute for ORD-08, which requires an API to return 422 for an update that would move an item to another ordered collection. A save that leaves every parent, such as one that sets a nullable foreign key to `null`, clears the item's rank key.
 
 ## Reordering a parent
 
-`reorder()` sets the whole order at once. List every current member exactly once.
+`arrange()` sets the whole order at once. List every current member exactly once.
 
 ```php
-$section->orderedRelation(SectionRevision::AssetsOrder)
-    ->reorder([$thirdId, $firstId, $secondId], expected: $digest);
+$section->assets()->arrange([$thirdId, $firstId, $secondId], expected: $digest);
 ```
 
-`expected` is the order revision of this parent. `null` skips the check. A list that omits a member, repeats one, or names a stranger throws `MembershipMismatch` (`InvalidArgumentException`). `reorder()` and an anchor match a UUID id in either letter case, and `OrderChange` reports each id in the database's letter case. A trashed member, a member with no rank key, and a row the relation excludes are not current members. `reorder()` keeps an excluded row directly after the member that precedes it now. It rewrites only the keys that change, and returns an `OrderChange`.
+The name leaves the query builder's `reorder()` alone, so `$section->assets()->reorder()` still clears the orders of a relation query.
+
+`expected` is the order revision of this parent. `null` skips the check. A list that omits a member, repeats one, or names a stranger throws `MembershipMismatch` (`InvalidArgumentException`). `arrange()` and an anchor match a UUID id in either letter case, and `OrderChange` reports each id in the database's letter case. A trashed member, a member with no rank key, and a row the relation excludes are not current members. `arrange()` keeps an excluded row directly after the member that precedes it now. It rewrites only the keys that change, and returns an `OrderChange`.
 
 ## The order revision in memory
 
-The package writes no revision into a parent instance, and no order write saves a parent row. `concurrencyRevision($revision)` runs the digest query each time, so every instance reads the current order. After a move, a caller who needs the order revision of that write reads `OrderChange::$revision`. A digest read after the commit can include another writer's change.
+The package writes no revision into a parent instance, and no order write saves a parent row. `concurrencyRevision($revision)` runs the digest query each time, so every instance reads the current order. After a move, a caller who needs the order revision of that write reads `OrderChange::$digest`. A digest read after the commit can include another writer's change.
 
 ## Locking
 
@@ -402,7 +402,7 @@ Every write that changes an order first locks the parent rows with `SELECT … F
 
 - A create always locks its parent.
 - An update locks only when `rank_key`, a foreign key, a morph type, a declared item column, or `deleted_at` is dirty.
-- A delete, `move()`, and `reorder()` lock too.
+- A delete, `move()`, and `arrange()` lock too.
 - A save of a parent locks it when a declared parent column is dirty.
 - A soft delete, a restore, or a declared-column save of a pivot's related model locks every parent that its pivots reach.
 - A create, a restore, a delete, and a watched-column save of a pivot lock its related row `FOR SHARE` after the parent, when the relation filters on the related model. The filter is the related model's `deleted_at` or a declared related column. The pivot write then waits for a related write that has not committed, and reads its result.
@@ -410,7 +410,7 @@ Every write that changes an order first locks the parent rows with `SELECT … F
 
 A `move()` re-reads the stored foreign key under the lock. If another transaction moved the item meanwhile, `move()` starts again against the new parent. After 5 such attempts it throws `ContendedOrder`.
 
-**Lock the parents before the item.** Every `Ordered` model implements `LocksParentsFirst` from eloquent-concurrency. `parentsToLockFirst()` returns the parent that the item's original attributes name, then the parent that its current attributes name, each once, and takes no lock. Code that locks an item before it writes it, such as an `If-Match` check, must first lock those parents in `(morph class, key)` order. An item locked before its parent can deadlock with a `reorder()` of that parent.
+**Lock the parents before the item.** Every `Ordered` model implements `LocksParentsFirst` from eloquent-concurrency. `parentsToLockFirst()` returns the parent that the item's original attributes name, then the parent that its current attributes name, each once, and takes no lock. Code that locks an item before it writes it, such as an `If-Match` check, must first lock those parents in `(morph class, key)` order. An item locked before its parent can deadlock with an `arrange()` of that parent.
 
 No attribute value makes `parentsToLockFirst()` throw. It leaves out a parent that does not exist, and returns both parents of attributes that name two. A parent that the item holds on another connection comes back from the item's own connection. The write then throws `LogicException` as before.
 
@@ -418,13 +418,13 @@ No attribute value makes `parentsToLockFirst()` throw. It leaves out a parent th
 
 A model that uses both traits locks that whole list in `(morph class, key)` order before it locks any parent for a single role. A soft delete, a restore, and a save that changes a column the pivot parents watch all lock it this way. Such a write therefore cannot deadlock with a caller that locks the sorted list first.
 
-**A parent that is also an item locks its own parents first.** A save of such a model can change a declared parent column and a column that its own order watches, such as its foreign key. That save locks the sorted `parentsToLockFirst()` list before it locks the model's own row. A `reorder()` of the model's parent locks that parent before it writes the model, so the two writes cannot deadlock. The order of the two traits in the class does not change this.
+**A parent that is also an item locks its own parents first.** A save of such a model can change a declared parent column and a column that its own order watches, such as its foreign key. That save locks the sorted `parentsToLockFirst()` list before it locks the model's own row. An `arrange()` of the model's parent locks that parent before it writes the model, so the two writes cannot deadlock. The order of the two traits in the class does not change this.
 
 ## Model events
 
 The package saves every row it writes through Eloquent, so each row fires the native `saving`, `updating`, `updated`, and `saved` events. Observers, `Event::listen('eloquent.updated: …')` listeners, and `$dispatchesEvents` classes all receive them.
 
-- **Items.** A `move()`, a `reorder()`, a rebalance, and the soft delete listener each save a fresh copy of every item whose `rank_key` or foreign key they write. The package loads each copy by key on the write connection.
+- **Items.** A `move()`, an `arrange()`, a rebalance, and the soft delete listener each save a fresh copy of every item whose `rank_key` or foreign key they write. The package loads each copy by key on the write connection.
 - **Parents.** An order write saves no parent row, so a parent fires no event for it. A parent fires its own events only when the caller saves it.
 - **Order.** A row that the caller saves through Eloquent, such as a create, a `delete()`, or a `restore()`, fires its own events around the package's item writes.
 
@@ -457,7 +457,7 @@ Event::listen(Reordered::class, function (Reordered $event): void {
 | A save through Eloquent that changes a declared item column | One when the item leaves or enters the relation. None otherwise. |
 | A save through Eloquent that changes a declared parent column | One, which lists every member that left and every row that entered. None when every member stays. |
 | A soft delete, a restore, or a declared-column save of a pivot's related model | One for each pivot that leaves or enters its relation. |
-| `reorder()` | One. |
+| `arrange()` | One. |
 | A create, including a pivot `attach()` | One. None when the relation excludes the new row. |
 | A delete, soft or force, including a pivot `detach()` | One. |
 | `restore()` | One when the stored row was trashed, and the item enters last. None when the relation excludes the restored row, or when another request already restored or force deleted the row. A restore of a row that another request already restored, and that also changes the parent, counts as a save that changes the parent. |
@@ -473,13 +473,14 @@ A key longer than 64 characters makes the write rebalance the relation first. Th
 use Support\Database\Eloquent\Ordering\Events\Rebalanced;
 
 Event::listen(Rebalanced::class, function (Rebalanced $event): void {
-    $event->relation;   // the OrderedRelation
-    $event->revision;   // the order digest after the write
+    $event->parent;     // the parent whose order the rebalance rewrote
+    $event->revision;   // the NamesConcurrencyRevision that names that order
+    $event->digest;     // the order digest after the write
     $event->ids;        // the id of each row whose rank key the rebalance rewrote
 });
 ```
 
-`Rebalanced` implements `ShouldDispatchAfterCommit`. It dispatches once per rebalanced relation per write, directly before that relation's `Reordered`, and carries the revision of that `Reordered`. The rebalance keeps the order, so it does not change the digest. It also dispatches when the write dispatches no `Reordered`, such as a create that the relation excludes. `ids` includes a row that the relation excludes. A rollback or a halt dispatches nothing.
+`Rebalanced` implements `ShouldDispatchAfterCommit`. It dispatches once per rebalanced relation per write, directly before that relation's `Reordered`, and carries the digest of that `Reordered`. The rebalance keeps the order, so it does not change the digest. It also dispatches when the write dispatches no `Reordered`, such as a create that the relation excludes. `ids` includes a row that the relation excludes. A rollback or a halt dispatches nothing.
 
 ## A write that bypasses Eloquent is unsupported
 
@@ -498,11 +499,11 @@ Asset::query()->whereKey($id)->delete();                              // changes
 - **`restore()` places the item last.** It assigns a new rank key under the parent lock, as a create does, and dispatches one `Reordered`. It discards a key that a bulk soft delete kept, because another member can hold that key now. A restore of a row that another request already restored, or force deleted, changes nothing and dispatches nothing, unless it also changes the parent of a restored row.
 - **A reorder or a rebalance of `n` members fires `n` sets of model events.** Each rewritten row fires `saving`, `updating`, `updated`, and `saved`. A move that rebalances saves the moved row twice, so its events fire twice. A listener that must ignore ordering-only changes can read `getChanges()`, or correlate with `Rebalanced`.
 - **A package write saves each copy through `Model::save()`.** A `save()` override in the model class does not run for a copy, and the copy fires its model events all the same.
-- **`move()` and `reorder()` save fresh copies, not the caller's instances.** An unsaved change on the item or on the parent stays unsaved.
+- **`move()` and `arrange()` save fresh copies, not the caller's instances.** An unsaved change on the item or on the parent stays unsaved.
 - **`WriteHalted` does not name the event.** A caller cannot tell whether a `saving` or an `updating` listener halted the write.
 - **The late-change check of an item has gaps.** An `updating` listener that returns a value other than `null` stops the listeners after it, so the check does not run. A wildcard `updating` listener registered after this package's provider runs after the check, so its change escapes too. A related model has no such gap, because its `updated` listener checks the prepared columns again and refuses an unprepared change.
 - **Every model's `creating` and `updating` events run one more listener.** The late-change check costs two `WeakMap` lookups.
-- **`reorder()` and a rebalance refresh no item instance in memory.** An instance keeps the `rank_key` it was read with, and a `Revisioned` item keeps its own revision. Reload the item.
+- **`arrange()` and a rebalance refresh no item instance in memory.** An instance keeps the `rank_key` it was read with, and a `Revisioned` item keeps its own revision. Reload the item.
 - **`attach([a, b])` and `detach([a, b])` dispatch one `Reordered` per pivot.** Each pivot row is one order write, and no batch API exists.
 - **The inverse side of a `MorphToMany` cannot be ordered.** Order it from the side that names the morph type. A `morphedByMany` relation throws `LogicException`.
 - **An item's class must match the relation's class exactly.** A subclass of the related model does not resolve. For a pivot relation, the `using()` class must be the item class.
@@ -533,7 +534,7 @@ Asset::query()->whereKey($id)->delete();                              // changes
 | Exception | Thrown when |
 |---|---|
 | `StaleConcurrencyRevision` (`RuntimeException`, from eloquent-concurrency) | `expected` does not match the order digest. |
-| `MembershipMismatch` (`InvalidArgumentException`) | `reorder()` does not list each current member exactly once. |
+| `MembershipMismatch` (`InvalidArgumentException`) | `arrange()` does not list each current member exactly once. |
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
 | `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
 | `UnselectedPosition` (`LogicException`) | Code reads `position` on an item whose query selected none: an explicit select list, a group, a having, `distinct`, a union, `withoutPositions()`, a model's `$withCount`, `withoutGlobalScopes()`, or a `BelongsToMany` paginator or chunk. `isset()` and `??` throw too. The exception names the item. |
