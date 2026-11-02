@@ -99,18 +99,11 @@ final class OrderedRelation
         public readonly Model&OrdersRelations&Revisioned $parent,
         public readonly NamesConcurrencyRevision $revision,
     ) {
-        $declarations = self::declarations($parent);
-        $declaration = $declarations[(string) $revision->value] ?? throw new LogicException(sprintf(
-            '[%s] declares no ordered relation for the [%s] revision.',
-            $parent::class,
-            $revision->value,
-        ));
+        $declaration = self::declaration($parent, $revision);
 
         $this->relationName = $declaration['method'];
         $this->keys = self::describe($declaration['relation']);
-        $this->parentColumns = array_values(array_unique(array_merge(
-            ...array_map(static fn (array $declared): array => $declared['declaration']->membershipOf($parent->getTable()), array_values($declarations)),
-        )));
+        $this->parentColumns = self::parentMembershipColumns($parent);
     }
 
     /**
@@ -264,6 +257,14 @@ final class OrderedRelation
 
     /**
      * @internal
+     */
+    public static function forgetParentsLockedFirst(Model $model): void
+    {
+        self::$parentsLockedFirst?->offsetUnset($model);
+    }
+
+    /**
+     * @internal
      *
      * @return list<array{string, OrdersRelation}>
      */
@@ -291,17 +292,11 @@ final class OrderedRelation
     /**
      * @internal
      *
-     * @param  Relation<*, *, *>  $relation
      * @return EloquentBuilder<*>
      */
-    public static function memberQuery(Relation $relation): EloquentBuilder
+    public static function memberQuery(Model $parent, NamesConcurrencyRevision $revision): EloquentBuilder
     {
-        throw_unless($relation instanceof HasMany || $relation instanceof MorphMany || $relation instanceof BelongsToMany, LogicException::class, sprintf(
-            '[%s] orders a [%s], which is not a HasMany, MorphMany, BelongsToMany, or MorphToMany relation.',
-            OrdersRelation::class,
-            $relation::class,
-        ));
-
+        $relation = self::declaration($parent, $revision)['relation'];
         $item = self::describe($relation)->item;
         $rankKey = $item->qualifyColumn(self::RANK_KEY);
         $scopes = array_keys($relation->getRelated()->getGlobalScopes());
@@ -1008,6 +1003,18 @@ final class OrderedRelation
     }
 
     /**
+     * @return array{method: string, declaration: OrdersRelation, relation: HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>}
+     */
+    private static function declaration(Model $parent, NamesConcurrencyRevision $revision): array
+    {
+        return self::declarations($parent)[(string) $revision->value] ?? throw new LogicException(sprintf(
+            '[%s] declares no ordered relation for the [%s] revision.',
+            $parent::class,
+            $revision->value,
+        ));
+    }
+
+    /**
      * @param  BelongsToMany<Model, Model>  $relation
      */
     private static function requireOrderedThrough(Model $parent, string $method, OrdersRelation $declaration, BelongsToMany $relation): void
@@ -1325,7 +1332,7 @@ final class OrderedRelation
             'the primary key of the item' => $item->getKeyName(),
         ] as $role => $key) {
             throw_unless($key === self::KEY_NAME, LogicException::class, sprintf(
-                '[%s::%s()] uses [%s] as %s. Ordered relations require the key [%s].',
+                '[%s::%s()] uses [%s] as %s. Ordered relations require the key [%s], because the position queries match and order members by it.',
                 $parent::class,
                 $name,
                 $key,

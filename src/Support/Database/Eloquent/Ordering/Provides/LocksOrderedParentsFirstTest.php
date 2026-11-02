@@ -15,6 +15,7 @@ use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Conferences\ConferenceRevision;
 use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Panels\PanelRevision;
+use Tests\Fixtures\Support\Speakers\ReversedSpeaker;
 use Tests\Fixtures\Support\Speakers\Speaker;
 use Tests\TestCase;
 
@@ -105,6 +106,25 @@ class LocksOrderedParentsFirstTest extends TestCase
 
         self::restore($speaker);
 
+        $this->assertSame([['conferences', 'panels'], ['conferences', 'panels']], [$deleted, $this->lockedParentTables()]);
+    }
+
+    #[Test]
+    public function it_locks_the_conference_before_the_panel_on_a_restore_of_a_model_that_orders_through_pivots_before_it_is_ordered(): void
+    {
+        $panel = Panel::create();
+        $speaker = $panel->reversedSpeakers()->create();
+        $conference = Conference::create();
+        $conference->reversedSpeakers()->attach($speaker);
+        DB::enableQueryLog();
+
+        $speaker->delete();
+        $deleted = $this->lockedParentTables();
+        DB::flushQueryLog();
+
+        self::restore($speaker);
+
+        $this->assertInstanceOf(ReversedSpeaker::class, $speaker);
         $this->assertSame([['conferences', 'panels'], ['conferences', 'panels']], [$deleted, $this->lockedParentTables()]);
     }
 

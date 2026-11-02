@@ -958,6 +958,27 @@ class HasOrderedRelationsTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_listener_that_changes_a_membership_column_of_the_parent_during_a_save_that_changes_none(): void
+    {
+        [$playlist] = $this->playlist('audio', ['audio', 'video']);
+        $this->recordReorders();
+
+        Playlist::updating(function (Playlist $updating): void {
+            $updating->kind = 'video';
+        });
+
+        try {
+            $playlist->update(['created_at' => now()->subDay()]);
+            $this->fail('The save accepted a listener that changed [kind].');
+        } catch (LogicException $exception) {
+            $this->assertSame(sprintf('A listener changed [kind] of [%s:%s] after its order write was prepared.', Playlist::class, $playlist->id), $exception->getMessage());
+        }
+
+        $this->assertSame('audio', DB::table('playlists')->where('id', $playlist->id)->value('kind'));
+        $this->assertSame([], $this->reorders);
+    }
+
+    #[Test]
     public function it_locks_the_parent_before_it_reads_the_members_for_a_membership_change_of_the_parent(): void
     {
         [$playlist] = $this->playlist('audio', ['audio', 'video']);

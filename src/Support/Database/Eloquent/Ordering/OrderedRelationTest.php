@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
@@ -25,6 +26,7 @@ use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
+use Support\Database\Eloquent\Ordering\Attributes\OrderedThrough;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
@@ -896,6 +898,97 @@ class OrderedRelationTest extends TestCase
     public function it_resolves_a_relation_whose_membership_filter_it_verifies(Closure $parent, NamesConcurrencyRevision $revision): void
     {
         $this->assertSame($revision, $parent()->orderedRelation($revision)->revision);
+    }
+
+    /**
+     * @param  Closure(): (Model&OrdersRelations&Revisioned)  $parent
+     * @param  Closure(class-string): string  $message
+     */
+    #[DataProvider('misdeclaredDigests')]
+    #[Test]
+    public function it_refuses_a_misdeclared_relation_when_it_reads_the_order_digest(Closure $parent, NamesConcurrencyRevision $revision, Closure $message): void
+    {
+        $declared = $parent();
+
+        try {
+            $declared->concurrencyRevision($revision);
+            $this->fail('The order digest of a misdeclared relation was read.');
+        } catch (LogicException $exception) {
+            $this->assertSame($message($declared::class), $exception->getMessage());
+        }
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision, Closure(class-string): string}>
+     */
+    public static function misdeclaredDigests(): iterable
+    {
+        yield 'a watched related column its membership omits' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            #[OrdersRelation(ListingRevision::CustomersOrder)]
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')
+                    ->using(ListingCustomer::class)
+                    ->wherePivotNull('deleted_at')
+                    ->where('customers.name', NamedListing::NAME);
+            }
+        }, ListingRevision::CustomersOrder, static fn (string $parent): string => sprintf(
+            '[%s::customers()] filters its members by [customers.name], which its membership does not declare.',
+            $parent,
+        )];
+
+        yield 'a related model that omits the parent from #[OrderedThrough]' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            #[OrdersRelation(ListingRevision::CustomersOrder)]
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')
+                    ->using(ListingCustomer::class)
+                    ->wherePivotNull('deleted_at');
+            }
+        }, ListingRevision::CustomersOrder, static fn (string $parent): string => sprintf(
+            '[%1$s::customers()] orders the pivots of [%2$s], so [%2$s] must name [%1$s] in #[%3$s].',
+            $parent,
+            Customer::class,
+            OrderedThrough::class,
+        )];
+
+        yield 'a HasOne method' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasOne<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder)]
+            public function assets(): HasOne
+            {
+                return $this->hasOne(Asset::class, 'section_id');
+            }
+        }, SectionRevision::AssetsOrder, static fn (string $parent): string => sprintf(
+            '[%s::assets()] must return a HasMany, MorphMany, BelongsToMany, or MorphToMany relation to an Ordered model.',
+            $parent,
+        )];
     }
 
     /**

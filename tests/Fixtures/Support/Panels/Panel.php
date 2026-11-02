@@ -11,6 +11,7 @@ use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
+use Tests\Fixtures\Support\Speakers\ReversedSpeaker;
 use Tests\Fixtures\Support\Speakers\Speaker;
 
 /**
@@ -31,5 +32,14 @@ class Panel extends Model implements OrdersRelations, Revisioned
     public function speakers(): HasMany
     {
         return $this->hasMany(Speaker::class);
+    }
+
+    /**
+     * @return HasMany<ReversedSpeaker, $this>
+     */
+    #[OrdersRelation(PanelRevision::ReversedSpeakersOrder)]
+    public function reversedSpeakers(): HasMany
+    {
+        return $this->hasMany(ReversedSpeaker::class, 'panel_id');
     }
 }

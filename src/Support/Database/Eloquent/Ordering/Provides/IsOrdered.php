@@ -111,6 +111,8 @@ trait IsOrdered
         });
 
         static::saved(static function (self $item): void {
+            OrderedRelation::forgetParentsLockedFirst($item);
+
             if (OrderWrite::saves($item)) {
                 return;
             }
@@ -159,6 +161,7 @@ trait IsOrdered
         });
 
         static::deleted(static function (self $item): void {
+            OrderedRelation::forgetParentsLockedFirst($item);
             $vacated = $item->vacatedPosition;
             $relations = $item->lockedOrderedRelations;
             $item->vacatedPosition = null;
@@ -340,7 +343,7 @@ trait IsOrdered
     /**
      * @return list<Model>
      */
-    private function orderingParentsToLockFirst(): array
+    protected function orderingParentsToLockFirst(): array
     {
         return [
             ...OrderedRelation::namedParents($this, $this->getRawOriginal(), $this->heldOrderedParents()),

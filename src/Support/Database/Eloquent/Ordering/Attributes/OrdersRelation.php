@@ -46,6 +46,6 @@ final class OrdersRelation extends NamedConcurrencyRevision
      */
     public function digestQuery(Relation $relation): Builder
     {
-        return OrderedRelation::memberQuery($relation);
+        return OrderedRelation::memberQuery($relation->getParent(), $this->revision);
     }
 }

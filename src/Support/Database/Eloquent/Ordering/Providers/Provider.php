@@ -57,6 +57,7 @@ class Provider extends ServiceProvider
         Event::listen("eloquent.trashed: {$related}", static function (Model $model) use ($held): void {
             $positions = $held[$model] ?? [];
             unset($held[$model]);
+            OrderedRelation::forgetParentsLockedFirst($model);
 
             self::reportHeldPivotParents($positions);
         });
@@ -71,6 +72,7 @@ class Provider extends ServiceProvider
         Event::listen("eloquent.updated: {$related}", static function (Model $model) use ($held): void {
             $positions = $held[$model] ?? [];
             unset($held[$model]);
+            OrderedRelation::forgetParentsLockedFirst($model);
             OrderedRelation::requirePrepared($model);
             $changed = array_filter(self::pivotParentsOf($model), static fn (array $parent): bool => $model->wasChanged($parent[3]));
             $unprepared = array_diff_key($changed, $positions);

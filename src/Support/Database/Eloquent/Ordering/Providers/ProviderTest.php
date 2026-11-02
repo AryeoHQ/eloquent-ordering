@@ -69,57 +69,6 @@ class ProviderTest extends TestCase
 
             protected $table = 'customers';
         })::class;
-        $parent = $this->listingOrderingThePivotsOf($related);
-
-        $this->assertRefused(
-            sprintf('[%s::customers()] orders the pivots of [%2$s], so [%2$s] must use [%3$s].', $parent::class, $related, OrdersThroughPivots::class),
-            $parent,
-        );
-    }
-
-    #[Test]
-    public function it_refuses_a_parent_whose_related_model_omits_it_from_ordered_through_on_its_first_declaration_read(): void
-    {
-        $parent = $this->listingOrderingThePivotsOf(Customer::class);
-
-        $this->assertRefused(
-            sprintf('[%s::customers()] orders the pivots of [%2$s], so [%2$s] must name [%1$s] in #[%3$s].', $parent::class, Customer::class, OrderedThrough::class),
-            $parent,
-        );
-    }
-
-    #[Test]
-    public function it_needs_no_ordered_through_on_a_related_model_whose_columns_no_order_watches(): void
-    {
-        $related = (new class extends Model
-        {
-            protected $table = 'customers';
-        })::class;
-
-        $this->assertSame(ListingRevision::CustomersOrder, $this->listingOrderingThePivotsOf($related)->orderedRelation(ListingRevision::CustomersOrder)->revision);
-    }
-
-    #[Test]
-    public function it_listens_to_a_model_that_orders_through_pivots_once_the_model_boots(): void
-    {
-        $viewer = new class extends Model
-        {
-            protected $table = 'customers';
-        };
-
-        $this->assertFalse(Event::hasListeners('eloquent.trashed: '.Customer::class));
-
-        new Customer;
-
-        $this->assertTrue(Event::hasListeners('eloquent.trashed: '.Customer::class));
-        $this->assertFalse(Event::hasListeners('eloquent.trashed: '.$viewer::class));
-    }
-
-    /**
-     * @param  class-string<Model>  $related
-     */
-    private function listingOrderingThePivotsOf(string $related): Model&OrdersRelations&Revisioned
-    {
         $parent = new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
@@ -141,7 +90,83 @@ class ProviderTest extends TestCase
         };
         $parent::$related = $related;
 
-        return $parent;
+        $this->assertRefused(
+            sprintf('[%s::customers()] orders the pivots of [%2$s], so [%2$s] must use [%3$s].', $parent::class, $related, OrdersThroughPivots::class),
+            $parent,
+        );
+    }
+
+    #[Test]
+    public function it_refuses_a_parent_whose_related_model_omits_it_from_ordered_through_on_its_first_declaration_read(): void
+    {
+        $parent = new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            #[OrdersRelation(ListingRevision::CustomersOrder)]
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id', 'customer_id')->using(ListingCustomer::class)->wherePivotNull('deleted_at');
+            }
+        };
+
+        $this->assertRefused(
+            sprintf('[%s::customers()] orders the pivots of [%2$s], so [%2$s] must name [%1$s] in #[%3$s].', $parent::class, Customer::class, OrderedThrough::class),
+            $parent,
+        );
+    }
+
+    #[Test]
+    public function it_needs_no_ordered_through_on_a_related_model_whose_columns_no_order_watches(): void
+    {
+        $related = (new class extends Model
+        {
+            protected $table = 'customers';
+        })::class;
+        $parent = new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            /** @var class-string<Model> */
+            public static string $related;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Model, $this, ListingCustomer>
+             */
+            #[OrdersRelation(ListingRevision::CustomersOrder)]
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(self::$related, 'listing_customer', 'listing_id', 'customer_id')->using(ListingCustomer::class)->wherePivotNull('deleted_at');
+            }
+        };
+        $parent::$related = $related;
+
+        $this->assertSame(ListingRevision::CustomersOrder, $parent->orderedRelation(ListingRevision::CustomersOrder)->revision);
+    }
+
+    #[Test]
+    public function it_listens_to_a_model_that_orders_through_pivots_once_the_model_boots(): void
+    {
+        $viewer = new class extends Model
+        {
+            protected $table = 'customers';
+        };
+
+        $this->assertFalse(Event::hasListeners('eloquent.trashed: '.Customer::class));
+
+        new Customer;
+
+        $this->assertTrue(Event::hasListeners('eloquent.trashed: '.Customer::class));
+        $this->assertFalse(Event::hasListeners('eloquent.trashed: '.$viewer::class));
     }
 
     private function assertRefused(string $message, Model&OrdersRelations $parent): void

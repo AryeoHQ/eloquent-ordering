@@ -27,7 +27,7 @@ trait OrdersThroughPivots
     /**
      * @return list<Model>
      */
-    private function pivotParentsToLockFirst(): array
+    protected function pivotParentsToLockFirst(): array
     {
         return Provider::parentsReachedBy($this);
     }

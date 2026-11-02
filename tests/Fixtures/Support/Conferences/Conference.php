@@ -11,6 +11,7 @@ use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
+use Tests\Fixtures\Support\Speakers\ReversedSpeaker;
 use Tests\Fixtures\Support\Speakers\Speaker;
 
 /**
@@ -32,6 +33,17 @@ class Conference extends Model implements OrdersRelations, Revisioned
     {
         return $this->belongsToMany(Speaker::class, 'conference_speaker')
             ->using(ConferenceSpeaker::class)
+            ->wherePivotNull('deleted_at');
+    }
+
+    /**
+     * @return BelongsToMany<ReversedSpeaker, $this, ReversedConferenceSpeaker>
+     */
+    #[OrdersRelation(ConferenceRevision::ReversedSpeakersOrder)]
+    public function reversedSpeakers(): BelongsToMany
+    {
+        return $this->belongsToMany(ReversedSpeaker::class, 'conference_speaker', 'conference_id', 'speaker_id')
+            ->using(ReversedConferenceSpeaker::class)
             ->wherePivotNull('deleted_at');
     }
 }
