@@ -23,7 +23,7 @@ php artisan migrate
 
 `aryeo/eloquent-concurrency` installs with it. Run its migrations too, because they install the `concurrency_digest()` function.
 
-Laravel discovers `Support\Database\Eloquent\Ordering\Providers\Provider`. The provider registers the `rankKey()` Blueprint macro and the `withPositions` builder macro. It also registers the listeners that refuse a late change to an order write. The related model of an ordered pivot registers its own listeners when it boots. The package ships no migration of its own.
+Laravel discovers `Support\Database\Eloquent\Ordering\Providers\Provider`. The provider registers the `rankKey()` and `rankKeyIndex()` Blueprint macros and the `withoutPositions()` builder macro. It also registers the listeners that refuse a late change to an order write. The related model of an ordered pivot registers its own listeners when it boots. The package ships no migration of its own.
 
 ## Declaring an ordered relation
 
@@ -50,15 +50,13 @@ Schema::create('assets', function (Blueprint $table): void {
     $table->string('title')->nullable();
     $table->timestamps();
     $table->softDeletes();
+    $table->rankKeyIndex('section_id');
 });
-
-Schema::getConnection()->statement(
-    'create unique index assets_section_id_rank_key_unique on assets (section_id, rank_key) where deleted_at is null',
-);
 ```
 
 - `rankKey()` adds a `rank_key` column: `varchar(64) collate "C" null`.
-- Add a unique index on the parent key and `rank_key`. Make it partial (`where deleted_at is null`) when the item soft deletes, because a bulk soft delete keeps its rank key.
+- `rank_key` is nullable because a row outside every order has no key: a trashed row, a row whose save left every parent, and a row that existed before the package. Such a row is not a member, so it has no position.
+- `rankKeyIndex()` adds a unique index on the named parent columns and `rank_key`. It adds `where deleted_at is null` when the table has a `deleted_at` column, because a bulk soft delete keeps its rank key. Name both columns of a morph parent: `rankKeyIndex('sceneable_type', 'sceneable_id')`. The position count reads this index.
 
 **3. Declare the relation on the parent.** The parent implements `OrdersRelations` and `Revisioned`, and uses `HasOrderedRelations` and `HasConcurrencyRevisions`. Put `#[OrdersRelation]` on the relation method. It names the revision. It extends eloquent-concurrency's `#[NamedConcurrencyRevision]`, so the parent reads the order digest with `concurrencyRevision()`.
 
@@ -108,29 +106,48 @@ class Asset extends Model implements Ordered
 }
 ```
 
-`IsOrdered` hides `rank_key` from serialization and adds a read-only `position` attribute (1-based, `null` until the item has a place). Only the package's order writes set `rank_key`. A save of an item whose `rank_key` the caller set throws `LogicException`, so move an item with `move()` and place a new one with `placeAt()`. `replicate()` drops the rank key, so a saved replica goes last. An ordered table must have no `position` column, because the readers and the accessor own that name.
+`IsOrdered` hides `rank_key` from serialization and adds a read-only `position` attribute (1-based). Only the package's order writes set `rank_key`. A save of an item whose `rank_key` the caller set throws `LogicException`, so move an item with `move()` and place a new one with `placeAt()`. `replicate()` drops the rank key, so a saved replica goes last. An ordered table must have no `position` column, because the package selects a computed column under that name.
 
-Three readers fill `position`. Each one counts the rows that the parent's relation returns, as `OrderChange::$order` lists them. A trashed row, a row that the relation excludes, and a row without a rank key have no position.
-
-- **The accessor.** `$asset->position` returns a position that a query or `loadPositions()` selected, and runs no query. Without a selected value, it counts with queries.
-- **`withPositions()`** numbers the query that `query()` returns, in one query. The caller's filters, order, limit, and offset apply after the numbering, in either call order. A filter therefore hides rows without renumbering the rest, and page 3 of 15 still starts at position 31. For a pivot relation, the pivot carries `position`, and a `select()` must come before `withPositions()`, because a later `select()` replaces that column. A copy of the query, such as `clone $query`, numbers only when `withPositions()` names that copy. On any other query, `withPositions()` throws `LogicException`.
-- **`loadPositions()`** sets `position` on each item of an `OrderedCollection`. It loads each item's parent with one query per parent class, and reuses a parent that the item already holds. It then runs one query per item class and relation, so the items can come from several parents and classes. Each item counts among the rows of its own parent's relation, so a declared relation `where()` that reads a parent attribute applies. See [Filtering an ordered relation](#filtering-an-ordered-relation). An item with no position gets `null`, and an item that is not `Ordered` throws `LogicException`.
+**Every query of an item selects its position.** `IsOrdered` boots the `SelectsPosition` global scope. The scope appends one correlated count to the select list, so `$asset->position` comes from the statement that read the row, and runs no query. The count covers every member of the item's parent, whatever the query filters, sorts, or pages. A filter therefore hides rows without renumbering the rest, and page 3 of 15 still starts at position 31. A delete or a move that commits after the read does not change the value that the page renders.
 
 ```php
-$assets = $section->orderedRelation(SectionRevision::AssetsOrder)
-    ->query()
-    ->withPositions()
-    ->where('title', 'like', 'Dusk%')
-    ->paginate(15);
+$assets = Asset::query()->where('title', 'like', 'Dusk%')->paginate(15);   // one query, with positions
 
-$results = Asset::query()->where('title', 'like', 'Dusk%')->get()
-    ->concat(Scene::query()->where('title', 'like', 'Dusk%')->get())
-    ->loadPositions();
+$assets->first()->position;                                                 // no query
 ```
 
-Declare `#[CollectedBy(OrderedCollection::class)]` on an item to make its queries return an `OrderedCollection`. Wrap other items, such as the pivots of a relation's results, in `new OrderedCollection($items)`. A pivot needs its `id` for `loadPositions()`, so load it through `OrderedRelation::query()`, or through a relation that declares `withPivot('id')`. A pivot without its `id` throws `LogicException`.
+The scope covers `get()`, `find()`, the paginators, `chunk()`, route binding, eager and lazy loads, `refresh()`, `fresh()`, `refreshForUpdate()`, `Collection::fresh()`, and a queued job's restored model. A query that joins an ordered pivot table, such as `$listing->customers` or `$customer->listings`, also selects `pivot_position`, so each pivot carries `position`. The scope runs on PostgreSQL only.
 
-A selected `position` is never dirty, and no save writes it. `move()`, a save that changes the parent or a declared item column, a delete, and `restore()` drop it from that instance, so the accessor counts again. A write by another request does not change it.
+**The position counts the item among the members of the parent that `#[OrderedIn]` names**, in the order that `OrderChange::$order` lists. `null` means the row is not a member:
+
+- the item is unsaved or trashed, or has no rank key;
+- its foreign key names no row, or names a trashed parent;
+- a declared relation filter excludes it;
+- for a pivot, its related row is trashed, or a declared related column excludes it.
+
+**A query that cannot carry the column selects no position.** A query with an explicit select list, a group, a having, `distinct`, or a union selects none, because the column would break `withCount()`, `whereIn()` subqueries, and grouped reads. Reading `position` on such a row throws `UnselectedPosition`, and so does reading it after `withoutPositions()`. Call `withoutPositions()` on a query that never reads `position`, to skip the count.
+
+```php
+Asset::query()->select(['id', 'title'])->first()->position;   // throws UnselectedPosition
+Asset::query()->withoutPositions()->get();                    // no count, no position
+```
+
+**A write fills the position of the instance it writes.** A create, `move()`, a save that changes the parent or a declared item column, `restore()`, and a delete set `position` from inside the write's transaction. A selected `position` is never dirty, and no save writes it. A write by another request does not change it, so reload an instance to read its new place.
+
+**A key query selects the position too.** `IsOrdered` overrides `newQueryWithoutScopes()`, which `refresh()`, `fresh()`, `refreshForUpdate()`, and a queue restore build on. A model that takes the same method from another trait, such as Laravel's `HasBuilder`, gets a trait collision. Resolve it in the model:
+
+```php
+class Asset extends Model implements Ordered
+{
+    use HasBuilder;
+    use IsOrdered;
+
+    public function newQueryWithoutScopes()
+    {
+        return $this->selectPositionOnKeyQuery(parent::newQueryWithoutScopes());
+    }
+}
+```
 
 The parent resolves a relation with `orderedRelation()`, and the item with `orderingRelation()`:
 
@@ -233,7 +250,8 @@ The package checks each relation once per process, when it first resolves. The c
 - the relation's own clauses use a type other than `where()` with an operator, `whereNull()`, `whereNotNull()`, `whereIn()`, `whereNotIn()`, `whereColumn()`, or a nested group of these;
 - a clause filters by an expression, or joins a top-level filter with `or`, because that filter reaches the rows of other parents;
 - a pivot relation filters by an unqualified column;
-- the relation reads a column that the declaration does not name.
+- the relation reads a column that the declaration does not name;
+- the relation reads a parent column in any form other than one `where('<item column>', $this->column)`, because the position query must compile the filter for each row.
 
 The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The check reads the relation's clauses before any global scope applies, and `query()` removes every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query.
 
@@ -470,9 +488,10 @@ Asset::query()->whereKey($id)->delete();                              // changes
 - **The parent key, the owner key, and the item key must be named `id`.** Any other name throws `LogicException`.
 - **One parent orders an item class in one relation only.** Declaring two relations for one class, or two relations under one revision, throws `LogicException`.
 - **A key longer than 64 characters triggers a rebalance.** The rebalance rewrites every member of the parent, and keeps the digest.
-- **The accessor's fallback costs queries.** Without a selected value, `position` counts with queries for each item. Number a list with `withPositions()` or `loadPositions()` instead.
-- **An ordered table cannot have a `position` column.** The readers select `position`, and the accessor returns any `position` attribute it finds, so a stored column hides the computed position. Drop or rename such a column.
-- **The package reserves the scope name `withPositions`.** It registers a global `withPositions` macro on the Eloquent builder, and a macro runs before a named scope. A model's own `scopeWithPositions()` never runs.
+- **Every item query runs a correlated count for each row.** The count reads the `rankKeyIndex()` index, so its cost grows with the row's position. Call `withoutPositions()` on a query that never reads `position`.
+- **An ordered table cannot have a `position` column.** The scope selects a computed `position`, and a `pivot_position` beside a pivot join, so a stored column of either name conflicts. Drop or rename such a column.
+- **The package reserves the scope name `withoutPositions`.** It registers a global `withoutPositions` macro on the Eloquent builder, and a macro runs before a named scope. A model's own `scopeWithoutPositions()` never runs.
+- **A declared filter on a parent column must compare one item column with it**, as `where('tracks.kind', $this->kind)` does. The position query compiles that filter as `tracks.kind is not distinct from playlists.kind`, so a `null` parent value matches a `null` item value, as Laravel's `where()` does.
 - **A create or delete reads the whole order.** It builds `OrderChange::$order`, which lists every member, so the cost grows with the relation.
 - **`Placement::in()` does not work on a create.** Associate the parent instead.
 - **A move between parent classes unsets the item's loaded relation** for the old parent. It does not set the new one.
@@ -496,5 +515,6 @@ Asset::query()->whereKey($id)->delete();                              // changes
 | `MembershipMismatch` (`InvalidArgumentException`) | `reorder()` does not list each current member exactly once. |
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
 | `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
+| `UnselectedPosition` (`LogicException`) | Code reads `position` on an item whose query selected none: an explicit select list, a group, a having, `distinct`, a union, or `withoutPositions()`. The exception names the item. |
 | `WriteHalted` (`RuntimeException`) | A `saving` or `updating` listener returned `false` for a copy that an order write saved. The message names the model and its key. The write rolled back. |
-| `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a membership declares a timestamp that Eloquent sets, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order or a declared parent column after the package prepared the write, a watched related column changed without a prepared order write, `withPositions()` ran on a query that `OrderedRelation::query()` did not return, or `loadPositions()` met a model that is not `Ordered` or a pivot without its `id`. On a parent's first declaration read: an ordered pivot relation reaches a watched related model that does not use `OrdersThroughPivots`, or that omits the parent from `#[OrderedThrough]`. |
+| `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a membership declares a timestamp that Eloquent sets, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order or a declared parent column after the package prepared the write, a watched related column changed without a prepared order write, or a relation reads a parent column in a form other than `<item column> = <parent column>`. On a parent's first declaration read: an ordered pivot relation reaches a watched related model that does not use `OrdersThroughPivots`, or that omits the parent from `#[OrderedThrough]`. |

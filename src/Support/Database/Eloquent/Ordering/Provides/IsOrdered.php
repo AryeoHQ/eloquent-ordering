@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering\Provides;
 
 use Closure;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Pivot;
@@ -15,12 +16,14 @@ use Support\Database\Eloquent\Concurrency\Concerns\WritesInTransactions;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Exceptions\ContendedOrder;
+use Support\Database\Eloquent\Ordering\Exceptions\UnselectedPosition;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\OrderWrite;
 use Support\Database\Eloquent\Ordering\Placement;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 
 /**
  * @phpstan-require-extends Model
@@ -56,6 +59,8 @@ trait IsOrdered
 
     public static function bootIsOrdered(): void
     {
+        static::addGlobalScope(new SelectsPosition);
+
         static::saving(static function (self $item): void {
             if (OrderWrite::saves($item)) {
                 return;
@@ -89,6 +94,8 @@ trait IsOrdered
                 $relation->placed($item);
                 $relation->announceRebalance();
             }
+
+            $item->selectStoredPosition();
         });
 
         static::deleting(static function (self $item): void {
@@ -98,7 +105,7 @@ trait IsOrdered
 
             [$current, $item->lockedOrderedRelations] = $item->lockCurrentOrderedRelations();
             $item->lockRelatedOfOrderedRelations();
-            $item->vacatedPosition = $current?->position($item);
+            $item->vacatedPosition = $current?->memberPosition($item);
         });
 
         static::registerModelEvent('trashed', static function (self $item): void {
@@ -133,10 +140,6 @@ trait IsOrdered
 
             $restored?->placed($item);
 
-            if ($restored !== null || $reparented !== null || $refiltered !== null || $item->wasChanged(OrderedRelations::DELETED_AT)) {
-                $item->forgetPosition();
-            }
-
             if ($reparented !== null) {
                 [$source, $destination, $previous] = $reparented;
 
@@ -158,6 +161,10 @@ trait IsOrdered
             foreach ($relations as $relation) {
                 $relation->announceRebalance();
             }
+
+            if ($restored !== null || $reparented !== null || $refiltered !== null || $item->wasChanged(OrderedRelations::DELETED_AT)) {
+                $item->selectStoredPosition();
+            }
         });
 
         static::deleted(static function (self $item): void {
@@ -166,7 +173,7 @@ trait IsOrdered
             $relations = $item->lockedOrderedRelations;
             $item->vacatedPosition = null;
             $item->lockedOrderedRelations = [];
-            $item->forgetPosition();
+            $item->forceFill([OrderedRelation::POSITION => null])->syncOriginalAttributes([OrderedRelation::POSITION]);
 
             foreach ($relations as $relation) {
                 if ($vacated !== null) {
@@ -224,7 +231,7 @@ trait IsOrdered
 
             $this->followMovedParent([$original, $stored], $change->relation->parent);
             $this->resolvedOrderedRelation = $change->relation;
-            $this->forgetPosition();
+            $this->selectStoredPosition();
 
             return $change;
         });
@@ -237,6 +244,25 @@ trait IsOrdered
     }
 
     /**
+     * @return Builder<static>
+     */
+    public function newQueryWithoutScopes()
+    {
+        return $this->selectPositionOnKeyQuery(parent::newQueryWithoutScopes()); // @phpstan-ignore return.type
+    }
+
+    /**
+     * @template TQuery of Builder<*>
+     *
+     * @param  TQuery  $query
+     * @return TQuery
+     */
+    protected function selectPositionOnKeyQuery(Builder $query): Builder
+    {
+        return $query->withGlobalScope(SelectsPosition::class, new SelectsPosition);
+    }
+
+    /**
      * @return Attribute<null|int, never>
      */
     protected function position(): Attribute
@@ -244,7 +270,7 @@ trait IsOrdered
         return Attribute::make(get: fn (mixed $value): null|int => match (true) {
             ! $this->exists => null,
             array_key_exists(OrderedRelation::POSITION, $this->attributes) => $value === null ? null : intval($value),
-            default => $this->resolveOrderedRelation($this->getAttributes())?->position($this),
+            default => throw new UnselectedPosition($this),
         });
     }
 
@@ -363,6 +389,23 @@ trait IsOrdered
         unset($this->attributes[OrderedRelation::POSITION], $this->original[OrderedRelation::POSITION]);
     }
 
+    private function selectStoredPosition(): void
+    {
+        $key = $this->getKey();
+        $row = $this->exists && (is_int($key) || is_string($key))
+            ? $this->selectPositionOnKeyQuery($this->newModelQuery())->whereKey($key)->useWritePdo()->toBase()->first()
+            : null;
+        $stored = is_object($row) ? (array) $row : [OrderedRelation::POSITION => null];
+
+        if (! array_key_exists(OrderedRelation::POSITION, $stored)) {
+            $this->forgetPosition();
+
+            return;
+        }
+
+        $this->forceFill([OrderedRelation::POSITION => $stored[OrderedRelation::POSITION]])->syncOriginalAttributes([OrderedRelation::POSITION]);
+    }
+
     /**
      * @param  array<string, mixed>  $attributes
      */
@@ -385,7 +428,7 @@ trait IsOrdered
             return;
         }
 
-        $this->reparented = [$current, $next, $current?->position($this)];
+        $this->reparented = [$current, $next, $current?->memberPosition($this)];
         $this->assignRankKey($next?->keyAt(Placement::last()));
     }
 
@@ -467,7 +510,7 @@ trait IsOrdered
      */
     private function storedOrderedAttributes(array $columns): null|array
     {
-        $stored = $this->newQueryWithoutScopes()->whereKey($this->getKey())->toBase()->useWritePdo()->first($columns);
+        $stored = $this->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($this->getKey())->toBase()->useWritePdo()->first($columns);
 
         return $stored === null ? null : (array) $stored;
     }

@@ -20,6 +20,7 @@ use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
@@ -32,6 +33,14 @@ class ProviderTest extends TestCase
     public function it_boots_the_provider(): void
     {
         $this->assertTrue($this->app->providerIsLoaded(Provider::class));
+    }
+
+    #[Test]
+    public function it_registers_a_without_positions_macro_on_every_eloquent_builder(): void
+    {
+        $this->assertContains(SelectsPosition::class, Customer::query()->withoutPositions()->removedScopes());
+        $this->assertContains(SelectsPosition::class, ListingCustomer::query()->withoutPositions()->removedScopes());
+        $this->assertSame([], Customer::query()->withoutPositions()->get()->all());
     }
 
     #[Test]

@@ -22,9 +22,9 @@ use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
+use Support\Database\Eloquent\Ordering\Exceptions\UnselectedPosition;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\OrderChange;
-use Support\Database\Eloquent\Ordering\OrderedCollection;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
 use Support\Database\Eloquent\Ordering\PositionChange;
@@ -38,6 +38,7 @@ use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Events\ModelUpdated;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingRevision;
+use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Photos\Photo;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Playlists\PlaylistRevision;
@@ -50,6 +51,7 @@ use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Reparenting;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Shelves\Shelf;
+use Tests\Fixtures\Support\Speakers\ReversedSpeaker;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\Fixtures\Support\Tracks\Track;
@@ -337,34 +339,57 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_reads_a_selected_position_without_a_query_and_counts_one_it_did_not_select(Shape $shape): void
+    public function it_reads_the_position_its_query_selected_without_a_query_and_refuses_one_it_did_not_select(Shape $shape): void
     {
         [$parent, [, $second]] = $shape->with(3);
-        $selected = $shape->orderedRelation($parent)->query()->withPositions()->get();
-        $unselected = $shape->find($this->key($second));
+        $selected = $shape->orderedRelation($parent)->query()->get();
+        $unselected = $shape->memberClass()::query()->withoutPositions()->findOrFail($this->key($second));
         DB::enableQueryLog();
 
         $this->assertSame([1, 2, 3], $selected->map(fn (Model $result): mixed => $shape->item($result)->getAttribute('position'))->all());
+
+        try {
+            $unselected->getAttribute('position');
+            $this->fail('A position that no query selected was read.');
+        } catch (UnselectedPosition $exception) {
+            $this->assertSame($unselected, $exception->item);
+        }
+
         $this->assertSame([], DB::getQueryLog());
-        $this->assertSame(2, $unselected->getAttribute('position'));
-        $this->assertNotSame([], DB::getQueryLog());
+    }
+
+    #[Test]
+    public function it_selects_the_position_on_every_key_query_of_an_item_whose_subclass_orders_through_pivots(): void
+    {
+        $panel = Panel::create();
+        $first = ReversedSpeaker::query()->create(['panel_id' => $panel->id]);
+        $second = ReversedSpeaker::query()->create(['panel_id' => $panel->id]);
+        $first->move(Placement::last(), expected: null);
+        $stale = ReversedSpeaker::query()->withoutPositions()->findOrFail($second->id);
+
+        $this->assertSame(1, $stale->refresh()->getAttribute('position'));
+        $this->assertSame(2, $first->fresh()?->position);
+        $this->assertSame([2], $first->newQueryForRestoration([$first->id])->get()->map(fn (ReversedSpeaker $speaker): null|int => $speaker->position)->all());
+        $this->assertSame([1, 2], ReversedSpeaker::query()->whereKey([$second->id, $first->id])->orderBy('rank_key')->get()->map(fn (ReversedSpeaker $speaker): null|int => $speaker->position)->all());
     }
 
     #[DataProvider('reorderingWrites')]
     #[Test]
-    public function it_counts_the_position_again_after_a_write_that_changes_its_order(Shape $shape, Closure $case): void
+    public function it_fills_the_position_from_inside_a_write_that_changes_its_order(Shape $shape, Closure $case): void
     {
         [$member, $write, $before, $after] = $case($shape);
-        (new OrderedCollection([$member]))->loadPositions();
         DB::enableQueryLog();
 
         $this->assertSame($before, $member->getAttribute('position'));
         $this->assertSame([], DB::getQueryLog());
 
         $write($member);
+        DB::flushQueryLog();
 
-        $this->assertArrayNotHasKey(OrderedRelation::POSITION, $member->getAttributes());
+        $this->assertArrayHasKey(OrderedRelation::POSITION, $member->getAttributes());
         $this->assertSame($after, $member->getAttribute('position'));
+        $this->assertSame([], DB::getQueryLog());
+        $this->assertFalse($member->isDirty());
     }
 
     #[DataProvider('shapes')]
@@ -372,7 +397,7 @@ class IsOrderedTest extends TestCase
     public function it_saves_a_member_with_a_selected_position_without_writing_it(Shape $shape): void
     {
         [$parent] = $shape->with(2);
-        $member = $shape->item($shape->orderedRelation($parent)->query()->withPositions()->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 2));
+        $member = $shape->item($shape->orderedRelation($parent)->query()->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 2));
         DB::enableQueryLog();
 
         $member->setAttribute('title', 'Dusk');
@@ -391,7 +416,7 @@ class IsOrderedTest extends TestCase
     {
         [$parent] = $shape->with(3);
         [$destination] = $shape->with(1);
-        $member = $shape->item($shape->orderedRelation($parent)->query()->withPositions()->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 3));
+        $member = $shape->item($shape->orderedRelation($parent)->query()->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 3));
         $events = ModelEvents::record();
         DB::enableQueryLog();
 
@@ -413,7 +438,7 @@ class IsOrderedTest extends TestCase
     {
         [, [$member]] = $shape->with(1);
         $positioned = $shape->find($this->key($member));
-        (new OrderedCollection([$positioned]))->loadPositions();
+        $this->assertSame(1, $positioned->getAttribute('position'));
 
         $copy = $positioned->replicate();
 
@@ -421,8 +446,10 @@ class IsOrderedTest extends TestCase
             $copy->setAttribute('customer_id', Customer::create()->id);
         }
 
+        DB::enableQueryLog();
+
         $this->assertTrue($copy->save());
-        $this->assertArrayNotHasKey(OrderedRelation::POSITION, $copy->getAttributes());
+        $this->assertStringNotContainsString('"position"', implode(' ', $this->writes()));
         $this->assertSame(2, $copy->getAttribute('position'));
     }
 
@@ -679,12 +706,11 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_counts_the_position_again_after_a_stale_restore_of_a_member_whose_position_it_loaded(Shape $shape): void
+    public function it_selects_the_position_again_after_a_stale_restore_of_a_member_whose_position_it_read(Shape $shape): void
     {
         [, [$first]] = $shape->with(3);
         $first->delete();
         $stale = $shape->find($this->key($first));
-        (new OrderedCollection([$stale]))->loadPositions();
         $restored = $shape->find($this->key($first));
         assert(method_exists($stale, 'restore') && method_exists($restored, 'restore'));
         $this->assertNull($stale->getAttribute('position'));
@@ -1163,7 +1189,7 @@ class IsOrderedTest extends TestCase
         $this->assertNull(DB::table($leaving->getTable())->where('id', $leaving->getKey())->value('rank_key'));
         $this->assertNull($leaving->getAttribute('position'));
         $this->assertFalse($leaving->isDirty());
-        $this->assertSame(1, $staying->getAttribute('position'));
+        $this->assertSame(1, $staying->refresh()->getAttribute('position'));
     }
 
     /**
@@ -1179,7 +1205,7 @@ class IsOrderedTest extends TestCase
 
         $this->assertSame(DB::table($arriving->getTable())->where('id', $arriving->getKey())->value('rank_key'), $this->rankKey($arriving));
         $this->assertFalse($arriving->isDirty());
-        $this->assertSame(range(1, count($members) + 1), array_map(fn (Model $member): mixed => $member->getAttribute('position'), [...$members, $arriving]));
+        $this->assertSame(range(1, count($members) + 1), array_map(fn (Model $member): mixed => $member->getAttribute('position'), [...array_map(fn (Model $member): Model => $member->refresh(), $members), $arriving]));
     }
 
     #[DataProvider('shapes')]
@@ -2485,32 +2511,31 @@ class IsOrderedTest extends TestCase
     }
 
     #[Test]
-    public function it_counts_the_position_again_after_a_membership_change_takes_out_a_track_with_a_selected_position(): void
+    public function it_fills_the_position_after_a_membership_change_takes_out_a_track_with_a_selected_position(): void
     {
         [$playlist, [, $second]] = $this->playlist('audio', ['audio', 'audio', 'audio']);
-        $leaving = $playlist->orderedRelation(PlaylistRevision::TracksOrder)->query()->withPositions()->get()->firstOrFail(fn (Model $track): bool => $track->getKey() === $second->id);
+        $leaving = $playlist->orderedRelation(PlaylistRevision::TracksOrder)->query()->get()->firstOrFail(fn (Model $track): bool => $track->getKey() === $second->id);
         $this->assertSame(2, $leaving->getAttribute('position'));
 
         $leaving->setAttribute('kind', 'video');
         $leaving->save();
 
-        $this->assertArrayNotHasKey(OrderedRelation::POSITION, $leaving->getAttributes());
+        $this->assertArrayHasKey(OrderedRelation::POSITION, $leaving->getAttributes());
         $this->assertNull($leaving->getAttribute('position'));
     }
 
     #[Test]
-    public function it_counts_the_position_again_after_a_membership_change_admits_a_track_with_a_selected_position(): void
+    public function it_fills_the_position_after_a_membership_change_admits_a_track_with_a_selected_position(): void
     {
         [, [, $second]] = $this->playlist('audio', ['audio', 'video', 'audio']);
         $entering = Track::query()->findOrFail($second->id);
-        (new OrderedCollection([$entering]))->loadPositions();
         $this->assertArrayHasKey(OrderedRelation::POSITION, $entering->getAttributes());
         $this->assertNull($entering->position);
 
         $entering->kind = 'audio';
         $entering->save();
 
-        $this->assertArrayNotHasKey(OrderedRelation::POSITION, $entering->getAttributes());
+        $this->assertArrayHasKey(OrderedRelation::POSITION, $entering->getAttributes());
         $this->assertSame(2, $entering->position);
     }
 

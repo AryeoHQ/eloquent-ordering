@@ -17,8 +17,7 @@ use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\Query\Builder;
-use Illuminate\Database\Query\Expression;
-use Illuminate\Database\Query\JoinClause;
+use Illuminate\Database\Query\Grammars\Grammar;
 use Illuminate\Support\Str;
 use LogicException;
 use ReflectionAttribute;
@@ -43,6 +42,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 use Throwable;
 use WeakMap;
 
@@ -57,6 +57,12 @@ final class OrderedRelation
     private const string KEY_NAME = 'id';
 
     private const string PROBE = "\0ordered-relation-membership-probe";
+
+    private const string MEMBER = 'ordering_member';
+
+    private const string MEMBER_PARENT = 'ordering_parent';
+
+    private const string MEMBER_RELATED = 'ordering_related';
 
     /** @var array<class-string, array<class-string, list<object>>> */
     private static array $attributes = [];
@@ -75,6 +81,15 @@ final class OrderedRelation
 
     /** @var array<string, list<string>> */
     private static array $parentTableColumns = [];
+
+    /** @var array<string, array<string, string>> */
+    private static array $membershipPairs = [];
+
+    /** @var array<string, null|string> */
+    private static array $positionColumns = [];
+
+    /** @var array<class-string, array<string, Model&Ordered>> */
+    private static array $orderedPivots = [];
 
     /** @var null|WeakMap<Model, array<string, mixed>> */
     private static null|WeakMap $prepared = null;
@@ -450,95 +465,53 @@ final class OrderedRelation
 
     /**
      * @internal
-     *
-     * @param  array<array-key, Model>  $items
      */
-    public static function loadPositions(array $items): void
+    public static function positionColumn(Model&Ordered $item, string $qualifier): null|string
     {
-        $named = [];
-        $parents = [];
+        $cached = implode(':', [$item::class, $item->getTable(), (string) $item->getConnectionName(), $qualifier]);
 
-        foreach ($items as $item) {
-            throw_unless($item instanceof Ordered, LogicException::class, sprintf('[%s] is not ordered, so it has no position.', $item::class));
+        if (! array_key_exists($cached, self::$positionColumns)) {
+            $grammar = $item->getConnection()->getQueryGrammar();
+            $branches = array_map(
+                static fn (array $membership): string => sprintf('when %s then (%s)', self::namesMembership($membership, $qualifier, $grammar), self::countedMembers($membership, $qualifier)),
+                self::memberships($item),
+            );
 
-            if (! $item->exists) {
-                continue;
+            self::$positionColumns[$cached] = $branches === [] ? null : sprintf('case %s end', implode(' ', $branches));
+        }
+
+        return self::$positionColumns[$cached];
+    }
+
+    /**
+     * @internal
+     *
+     * @return array<string, Model&Ordered>
+     */
+    public static function orderedPivots(Model $model): array
+    {
+        if (! array_key_exists($model::class, self::$orderedPivots)) {
+            $parents = array_map(static fn (string $class): Model => new $class, self::orderedThrough($model));
+            $pivots = [];
+
+            if (self::ordersPivots($model)) {
+                $parents[] = $model;
             }
 
-            $attributes = $item->getAttributes();
-            $membership = self::membershipNamedBy($item, $attributes);
+            foreach (array_filter(array_map(self::asParent(...), $parents)) as $parent) {
+                foreach (self::declarations($parent) as ['relation' => $relation]) {
+                    $pivot = $relation instanceof BelongsToMany ? self::describe($relation)->item : null;
 
-            if ($membership === null) {
-                self::fillPosition($item, null);
-
-                continue;
-            }
-
-            $key = $item->getKey();
-
-            throw_unless(is_int($key) || is_string($key), LogicException::class, sprintf(
-                '[%s] has no [%s], so loadPositions() cannot match it to its position. Load a pivot through [%s::query()], or through a relation that declares withPivot(\'%s\').',
-                $item::class,
-                $item->getKeyName(),
-                self::class,
-                self::KEY_NAME,
-            ));
-
-            $parent = self::parentNamedBy($membership, $attributes[$membership['keys']->foreignKey]);
-
-            foreach ([...array_values($item->getRelations()), ...$item instanceof Pivot ? [$item->pivotParent] : []] as $model) {
-                $candidate = self::asParent($model);
-
-                if ($candidate !== null && self::isNamed($membership, $attributes, $candidate)) {
-                    self::requireConnectionOf($item, $candidate);
-                    $parents[$parent] ??= $candidate;
+                    if ($pivot instanceof Ordered && ($parent === $model || $relation->getRelated()::class === $model::class)) {
+                        $pivots[$relation->getTable()] ??= $pivot;
+                    }
                 }
             }
 
-            $named[] = [$item, $membership, $parent, $attributes[$membership['keys']->foreignKey]];
+            self::$orderedPivots[$model::class] = $pivots;
         }
 
-        $missing = [];
-
-        foreach ($named as [, $membership, $parent, $ownerKey]) {
-            if (! array_key_exists($parent, $parents)) {
-                $class = self::parentClassOf($membership);
-                $missing[$class] ??= [$membership, []];
-                $missing[$class][1][] = $ownerKey;
-            }
-        }
-
-        foreach ($missing as [$membership, $ownerKeys]) {
-            foreach ($membership['parent']->newQueryWithoutScopes()->whereIn($membership['keys']->ownerKey, array_values(array_unique($ownerKeys)))->get() as $model) {
-                $candidate = self::asParent($model);
-
-                if ($candidate !== null) {
-                    $parents[self::parentNamedBy($membership, $candidate->getAttribute($membership['keys']->ownerKey))] = $candidate;
-                }
-            }
-        }
-
-        $groups = [];
-
-        foreach ($named as [$item, $membership, $parent]) {
-            if (! array_key_exists($parent, $parents)) {
-                self::fillPosition($item, null);
-
-                continue;
-            }
-
-            $group = implode(':', [$item::class, $item->getTable(), (string) $item->getConnectionName(), $membership['parent']::class, (string) $membership['revision']->value]);
-            $groups[$group]['relations'][$parent] ??= new self($parents[$parent], $membership['revision']);
-            $groups[$group]['items'][] = $item;
-        }
-
-        foreach ($groups as ['relations' => $relations, 'items' => $members]) {
-            $positions = self::positionsOf(array_values($relations), $members);
-
-            foreach ($members as $member) {
-                self::fillPosition($member, $positions[(string) self::keyOf($member)] ?? null);
-            }
-        }
+        return self::$orderedPivots[$model::class];
     }
 
     /**
@@ -547,19 +520,11 @@ final class OrderedRelation
     public function query(): Relation
     {
         $relation = $this->scopedRelation();
+        $relation->getQuery()->withGlobalScope(SelectsPosition::class, new SelectsPosition);
 
         if ($relation instanceof BelongsToMany) {
             $relation->withPivot($this->keys->item->getKeyName());
         }
-
-        $selectPositions = $this->selectPositions(...);
-        $pivot = $relation instanceof BelongsToMany;
-
-        $relation->getQuery()->macro('withPositions', function (EloquentBuilder $query) use ($selectPositions, $pivot): EloquentBuilder {
-            $selectPositions($query, $pivot);
-
-            return $query;
-        });
 
         return $relation
             ->orderBy($this->keys->item->qualifyColumn(self::RANK_KEY))
@@ -606,7 +571,7 @@ final class OrderedRelation
     public function move(Model&Ordered $item, Placement $placement, self $source): OrderChange
     {
         $id = self::keyOf($item);
-        $previous = $source->position($item) ?? throw new LogicException(sprintf('[%s:%s] has no place in its order.', $item::class, $id));
+        $previous = $source->memberPosition($item) ?? throw new LogicException(sprintf('[%s:%s] has no place in its order.', $item::class, $id));
 
         if ($this->is($source)) {
             if ($this->holdsPlace($id, $placement)) {
@@ -721,7 +686,7 @@ final class OrderedRelation
             return;
         }
 
-        $related->newQueryWithoutScopes()
+        $related->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)
             ->where($related->qualifyColumn($relation->getRelatedKeyName()), $item->getAttribute($relation->getRelatedPivotKeyName()))
             ->toBase()
             ->lock('for share')
@@ -790,18 +755,204 @@ final class OrderedRelation
     }
 
     /**
-     * @internal
+     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
      */
-    public function position(Model $item): null|int
+    private static function namesMembership(array $membership, string $qualifier, Grammar $grammar): string
     {
-        $rankKey = $this->keys->item->qualifyColumn(self::RANK_KEY);
-        $key = $this->members()->where($this->keys->item->getQualifiedKeyName(), $item->getKey())->value($rankKey);
+        $keys = $membership['keys'];
+        $named = sprintf('%s is not null', $grammar->wrap($qualifier.'.'.$keys->foreignKey));
 
-        if (! is_string($key)) {
-            return null;
+        return $keys->morphType === null
+            ? $named
+            : sprintf('%s and %s = %s', $named, $grammar->wrap($qualifier.'.'.$keys->morphType), $grammar->escape($keys->morphClass));
+    }
+
+    /**
+     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
+     */
+    private static function countedMembers(array $membership, string $qualifier): string
+    {
+        ['parent' => $parent, 'keys' => $keys] = $membership;
+        ['method' => $method, 'relation' => $relation] = self::declaration($parent, $membership['revision']);
+        $item = $keys->item;
+        $key = $item->getKeyName();
+        $member = static fn (string $column): string => self::MEMBER.'.'.$column;
+        $outer = static fn (string $column): string => $qualifier.'.'.$column;
+        $aliases = [$parent->getTable() => self::MEMBER_PARENT];
+
+        $members = $item->getConnection()->query()
+            ->from($item->getTable().' as '.self::MEMBER)
+            ->join($parent->getTable().' as '.self::MEMBER_PARENT, self::MEMBER_PARENT.'.'.$keys->ownerKey, '=', $member($keys->foreignKey))
+            ->whereColumn($member($keys->foreignKey), '=', $outer($keys->foreignKey))
+            ->whereNotNull($member(self::RANK_KEY));
+
+        if ($keys->morphType !== null) {
+            $members->whereColumn($member($keys->morphType), '=', $outer($keys->morphType));
         }
 
-        return $this->members()->where($rankKey, '<', $key)->count() + 1;
+        if ($relation instanceof BelongsToMany) {
+            $related = $relation->getRelated();
+            $aliases[$related->getTable()] = self::MEMBER_RELATED;
+            $members->join($related->getTable().' as '.self::MEMBER_RELATED, self::MEMBER_RELATED.'.'.$relation->getRelatedKeyName(), '=', $member($relation->getRelatedPivotKeyName()));
+            self::whereLive($members, $related, self::MEMBER_RELATED);
+        }
+
+        $aliases[$item->getTable()] = self::MEMBER;
+        self::whereLive($members, $item, self::MEMBER);
+        self::whereLive($members, $parent, self::MEMBER_PARENT);
+
+        $filters = self::membershipFilters($parent, $method, $aliases);
+
+        if ($filters->wheres !== []) {
+            $members->addNestedWhereQuery($filters);
+        }
+
+        $grammar = $members->getGrammar();
+
+        $members
+            ->whereColumn($member(self::RANK_KEY), '<=', $outer(self::RANK_KEY))
+            ->whereRaw(sprintf(
+                '(%s, %s) <= (%s, %s)',
+                $grammar->wrap($member(self::RANK_KEY)),
+                $grammar->wrap($member($key)),
+                $grammar->wrap($outer(self::RANK_KEY)),
+                $grammar->wrap($outer($key)),
+            ))
+            ->selectRaw(sprintf('case when bool_or(%s = %s) then count(*) end', $grammar->wrap($member($key)), $grammar->wrap($outer($key))));
+
+        return $grammar->substituteBindingsIntoRawSql($members->toSql(), $members->getBindings());
+    }
+
+    private static function whereLive(Builder $query, Model $model, string $alias): void
+    {
+        $deletedAt = in_array(SoftDeletes::class, class_uses_recursive($model), true) && method_exists($model, 'getDeletedAtColumn') ? $model->getDeletedAtColumn() : null;
+
+        if (is_string($deletedAt)) {
+            $query->whereNull($alias.'.'.$deletedAt);
+        }
+    }
+
+    /**
+     * @param  array<string, string>  $aliases
+     */
+    private static function membershipFilters(Model $parent, string $method, array $aliases): Builder
+    {
+        $pairs = self::$membershipPairs[sprintf('%s::%s()', $parent::class, $method)] ?? [];
+        $base = self::probedRelation($parent, $method, array_keys($pairs))->getBaseQuery();
+        $filters = $base->newQuery();
+
+        self::copyFilters($base->wheres, $filters, $pairs, $aliases);
+
+        return $filters;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $wheres
+     * @param  array<string, string>  $pairs
+     * @param  array<string, string>  $aliases
+     */
+    private static function copyFilters(array $wheres, Builder $into, array $pairs, array $aliases): void
+    {
+        $grammar = $into->getGrammar();
+        $probes = array_combine(array_map(self::probe(...), array_keys($pairs)), array_keys($pairs));
+        $alias = static function (mixed $column) use ($aliases): string {
+            throw_unless(is_string($column), LogicException::class, 'A membership filter names a column by an expression.');
+
+            $segments = explode('.', $column);
+            $name = array_pop($segments);
+            $table = array_pop($segments);
+
+            return ($table === null ? self::MEMBER : ($aliases[$table] ?? $table)).'.'.$name;
+        };
+
+        foreach ($wheres as $where) {
+            assert(is_array($where));
+
+            $boolean = is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and';
+            $value = $where['value'] ?? null;
+            $paired = is_string($value) ? $probes[$value] ?? null : null;
+            $nested = $where['query'] ?? null;
+
+            match ($where['type'] ?? null) {
+                'Basic' => $paired === null
+                    ? $into->where($alias($where['column'] ?? null), is_string($where['operator'] ?? null) ? $where['operator'] : '=', $value, $boolean)
+                    : $into->whereRaw(sprintf('%s is not distinct from %s', $grammar->wrap($alias($where['column'] ?? null)), $grammar->wrap(self::MEMBER_PARENT.'.'.$paired)), [], $boolean),
+                'Null' => $into->whereNull($alias($where['column'] ?? null), $boolean),
+                'NotNull' => $into->whereNotNull($alias($where['column'] ?? null), $boolean),
+                'In' => $into->whereIn($alias($where['column'] ?? null), is_array($where['values'] ?? null) ? $where['values'] : [], $boolean),
+                'NotIn' => $into->whereNotIn($alias($where['column'] ?? null), is_array($where['values'] ?? null) ? $where['values'] : [], $boolean),
+                'Column' => $into->whereColumn($alias($where['first'] ?? null), is_string($where['operator'] ?? null) ? $where['operator'] : '=', $alias($where['second'] ?? null), $boolean),
+                'Nested' => $into->whereNested(static function (Builder $query) use ($nested, $pairs, $aliases): void {
+                    throw_unless($nested instanceof Builder, LogicException::class, 'A nested membership filter holds no query.');
+
+                    self::copyFilters($nested->wheres, $query, $pairs, $aliases);
+                }, $boolean),
+                default => throw new LogicException(sprintf('A membership filter of type [%s] cannot be reproduced for each row.', get_debug_type($where['type'] ?? null))),
+            };
+        }
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @return Relation<*, *, *>
+     */
+    private static function probedRelation(Model $parent, string $method, array $columns): Relation
+    {
+        $variant = clone $parent;
+        $variant->setRawAttributes([...$parent->getAttributes(), ...array_combine($columns, array_map(self::probe(...), $columns))]);
+        $relation = Relation::noConstraints(static fn (): mixed => $variant->{$method}());
+
+        throw_unless($relation instanceof Relation, LogicException::class, sprintf('[%s::%s()] returns no relation.', $parent::class, $method));
+
+        return $relation;
+    }
+
+    /**
+     * @param  list<string>  $read
+     * @return array<string, string>
+     */
+    private static function membershipPairs(string $name, Model $parent, string $method, array $read): array
+    {
+        $columns = array_map(static fn (string $column): string => Str::afterLast($column, '.'), $read);
+        $base = self::probedRelation($parent, $method, $columns)->getBaseQuery();
+        $bindings = $base->getBindings();
+        $pairs = [];
+
+        foreach ($columns as $index => $column) {
+            $probe = self::probe($column);
+            $paired = array_values(array_filter($base->wheres, static fn (mixed $where): bool => is_array($where)
+                && ($where['type'] ?? null) === 'Basic'
+                && ($where['operator'] ?? null) === '='
+                && ($where['value'] ?? null) === $probe
+                && is_string($where['column'] ?? null)
+                && strtolower(is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and') === 'and'));
+            $itemColumn = $paired[0]['column'] ?? null;
+
+            throw_unless(count($paired) === 1 && is_string($itemColumn) && count(array_keys($bindings, $probe, true)) === 1, LogicException::class, sprintf(
+                '[%s] filters its members by the parent column [%s] in a form other than [<item column> = %s], so a position query cannot reproduce the filter for each row.',
+                $name,
+                $read[$index],
+                $read[$index],
+            ));
+
+            $pairs[$column] = $itemColumn;
+        }
+
+        return $pairs;
+    }
+
+    private static function probe(string $column): string
+    {
+        return self::PROBE.':'.$column;
+    }
+
+    private static function ordersPivots(Model $model): bool
+    {
+        return array_any(self::orderDeclarations($model), static function (array $declared) use ($model): bool {
+            $type = (new ReflectionMethod($model, $declared[0]))->getReturnType();
+
+            return $type instanceof ReflectionNamedType && is_a($type->getName(), BelongsToMany::class, true);
+        });
     }
 
     /**
@@ -882,7 +1033,7 @@ final class OrderedRelation
      */
     private static function storedParent(array $membership, array $attributes): null|(Model&OrdersRelations&Revisioned)
     {
-        return self::asParent($membership['parent']->newQueryWithoutScopes()->where($membership['keys']->ownerKey, $attributes[$membership['keys']->foreignKey])->first());
+        return self::asParent($membership['parent']->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->where($membership['keys']->ownerKey, $attributes[$membership['keys']->foreignKey])->first());
     }
 
     /**
@@ -893,22 +1044,6 @@ final class OrderedRelation
     {
         return $parent::class === $membership['parent']::class
             && self::sameKey($parent->getAttribute($membership['keys']->ownerKey), $attributes[$membership['keys']->foreignKey]);
-    }
-
-    /**
-     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
-     */
-    private static function parentClassOf(array $membership): string
-    {
-        return implode(':', [$membership['parent']::class, (string) $membership['parent']->getConnectionName(), $membership['keys']->ownerKey]);
-    }
-
-    /**
-     * @param  array{parent: Model&OrdersRelations&Revisioned, revision: NamesConcurrencyRevision, keys: RelationKeys, columns: list<string>}  $membership
-     */
-    private static function parentNamedBy(array $membership, mixed $ownerKey): string
-    {
-        return self::parentClassOf($membership).':'.(is_int($ownerKey) || is_string($ownerKey) ? (string) $ownerKey : '');
     }
 
     /**
@@ -1048,9 +1183,10 @@ final class OrderedRelation
     /**
      * @internal
      *
+     * @param  Model|class-string<Model>  $related
      * @return list<class-string<Model>>
      */
-    public static function orderedThrough(Model $related): array
+    public static function orderedThrough(Model|string $related): array
     {
         return array_merge([], ...array_map(static fn (OrderedThrough $declared): array => $declared->parents, self::attributes($related, OrderedThrough::class)));
     }
@@ -1115,13 +1251,17 @@ final class OrderedRelation
         ];
         $wheres = $relation->getBaseQuery()->wheres;
 
-        foreach ([...self::filteredColumns($name, $wheres, $item->getTable(), $related !== null), ...self::parentColumnsRead($parent, $method, $keys->ownerKey)] as $column) {
+        $read = self::parentColumnsRead($parent, $method, $keys->ownerKey);
+
+        foreach ([...self::filteredColumns($name, $wheres, $item->getTable(), $related !== null), ...$read] as $column) {
             throw_unless(in_array($column, [...$implicit, ...$declaration->membership], true), LogicException::class, sprintf(
                 '[%s] filters its members by [%s], which its membership does not declare.',
                 $name,
                 $column,
             ));
         }
+
+        self::$membershipPairs[$name] = self::membershipPairs($name, $parent, $method, $read);
 
         if ($relation instanceof BelongsToMany) {
             self::requireOrderedThrough($parent, $method, $declaration, $relation);
@@ -1195,7 +1335,7 @@ final class OrderedRelation
             try {
                 $query = $variant->{$relation}();
                 assert($query instanceof Relation);
-                $base = $query->toBase();
+                $base = $query->getQuery()->withoutGlobalScope(SelectsPosition::class)->toBase();
 
                 return [$base->toSql(), $base->getBindings()];
             } catch (Throwable) {
@@ -1228,25 +1368,28 @@ final class OrderedRelation
     /**
      * @template TAttribute of object
      *
+     * @param  Model|class-string<Model>  $model
      * @param  class-string<TAttribute>  $attribute
      * @return list<TAttribute>
      */
-    private static function attributes(Model $model, string $attribute): array
+    private static function attributes(Model|string $model, string $attribute): array
     {
-        if (! array_key_exists($attribute, self::$attributes[$model::class] ?? [])) {
+        $name = is_string($model) ? $model : $model::class;
+
+        if (! array_key_exists($attribute, self::$attributes[$name] ?? [])) {
             $instances = [];
 
-            for ($class = new ReflectionClass($model); $class !== false; $class = $class->getParentClass()) {
+            for ($class = new ReflectionClass($name); $class !== false; $class = $class->getParentClass()) {
                 foreach ($class->getAttributes($attribute) as $reflection) {
                     $instances[] = $reflection->newInstance();
                 }
             }
 
-            self::$attributes[$model::class][$attribute] = $instances;
+            self::$attributes[$name][$attribute] = $instances;
         }
 
         /** @var list<TAttribute> */
-        return self::$attributes[$model::class][$attribute];
+        return self::$attributes[$name][$attribute];
     }
 
     /**
@@ -1417,11 +1560,6 @@ final class OrderedRelation
         return ($item instanceof Pivot ? $template : $item)->usesTimestamps();
     }
 
-    private static function fillPosition(Model $item, mixed $position): void
-    {
-        $item->forceFill([self::POSITION => $position])->syncOriginalAttributes([self::POSITION]);
-    }
-
     private static function keyOf(Model $item): int|string
     {
         $key = $item->getKey();
@@ -1450,7 +1588,7 @@ final class OrderedRelation
         usort($parents, self::lockOrder(...));
 
         foreach ($parents as $parent) {
-            $parent->newQueryWithoutScopes()->whereKey($parent->getKey())->toBase()->lock('for no key update')->first([$parent->getKeyName()]);
+            $parent->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($parent->getKey())->toBase()->lock('for no key update')->first([$parent->getKeyName()]);
         }
     }
 
@@ -1544,7 +1682,7 @@ final class OrderedRelation
         $ids = array_keys($changed);
         $copies = OrderWrite::copies($this->keys->item, $ids, $this->keys->item->usesTimestamps());
 
-        $this->keys->item->newQueryWithoutScopes()->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $ids)->update([self::RANK_KEY => null]);
+        $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $ids)->update([self::RANK_KEY => null]);
 
         foreach ($changed as $id => $key) {
             if (array_key_exists($id, $copies)) {
@@ -1719,46 +1857,6 @@ final class OrderedRelation
     }
 
     /**
-     * @param  EloquentBuilder<Model>  $query
-     */
-    private function selectPositions(EloquentBuilder $query, bool $pivot): void
-    {
-        $base = $query->getQuery();
-        $table = $this->keys->item->getTable();
-        $numbered = $this->numbered($this->members(), [$this->keys->item->qualifyColumn('*')]);
-        $sql = sprintf('(%s) as %s', $numbered->toSql(), $base->getGrammar()->wrapTable($table));
-        $numbers = static fn (mixed $table): bool => $table instanceof Expression && $table->getValue($base->getGrammar()) === $sql;
-
-        if (! $pivot) {
-            if (! $numbers($base->from)) {
-                $base->fromRaw($sql, $numbered->getBindings());
-            }
-
-            return;
-        }
-
-        $joins = $base->joins ?? [];
-
-        if (array_any($joins, static fn (JoinClause $join): bool => $numbers($join->table))) {
-            return;
-        }
-
-        $index = array_find_key($joins, static fn (JoinClause $join): bool => $join->table === $table)
-            ?? throw new LogicException(sprintf('[%s::%s()] does not join the pivot table [%s].', $this->parent::class, $this->relationName, $table));
-
-        $join = clone $joins[$index];
-        $join->table = new Expression($sql);
-        $base->joins[$index] = $join;
-        $base->setBindings([...$numbered->getBindings(), ...$base->getRawBindings()['join']], 'join');
-
-        if ($base->columns === null) {
-            $query->select($query->getModel()->qualifyColumn('*'));
-        }
-
-        $base->addSelect(sprintf('%s as pivot_%s', $this->keys->item->qualifyColumn(self::POSITION), self::POSITION));
-    }
-
-    /**
      * @param  non-empty-list<self>  $relations
      * @param  list<Model>  $items
      * @return array<string, mixed>
@@ -1807,7 +1905,7 @@ final class OrderedRelation
 
     private function indexedRows(): Builder
     {
-        $rows = $this->keys->item->newQueryWithoutScopes()->toBase();
+        $rows = $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase();
 
         foreach ($this->keys->pointingAt($this->parent) as $column => $value) {
             $rows->where($this->keys->item->qualifyColumn($column), $value);
@@ -1842,6 +1940,6 @@ final class OrderedRelation
 
     private function parentRow(): Builder
     {
-        return $this->parent->newQueryWithoutScopes()->whereKey($this->parent->getKey())->toBase();
+        return $this->parent->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($this->parent->getKey())->toBase();
     }
 }

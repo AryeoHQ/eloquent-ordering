@@ -11,7 +11,6 @@ use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 use Illuminate\Database\Eloquent\Relations\Pivot;
-use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
@@ -50,7 +49,6 @@ use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
-use Tests\Fixtures\Support\Shapes\HasManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Tracks\Track;
@@ -116,22 +114,8 @@ class OrderedRelationTest extends TestCase
     public static function positionedQueries(): iterable
     {
         return Shape::crossed([
-            'a filter after withPositions()' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->withPositions()->whereIn($column, $ids)->get()],
-            'a filter before withPositions()' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->whereIn($column, $ids)->withPositions()->get()],
-            'withPositions() twice' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->withPositions()->whereIn($column, $ids)->withPositions()->get()],
-        ]);
-    }
-
-    /**
-     * @return iterable<string, list<mixed>>
-     */
-    public static function copiedQueries(): iterable
-    {
-        return Shape::crossed([
-            'the copy alone' => [fn (Relation $query): array => [(clone $query)->withPositions(), $query], [true, false]],
-            'the original alone' => [fn (Relation $query): array => [clone $query, $query->withPositions()], [false, true]],
-            'both' => [fn (Relation $query): array => [(clone $query)->withPositions(), $query->withPositions()], [true, true]],
-            'a copy of a numbered query, numbered again' => [fn (Relation $query): array => [(clone $query->withPositions())->withPositions(), $query], [true, true]],
+            'a filter' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->whereIn($column, $ids)->get()],
+            'a filter and another order' => [fn (OrderedRelation $relation, string $column, array $ids): iterable => $relation->query()->whereIn($column, $ids)->reorder($column, 'desc')->get()],
         ]);
     }
 
@@ -181,14 +165,15 @@ class OrderedRelationTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
-    public function it_numbers_every_member_in_one_query_as_the_accessor_and_the_order_change_do(Shape $shape): void
+    public function it_selects_the_position_of_every_member_in_the_query_that_reads_it_as_the_order_change_numbers_it(Shape $shape): void
     {
         [$parent, $members] = $shape->with(4);
         $shape->add($parent, hidden: true);
         $change = $members[2]->move(Placement::first(), expected: null);
+        $shape->orderedRelation($parent)->query()->get();
         DB::enableQueryLog();
 
-        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->withPositions()->get());
+        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->get());
 
         $this->assertCount(1, DB::getQueryLog());
         $this->assertSame(array_combine($change->order, range(1, count($change->order))), $positions);
@@ -197,30 +182,13 @@ class OrderedRelationTest extends TestCase
 
     #[DataProvider('positionedQueries')]
     #[Test]
-    public function it_numbers_the_members_a_filter_keeps_by_their_place_among_every_member(Shape $shape, Closure $query): void
+    public function it_selects_for_the_members_a_filter_keeps_their_place_among_every_member(Shape $shape, Closure $query): void
     {
         [$parent, [, $second, , $fourth]] = $shape->with(4);
 
         $positions = $shape->selectedPositions($query($shape->orderedRelation($parent), $shape->memberTable().'.id', [$second->getKey(), $fourth->getKey()]));
 
-        $this->assertSame([$second->getKey() => 2, $fourth->getKey() => 4], $positions);
-    }
-
-    /**
-     * @param  Closure(Relation<Model, Model, mixed>): array{Relation<Model, Model, mixed>, Relation<Model, Model, mixed>}  $copy
-     * @param  array{bool, bool}  $numbered
-     */
-    #[DataProvider('copiedQueries')]
-    #[Test]
-    public function it_numbers_each_copy_of_a_query_that_withpositions_names(Shape $shape, Closure $copy, array $numbered): void
-    {
-        [$parent, [$first, $second]] = $shape->with(2);
-        $positions = [$first->getKey() => 1, $second->getKey() => 2];
-        $missing = [$first->getKey() => 'missing', $second->getKey() => 'missing'];
-
-        $queries = $copy($shape->orderedRelation($parent)->query());
-
-        $this->assertSame([$numbered[0] ? $positions : $missing, $numbered[1] ? $positions : $missing], array_map(fn (Relation $query): array => $this->loadedPositions($shape, $query->get()), $queries));
+        $this->assertEquals([$second->getKey() => 2, $fourth->getKey() => 4], $positions);
     }
 
     #[DataProvider('shapes')]
@@ -229,7 +197,7 @@ class OrderedRelationTest extends TestCase
     {
         [$parent, $members] = $shape->with(5);
 
-        $page = $shape->orderedRelation($parent)->query()->withPositions()->paginate(2, page: 2);
+        $page = $shape->orderedRelation($parent)->query()->paginate(2, page: 2);
 
         $this->assertSame(5, $page->total());
         $this->assertSame([$members[2]->getKey() => 3, $members[3]->getKey() => 4], $shape->selectedPositions($page->items()));
@@ -242,7 +210,7 @@ class OrderedRelationTest extends TestCase
         [$parent, [$first, $second, $third]] = $shape->with(3);
         $second->delete();
 
-        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->withPositions()->get());
+        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->get());
 
         $this->assertSame([$first->getKey() => 1, $third->getKey() => 2], $positions);
     }
@@ -254,7 +222,7 @@ class OrderedRelationTest extends TestCase
         [$parent, [$first, $second, $third]] = $shape->with(3);
         Customer::query()->findOrFail($second->getAttribute('customer_id'))->delete();
 
-        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->withPositions()->get());
+        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->get());
 
         $this->assertSame([$first->getKey() => 1, $third->getKey() => 2], $positions);
         $this->assertNull($shape->find($this->key($second))->getAttribute('position'));
@@ -267,115 +235,23 @@ class OrderedRelationTest extends TestCase
         [$parent, [$first, $second, $third]] = $shape->with(3);
         DB::table($shape->memberTable())->where('id', $first->getKey())->update([OrderedRelation::RANK_KEY => null]);
 
-        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->withPositions()->get());
+        $positions = $shape->selectedPositions($shape->orderedRelation($parent)->query()->get());
 
         $this->assertSame([$second->getKey() => 1, $third->getKey() => 2, $first->getKey() => null], $positions);
         $this->assertNull($shape->find($this->key($first))->getAttribute('position'));
     }
 
     #[Test]
-    public function it_numbers_no_row_its_relation_excludes(): void
-    {
-        $section = Section::create();
-        $first = $this->addAsset($section, 'Shown');
-        $this->addAsset($section, 'Excluded');
-        $last = $this->addAsset($section, 'Shown');
-
-        $parent = (new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'sections';
-
-            /**
-             * @return HasMany<Asset, $this>
-             */
-            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.title'])]
-            public function assets(): HasMany
-            {
-                return $this->hasMany(Asset::class, 'section_id')->where('title', 'Shown');
-            }
-        })->newQuery()->findOrFail($section->id);
-
-        $positions = (new HasManyShape)->selectedPositions($parent->orderedRelation(SectionRevision::AssetsOrder)->query()->withPositions()->get());
-
-        $this->assertSame([$first->id => 1, $last->id => 2], $positions);
-    }
-
-    #[Test]
-    public function it_numbers_only_the_query_of_an_ordered_relation(): void
-    {
-        try {
-            Section::create()->assets()->withPositions();
-            $this->fail('A relation that no ordered relation returned was numbered.');
-        } catch (LogicException $exception) {
-            $this->assertStringContainsString('[withPositions()] numbers only a query that', $exception->getMessage());
-        }
-    }
-
-    #[Test]
-    public function it_numbers_no_pivot_relation_that_does_not_join_its_pivot_table(): void
-    {
-        [$listing] = (new BelongsToManyShape)->with(1);
-
-        $parent = (new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'listings';
-
-            /**
-             * @return BelongsToMany<Model, $this, ListingCustomer>
-             */
-            #[OrdersRelation(ListingRevision::CustomersOrder)]
-            public function customers(): BelongsToMany
-            {
-                $relation = $this->belongsToMany(OrderedRelationTest::unwatchedCustomer(), 'listing_customer', 'listing_id', 'customer_id')->using(ListingCustomer::class)->wherePivotNull('deleted_at');
-                $relation->getBaseQuery()->joins = [];
-
-                return $relation;
-            }
-        })->newQuery()->findOrFail($listing->getKey());
-
-        try {
-            $parent->orderedRelation(ListingRevision::CustomersOrder)->query()->withPositions();
-            $this->fail('A pivot relation without its pivot join was numbered.');
-        } catch (LogicException $exception) {
-            $this->assertStringContainsString('does not join the pivot table [listing_customer].', $exception->getMessage());
-        }
-    }
-
-    #[Test]
-    public function it_numbers_the_members_of_a_pivot_relation_that_binds_its_own_join(): void
+    public function it_selects_the_pivot_position_beside_a_join_that_binds_its_own_value(): void
     {
         $shape = new BelongsToManyShape;
         [$listing, [$first, $second, $third]] = $shape->with(3);
         Customer::query()->whereKey([$first->getAttribute('customer_id'), $third->getAttribute('customer_id')])->update(['name' => 'Kept']);
 
-        $parent = (new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'listings';
-
-            /**
-             * @return BelongsToMany<Model, $this, ListingCustomer>
-             */
-            #[OrdersRelation(ListingRevision::CustomersOrder)]
-            public function customers(): BelongsToMany
-            {
-                return $this->belongsToMany(OrderedRelationTest::unwatchedCustomer(), 'listing_customer', 'listing_id', 'customer_id')
-                    ->using(ListingCustomer::class)
-                    ->wherePivotNull('deleted_at')
-                    ->leftJoin('customers as kept', fn (JoinClause $join): JoinClause => $join->on('kept.id', '=', 'customers.id')->where('kept.name', '=', 'Kept'))
-                    ->select(['customers.*', 'kept.name as kept_name']);
-            }
-        })->newQuery()->findOrFail($listing->getKey());
-
-        $results = $parent->orderedRelation(ListingRevision::CustomersOrder)->query()->withPositions()->get();
+        $results = $shape->orderedRelation($listing)->query()
+            ->leftJoin('customers as kept', fn (JoinClause $join): JoinClause => $join->on('kept.id', '=', 'customers.id')->where('kept.name', '=', 'Kept'))
+            ->addSelect('kept.name as kept_name')
+            ->get();
 
         $this->assertSame([$first->getKey() => 1, $second->getKey() => 2, $third->getKey() => 3], $shape->selectedPositions($results));
         $this->assertSame(['Kept', null, 'Kept'], $results->pluck('kept_name')->all());
@@ -831,7 +707,8 @@ class OrderedRelationTest extends TestCase
         $moving->playlist()->associate($video);
 
         $this->assertTrue($moving->save());
-        $this->assertNull($video->orderedRelation(PlaylistRevision::TracksOrder)->position($moving));
+        $this->assertNull($video->orderedRelation(PlaylistRevision::TracksOrder)->memberPosition($moving));
+        $this->assertNull($moving->position);
         $this->assertSame([[$audio->id, [[$moving->id, null, 2]]]], $this->reorders);
         $this->assertNotSame($revisions[0], $this->tracksRevision($audio));
         $this->assertSame($revisions[1], $this->tracksRevision($video));
@@ -1100,6 +977,40 @@ class OrderedRelationTest extends TestCase
             }
         }, SectionRevision::AssetsOrder, '::assets()] filters its members by [sections.name], which its membership does not declare.'];
 
+        yield 'a parent column compared by another operator' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.title', 'sections.name'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('assets.title', '!=', $this->getAttribute('name'));
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] filters its members by the parent column [sections.name] in a form other than [<item column> = sections.name]'];
+
+        yield 'a parent column in a list' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.title', 'sections.name'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->whereIn('assets.title', [$this->getAttribute('name'), 'Shown']);
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] filters its members by the parent column [sections.name] in a form other than [<item column> = sections.name]'];
+
         yield 'an unqualified pivot column' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
@@ -1359,23 +1270,6 @@ class OrderedRelationTest extends TestCase
         assert($parent instanceof OrdersRelations && $parent instanceof Revisioned);
 
         return $parent;
-    }
-
-    /**
-     * @param  iterable<Model>  $results
-     * @return array<int|string, mixed>
-     */
-    private function loadedPositions(Shape $shape, iterable $results): array
-    {
-        $positions = [];
-
-        foreach ($results as $result) {
-            $item = $shape->item($result);
-            $attributes = $item->getAttributes();
-            $positions[$this->key($item)] = array_key_exists(OrderedRelation::POSITION, $attributes) ? $attributes[OrderedRelation::POSITION] : 'missing';
-        }
-
-        return $positions;
     }
 
     /**

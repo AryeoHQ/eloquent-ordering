@@ -7,7 +7,9 @@ namespace Support\Database\Eloquent\Ordering\Provides;
 use Illuminate\Database\Eloquent\Model;
 use Support\Database\Eloquent\Concurrency\Concerns\WritesInTransactions;
 use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
+use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 
 /**
  * @phpstan-require-extends Model
@@ -22,6 +24,12 @@ trait OrdersThroughPivots
     public static function bootOrdersThroughPivots(): void
     {
         Provider::listenToPivotParentsOf(static::class);
+
+        static::addGlobalScope(new SelectsPosition);
+
+        foreach (OrderedRelation::orderedThrough(static::class) as $parent) {
+            $parent::addGlobalScope(new SelectsPosition);
+        }
     }
 
     /**

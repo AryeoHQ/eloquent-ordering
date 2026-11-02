@@ -6,6 +6,8 @@ namespace Support\Database\Eloquent\Ordering\Provides;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -16,18 +18,22 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Ordering\Attributes\OrderedThrough;
 use Support\Database\Eloquent\Ordering\Events\Reordered;
+use Support\Database\Eloquent\Ordering\Placement;
 use Support\Database\Eloquent\Ordering\PositionChange;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
 use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
+use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Listings\NamedListing;
+use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
+use Tests\Fixtures\Support\Speakers\Speaker;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\TestCase;
@@ -47,6 +53,68 @@ class OrdersThroughPivotsTest extends TestCase
     public static function pivots(): iterable
     {
         return PivotShape::pivots();
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_selects_the_pivot_position_in_the_query_of_each_relation_that_reads_the_pivots(PivotShape $shape): void
+    {
+        [$parent, $members] = $shape->with(3);
+        $change = $members[2]->move(Placement::first(), expected: null);
+        $expected = array_combine($change->order, range(1, count($change->order)));
+        $shape->customers($parent)->get();
+        DB::enableQueryLog();
+
+        $lazy = $shape->selectedPositions($shape->customers($parent)->withPivot('id')->get());
+        $eager = $shape->selectedPositions($parent->newQuery()->with(['customers' => fn (Relation $customers): mixed => $customers instanceof BelongsToMany ? $customers->withPivot('id') : $customers])->findOrFail($parent->getKey())->getRelation('customers'));
+
+        $this->assertCount(3, DB::getQueryLog());
+        $this->assertEquals($expected, $lazy);
+        $this->assertEquals($expected, $eager);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_selects_the_pivot_position_on_the_inverse_side_of_a_pivot_relation(PivotShape $shape): void
+    {
+        [$first, [$firstMember]] = $shape->with(1);
+        $second = $shape->createParent();
+        $shape->add($second);
+        $customer = Customer::query()->findOrFail($firstMember->getAttribute('customer_id'));
+        $shape->customers($second)->attach($customer->id);
+        $inverse = $first instanceof Listing ? 'listings' : 'tours';
+
+        $positions = $customer->{$inverse}()->get()->mapWithKeys(fn (Model $parent): array => [$parent->getKey() => $parent->getRelation('pivot')->getAttribute('position')])->all();
+
+        $this->assertSame([$first->getKey() => 1, $second->getKey() => 2], $positions);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_selects_no_pivot_position_for_a_pivot_whose_customer_is_trashed(PivotShape $shape): void
+    {
+        [$parent, [, $member]] = $shape->with(2);
+        $customer = Customer::query()->findOrFail($member->getAttribute('customer_id'));
+        $customer->delete();
+        $inverse = $parent instanceof Listing ? 'listings' : 'tours';
+
+        $pivots = Customer::query()->withTrashed()->findOrFail($customer->id)->{$inverse}()->get()->map(fn (Model $parent): mixed => $parent->getRelation('pivot'));
+
+        $this->assertSame([null], $pivots->map(fn (Model $pivot): mixed => $pivot->getAttribute('position'))->all());
+    }
+
+    #[Test]
+    public function it_selects_the_position_of_a_related_model_that_is_ordered_itself_beside_its_pivot_position(): void
+    {
+        $panel = Panel::create();
+        $conference = Conference::create();
+        $speakers = array_map(fn (string $name): Speaker => Speaker::query()->create(['panel_id' => $panel->id, 'name' => $name]), ['Ada', 'Grace']);
+        $conference->speakers()->attach([$speakers[1]->id, $speakers[0]->id]);
+
+        $read = $conference->speakers()->orderBy('speakers.id')->get();
+
+        $this->assertSame([1, 2], $read->map(fn (Speaker $speaker): null|int => $speaker->position)->all());
+        $this->assertSame([2, 1], $read->map(fn (Speaker $speaker): mixed => $speaker->getRelation('pivot')->getAttribute('position'))->all());
     }
 
     #[DataProvider('pivots')]
