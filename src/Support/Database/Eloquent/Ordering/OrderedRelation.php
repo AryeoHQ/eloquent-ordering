@@ -20,6 +20,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Grammars\Grammar;
+use Illuminate\Database\Query\JoinClause;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
 use LogicException;
@@ -780,13 +781,14 @@ final class OrderedRelation
     {
         $item = $keys->item;
         $key = $item->getKeyName();
-        $member = static fn (string $column): string => self::MEMBER.'.'.$column;
+        [$inner, $owner, $relatedAlias] = self::innerAliases($qualifier);
+        $member = static fn (string $column): string => $inner.'.'.$column;
         $outer = static fn (string $column): string => $qualifier.'.'.$column;
-        $aliases = [$parent->getTable() => self::MEMBER_PARENT];
+        $aliases = [$parent->getTable() => $owner];
 
         $members = $connection->query()
-            ->from($item->getTable().' as '.self::MEMBER)
-            ->join($parent->getTable().' as '.self::MEMBER_PARENT, self::MEMBER_PARENT.'.'.$keys->ownerKey, '=', $member($keys->foreignKey))
+            ->from($item->getTable().' as '.$inner)
+            ->join($parent->getTable().' as '.$owner, $owner.'.'.$keys->ownerKey, '=', $member($keys->foreignKey))
             ->whereColumn($member($keys->foreignKey), '=', $outer($keys->foreignKey))
             ->whereNotNull($member(self::RANK_KEY));
 
@@ -796,16 +798,16 @@ final class OrderedRelation
 
         if ($relation instanceof BelongsToMany) {
             $related = $relation->getRelated();
-            $aliases[$related->getTable()] = self::MEMBER_RELATED;
-            $members->join($related->getTable().' as '.self::MEMBER_RELATED, self::MEMBER_RELATED.'.'.$relation->getRelatedKeyName(), '=', $member($relation->getRelatedPivotKeyName()));
-            self::whereLive($members, $related, self::MEMBER_RELATED);
+            $aliases[$related->getTable()] = $relatedAlias;
+            $members->join($related->getTable().' as '.$relatedAlias, $relatedAlias.'.'.$relation->getRelatedKeyName(), '=', $member($relation->getRelatedPivotKeyName()));
+            self::whereLive($members, $related, $relatedAlias);
         }
 
-        $aliases[$item->getTable()] = self::MEMBER;
-        self::whereLive($members, $item, self::MEMBER);
-        self::whereLive($members, $parent, self::MEMBER_PARENT);
+        $aliases[$item->getTable()] = $inner;
+        self::whereLive($members, $item, $inner);
+        self::whereLive($members, $parent, $owner);
 
-        $filters = self::membershipFilters($parent, $method, $aliases);
+        $filters = self::membershipFilters($parent, $method, $aliases, $inner, $owner);
 
         if ($filters->wheres !== []) {
             $members->addNestedWhereQuery($filters);
@@ -829,6 +831,16 @@ final class OrderedRelation
         return $grammar->substituteBindingsIntoRawSql($members->toSql(), array_replace($connection->prepareBindings($bindings), array_filter($bindings, is_bool(...))));
     }
 
+    /**
+     * @return array{string, string, string}
+     */
+    private static function innerAliases(string $qualifier): array
+    {
+        $aliases = [self::MEMBER, self::MEMBER_PARENT, self::MEMBER_RELATED];
+
+        return in_array($qualifier, $aliases, true) ? array_map(static fn (string $alias): string => $alias.'_inner', $aliases) : $aliases;
+    }
+
     private static function whereLive(Builder $query, Model $model, string $alias): void
     {
         $deletedAt = in_array(SoftDeletes::class, class_uses_recursive($model), true) && method_exists($model, 'getDeletedAtColumn') ? $model->getDeletedAtColumn() : null;
@@ -841,14 +853,14 @@ final class OrderedRelation
     /**
      * @param  array<string, string>  $aliases
      */
-    private static function membershipFilters(Model $parent, string $method, array $aliases): Builder
+    private static function membershipFilters(Model $parent, string $method, array $aliases, string $member, string $owner): Builder
     {
         $pairs = self::$membershipPairs[sprintf('%s::%s()', $parent::class, $method)] ?? [];
         $base = self::probedRelation($parent, $method, array_keys($pairs))->getBaseQuery();
         $filters = $base->newQuery();
         $probes = array_map(self::probe(...), array_keys($pairs));
 
-        self::copyFilters($base->wheres, $filters, $pairs, $aliases);
+        self::copyFilters($base->wheres, $filters, $pairs, $aliases, $member, $owner);
 
         return $filters->setBindings(array_values(array_filter(
             $base->getRawBindings()['where'],
@@ -861,18 +873,18 @@ final class OrderedRelation
      * @param  array<string, string>  $pairs
      * @param  array<string, string>  $aliases
      */
-    private static function copyFilters(array $wheres, Builder $into, array $pairs, array $aliases): void
+    private static function copyFilters(array $wheres, Builder $into, array $pairs, array $aliases, string $member, string $owner): void
     {
         $grammar = $into->getGrammar();
         $probes = array_combine(array_map(self::probe(...), array_keys($pairs)), array_keys($pairs));
-        $alias = static function (mixed $column) use ($aliases): string {
+        $alias = static function (mixed $column) use ($aliases, $member): string {
             throw_unless(is_string($column), LogicException::class, 'A membership filter names a column by an expression.');
 
             $segments = explode('.', $column);
             $name = array_pop($segments);
             $table = array_pop($segments);
 
-            return ($table === null ? self::MEMBER : ($aliases[$table] ?? $table)).'.'.$name;
+            return ($table === null ? $member : ($aliases[$table] ?? $table)).'.'.$name;
         };
 
         foreach ($wheres as $where) {
@@ -886,16 +898,16 @@ final class OrderedRelation
             match ($where['type'] ?? null) {
                 'Basic' => $paired === null
                     ? $into->where($alias($where['column'] ?? null), is_string($where['operator'] ?? null) ? $where['operator'] : '=', $value, $boolean)
-                    : $into->whereRaw(sprintf('%s is not distinct from %s', $grammar->wrap($alias($where['column'] ?? null)), $grammar->wrap(self::MEMBER_PARENT.'.'.$paired)), [], $boolean),
+                    : $into->whereRaw(sprintf('%s is not distinct from %s', $grammar->wrap($alias($where['column'] ?? null)), $grammar->wrap($owner.'.'.$paired)), [], $boolean),
                 'Null' => $into->whereNull($alias($where['column'] ?? null), $boolean),
                 'NotNull' => $into->whereNotNull($alias($where['column'] ?? null), $boolean),
                 'In' => $into->whereIn($alias($where['column'] ?? null), is_array($where['values'] ?? null) ? $where['values'] : [], $boolean),
                 'NotIn' => $into->whereNotIn($alias($where['column'] ?? null), is_array($where['values'] ?? null) ? $where['values'] : [], $boolean),
                 'Column' => $into->whereColumn($alias($where['first'] ?? null), is_string($where['operator'] ?? null) ? $where['operator'] : '=', $alias($where['second'] ?? null), $boolean),
-                'Nested' => $into->whereNested(static function (Builder $query) use ($nested, $pairs, $aliases): void {
+                'Nested' => $into->whereNested(static function (Builder $query) use ($nested, $pairs, $aliases, $member, $owner): void {
                     throw_unless($nested instanceof Builder, LogicException::class, 'A nested membership filter holds no query.');
 
-                    self::copyFilters($nested->wheres, $query, $pairs, $aliases);
+                    self::copyFilters($nested->wheres, $query, $pairs, $aliases, $member, $owner);
                 }, $boolean),
                 default => throw new LogicException(sprintf('A membership filter of type [%s] cannot be reproduced for each row.', get_debug_type($where['type'] ?? null))),
             };
@@ -1267,6 +1279,8 @@ final class OrderedRelation
             return;
         }
 
+        self::requireOwnJoins($name, $relation);
+
         $keys = self::describe($relation);
         $item = $keys->item;
         $related = $relation instanceof BelongsToMany ? $relation->getRelated() : null;
@@ -1323,6 +1337,27 @@ final class OrderedRelation
         }
 
         self::$verifiedMemberships[$name] = true;
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     */
+    private static function requireOwnJoins(string $name, HasMany|MorphMany|BelongsToMany $relation): void
+    {
+        $own = $relation instanceof BelongsToMany ? [$relation->getTable()] : [];
+
+        foreach ($relation->getBaseQuery()->joins ?? [] as $join) {
+            $table = $join instanceof JoinClause && is_string($join->table) ? $join->table : null;
+            $index = $table === null ? false : array_search($table, $own, true);
+
+            throw_if($index === false, LogicException::class, sprintf(
+                '[%s] joins [%s] to its members, so a position query cannot reproduce the join for each row.',
+                $name,
+                $table ?? 'a subquery',
+            ));
+
+            unset($own[$index]);
+        }
     }
 
     /**

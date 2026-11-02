@@ -1101,6 +1101,44 @@ class OrderedRelationTest extends TestCase
 
         yield 'a subquery that reads the row it filters' => [self::correlatedFolder(...), FolderRevision::DocumentsOrder, '::documents()] filters its members through a subquery that reads a table outside it'];
 
+        yield 'a joined table' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'folders';
+
+            /**
+             * @return HasMany<KindedDocument, $this>
+             */
+            #[OrdersRelation(FolderRevision::DocumentsOrder)]
+            public function documents(): HasMany
+            {
+                return $this->hasMany(KindedDocument::class, 'folder_id')
+                    ->join('folders as homes', static fn (JoinClause $join): JoinClause => $join->on('homes.id', '=', 'documents.home_folder_id')->where('homes.name', '=', 'Archive'))
+                    ->select('documents.*');
+            }
+        }, FolderRevision::DocumentsOrder, '::documents()] joins [folders as homes] to its members, so a position query cannot reproduce the join for each row.'];
+
+        yield 'a join beside the pivot table' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            #[OrdersRelation(ListingRevision::CustomersOrder)]
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')
+                    ->using(ListingCustomer::class)
+                    ->join('customers as kept', 'kept.id', '=', 'customers.id');
+            }
+        }, ListingRevision::CustomersOrder, '::customers()] joins [customers as kept] to its members, so a position query cannot reproduce the join for each row.'];
+
         yield 'an unqualified pivot column' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
