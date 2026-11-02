@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering;
 
 use Closure;
+use Illuminate\Contracts\Database\Query\Expression as ExpressionContract;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
@@ -19,6 +20,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Grammars\Grammar;
+use Illuminate\Database\QueryException;
 use Illuminate\Support\Str;
 use LogicException;
 use ReflectionAttribute;
@@ -64,6 +66,8 @@ final class OrderedRelation
     private const string MEMBER_PARENT = 'ordering_parent';
 
     private const string MEMBER_RELATED = 'ordering_related';
+
+    private const string OUTER = 'ordering_outer';
 
     /** @var array<class-string, array<class-string, list<object>>> */
     private static array $attributes = [];
@@ -764,8 +768,16 @@ final class OrderedRelation
      */
     private static function countedMembers(array $membership, string $qualifier, Connection $connection): string
     {
-        ['parent' => $parent, 'keys' => $keys] = $membership;
-        ['method' => $method, 'relation' => $relation] = self::declaration($parent, $membership['revision']);
+        ['method' => $method, 'relation' => $relation] = self::declaration($membership['parent'], $membership['revision']);
+
+        return self::memberCount($membership['parent'], $method, $relation, $membership['keys'], $qualifier, $connection);
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     */
+    private static function memberCount(Model $parent, string $method, HasMany|MorphMany|BelongsToMany $relation, RelationKeys $keys, string $qualifier, Connection $connection): string
+    {
         $item = $keys->item;
         $key = $item->getKeyName();
         $member = static fn (string $column): string => self::MEMBER.'.'.$column;
@@ -892,11 +904,12 @@ final class OrderedRelation
 
     /**
      * @param  list<string>  $columns
+     * @param  list<string>  $nulled
      * @return Relation<*, *, *>
      */
-    private static function probedRelation(Model $parent, string $method, array $columns): Relation
+    private static function probedRelation(Model $parent, string $method, array $columns, array $nulled = []): Relation
     {
-        $variant = self::probed($parent, $columns);
+        $variant = self::probed($parent, $columns, $nulled);
 
         try {
             $relation = Relation::noConstraints(static fn (): mixed => $variant->{$method}());
@@ -919,13 +932,27 @@ final class OrderedRelation
 
     /**
      * @param  list<string>  $columns
+     * @param  list<string>  $nulled
      */
-    private static function probed(Model $parent, array $columns): Model
+    private static function probed(Model $parent, array $columns, array $nulled = []): Model
     {
         $variant = (clone $parent)->mergeCasts(array_fill_keys($columns, 'string'));
-        $variant->setRawAttributes([...$parent->getAttributes(), ...array_combine($columns, array_map(self::probe(...), $columns))]);
+        $variant->setRawAttributes([...$parent->getAttributes(), ...array_combine($columns, array_map(self::probe(...), $columns)), ...array_fill_keys($nulled, null)]);
 
         return $variant;
+    }
+
+    /**
+     * @param  list<string>  $columns
+     */
+    private static function comparesNullAsNull(Model $parent, string $method, array $columns, string $column, Builder $probed, int|string $index): bool
+    {
+        $expected = clone $probed;
+        $expected->wheres[$index] = ['type' => 'Null', 'column' => $probed->wheres[$index]['column'], 'boolean' => $probed->wheres[$index]['boolean']];
+        $expected->setBindings(array_values(array_filter($probed->getRawBindings()['where'], static fn (mixed $binding): bool => $binding !== self::probe($column))), 'where');
+        $nulled = self::probedRelation($parent, $method, $columns, [$column])->getBaseQuery();
+
+        return [$nulled->toSql(), $nulled->getBindings()] === [$expected->toSql(), $expected->getBindings()];
     }
 
     /**
@@ -941,20 +968,29 @@ final class OrderedRelation
 
         foreach ($columns as $index => $column) {
             $probe = self::probe($column);
-            $paired = array_values(array_filter($base->wheres, static fn (mixed $where): bool => is_array($where)
+            $paired = array_filter($base->wheres, static fn (mixed $where): bool => is_array($where)
                 && ($where['type'] ?? null) === 'Basic'
                 && ($where['operator'] ?? null) === '='
                 && ($where['value'] ?? null) === $probe
                 && is_string($where['column'] ?? null)
-                && strtolower(is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and') === 'and'));
-            $itemColumn = $paired[0]['column'] ?? null;
+                && strtolower(is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and') === 'and');
+            $where = array_key_first($paired);
+            $itemColumn = $where === null ? null : $paired[$where]['column'];
 
-            throw_unless(count($paired) === 1 && is_string($itemColumn) && count(array_keys($bindings, $probe, true)) === 1, LogicException::class, sprintf(
-                '[%s] filters its members by the parent column [%s] in a form other than [<item column> = %s], so a position query cannot reproduce the filter for each row.',
-                $name,
-                $read[$index],
-                $read[$index],
-            ));
+            throw_unless(
+                $where !== null
+                && count($paired) === 1
+                && is_string($itemColumn)
+                && count(array_keys($bindings, $probe, true)) === 1
+                && self::comparesNullAsNull($parent, $method, $columns, $column, $base, $where),
+                LogicException::class,
+                sprintf(
+                    '[%s] filters its members by the parent column [%s] in a form other than [<item column> = %s], so a position query cannot reproduce the filter for each row.',
+                    $name,
+                    $read[$index],
+                    $read[$index],
+                ),
+            );
 
             $pairs[$column] = $itemColumn;
         }
@@ -1173,13 +1209,9 @@ final class OrderedRelation
     /**
      * @param  BelongsToMany<Model, Model>  $relation
      */
-    private static function requireOrderedThrough(Model $parent, string $method, OrdersRelation $declaration, BelongsToMany $relation): void
+    private static function requireOrderedThrough(Model $parent, string $method, BelongsToMany $relation): void
     {
         $related = $relation->getRelated();
-
-        if (self::watchedRelatedColumns($related, $declaration) === []) {
-            return;
-        }
 
         throw_unless(in_array(OrdersThroughPivots::class, class_uses_recursive($related), true), LogicException::class, sprintf(
             '[%s::%s()] orders the pivots of [%s], so [%s] must use [%s].',
@@ -1284,12 +1316,53 @@ final class OrderedRelation
         }
 
         self::$membershipPairs[$name] = self::membershipPairs($name, $parent, $method, $read);
+        self::requireUncorrelatedSubqueries($name, $parent, $method, $relation, $keys);
 
         if ($relation instanceof BelongsToMany) {
-            self::requireOrderedThrough($parent, $method, $declaration, $relation);
+            self::requireOrderedThrough($parent, $method, $relation);
         }
 
         self::$verifiedMemberships[$name] = true;
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     */
+    private static function requireUncorrelatedSubqueries(string $name, Model $parent, string $method, HasMany|MorphMany|BelongsToMany $relation, RelationKeys $keys): void
+    {
+        $connection = $relation->getBaseQuery()->getConnection();
+
+        if (! $connection instanceof Connection || $connection->getDriverName() !== 'pgsql' || ! self::filtersBySubquery($relation->getBaseQuery()->wheres)) {
+            return;
+        }
+
+        $grammar = $connection->getQueryGrammar();
+        $probe = sprintf(
+            'explain select (%s) from %s',
+            self::memberCount($parent, $method, $relation, $keys, self::OUTER, $connection),
+            $grammar->wrapTable($keys->item->getTable().' as '.self::OUTER),
+        );
+
+        try {
+            $connection->transaction(static fn (): array => $connection->select($probe));
+        } catch (QueryException $exception) {
+            throw new LogicException(sprintf(
+                '[%s] filters its members through a subquery that reads a table outside it, so a position query cannot reproduce the filter for each row.',
+                $name,
+            ), previous: $exception);
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $wheres
+     */
+    private static function filtersBySubquery(array $wheres): bool
+    {
+        return array_any($wheres, static fn (mixed $where): bool => is_array($where) && match ($where['type'] ?? null) {
+            'In', 'NotIn' => array_any(is_array($where['values'] ?? null) ? $where['values'] : [], static fn (mixed $value): bool => $value instanceof ExpressionContract),
+            'Nested' => ($where['query'] ?? null) instanceof Builder && self::filtersBySubquery($where['query']->wheres),
+            default => false,
+        });
     }
 
     /**

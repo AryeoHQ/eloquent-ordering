@@ -268,9 +268,11 @@ The package checks each relation once per process, when it first resolves. The c
 - a clause filters by an expression, or joins a top-level filter with `or`, because that filter reaches the rows of other parents;
 - a pivot relation filters by an unqualified column;
 - the relation reads a column that the declaration does not name;
-- the relation reads a parent column in any form other than one `where('<item column>', $this->column)`, because the position query must compile the filter for each row.
+- the relation reads a parent column in any form other than one `where('<item column>', $this->column)`, because the position query must compile the filter for each row;
+- with the parent column set to `null`, the relation compiles that pair as anything but `whereNull('<item column>')`. A fallback such as `$this->kind ?? 'audio'` fails this check, and so does a clause that applies only when the column is set;
+- a `whereIn()` or `whereNotIn()` subquery reads a table outside its own `from`, such as the item table. The position query counts the members under an alias.
 
-The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The parent's `id` needs none either, but a filter that reads it must take the pair form, such as `where('assets.root_id', $this->id)`. The check reads the relation's clauses before any global scope applies, and `query()` removes every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query.
+The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The parent's `id` needs none either, but a filter that reads it must take the pair form, such as `where('assets.root_id', $this->id)`. The check reads the relation's clauses before any global scope applies, and `query()` removes every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query. A relation with a subquery filter runs one `explain` of its position query on PostgreSQL, inside a savepoint.
 
 The probe bypasses the column's cast, so `where('tracks.kind', $this->kind)` works when `kind` casts to an enum. A relation that reads the column through an accessor, or reads a property of the cast value such as `$this->kind->value`, throws `LogicException`.
 
@@ -299,7 +301,7 @@ $assets->concurrencyRevision();          // the order digest, one query
 
 ## A related model of an ordered pivot
 
-A pivot relation drops a pivot whose related model, such as a customer, is soft deleted. That model must use `OrdersThroughPivots`, implement `LocksParentsFirst`, and name in `#[OrderedThrough]` each parent class that orders its pivots:
+Every related model of an ordered pivot relation, such as a customer, must use `OrdersThroughPivots` and implement `LocksParentsFirst`. It must also name in `#[OrderedThrough]` each parent class that orders its pivots:
 
 ```php
 use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
@@ -314,7 +316,9 @@ class Customer extends Model implements LocksParentsFirst
 }
 ```
 
-The trait registers the related model's listeners when the model boots, so no configuration lists the parents. A parent throws `LogicException` on its first declaration read when its ordered `BelongsToMany` or `MorphToMany` relation reaches a related model that the order watches, and that model does not use `OrdersThroughPivots` or omits the parent from `#[OrderedThrough]`. The order watches a related model that soft deletes, or whose columns `membership:` names. A related model that the order does not watch needs neither. The trait runs the related model's `save()` and `delete()` in a transaction. It also provides `parentsToLockFirst()`. The check does not require `LocksParentsFirst`, but PHPStan reports a model that uses the trait without it.
+The trait registers the related model's listeners and the `SelectsPosition` scope when the model boots, so no configuration lists the parents. The scope selects `pivot_position` into each relation read that joins the pivot table, from either side. A parent throws `LogicException` on its first declaration read when its ordered `BelongsToMany` or `MorphToMany` relation reaches a misdeclared related model. Such a model does not use `OrdersThroughPivots`, or omits the parent from `#[OrderedThrough]`.
+
+The order watches a related model that soft deletes, because the relation drops its pivots, and a related model whose columns `membership:` names. On a related model that the order does not watch, the listeners lock no parent and report nothing. The trait runs the related model's `save()` and `delete()` in a transaction. It also provides `parentsToLockFirst()`. The check does not require `LocksParentsFirst`, but PHPStan reports a model that uses the trait without it.
 
 An `Ordered` model can also be the related model of an ordered pivot. It then uses both `IsOrdered` and `OrdersThroughPivots`, and implements `Ordered`, which extends `LocksParentsFirst`. Both traits take `parentsToLockFirst()` from one shared trait, so PHP reports no collision.
 
@@ -524,7 +528,7 @@ Asset::query()->whereKey($id)->delete();                              // changes
 - **A related model reads each parent that `#[OrderedThrough]` names on its first watched write.** It instantiates each parent, reads its method attributes, and builds each declared relation. A name that orders no pivot of the model is skipped without an error.
 - **A concurrent attach can escape a related model's soft delete.** Suppose another transaction attaches the related model to a new parent between the pivot read and the write. The soft delete does not lock that parent, and reports nothing to it. An attach that reaches the related row after the write waits for the related commit, so it reports what the related write left.
 - **A related model's soft delete without the package's `deleting` listener locks no parent and reports nothing.** A `deleting` listener that runs first and returns a value other than `null` stops the package's listener.
-- **A pivot write locks the related row only when the relation filters on it.** No fixture has a pivot relation whose related model has no `deleted_at` and no declared column, so that skip is untested for a pivot write.
+- **A pivot write locks the related row only when the relation filters on it.** A related model without `deleted_at` or a declared column is never locked, because no write to it changes the order.
 - **A pivot order with two live pivots of one related model under one parent is unsupported.** Its digest cannot tell the two pivots apart. Add the partial unique index from [Supported shapes](#supported-shapes) to refuse the second pivot.
 - **A hard delete of a related model with pivot rows is unsupported.** Let the pivot table's foreign key refuse it.
 
@@ -538,4 +542,4 @@ Asset::query()->whereKey($id)->delete();                              // changes
 | `ContendedOrder` (`RuntimeException`) | The item changed parent during each of 5 attempts to lock its order. |
 | `UnselectedPosition` (`LogicException`) | Code reads `position` on an item whose query selected none: an explicit select list, a group, a having, `distinct`, a union, `withoutPositions()`, a model's `$withCount`, `withoutGlobalScopes()`, or a `BelongsToMany` paginator or chunk. `isset()` and `??` throw too. The exception names the item. |
 | `WriteHalted` (`RuntimeException`) | A `saving` or `updating` listener returned `false` for a copy that an order write saved. The message names the model and its key. The write rolled back. |
-| `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a membership declares a timestamp that Eloquent sets, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order or a declared parent column after the package prepared the write, a watched related column changed without a prepared order write, or a relation reads a parent column in a form other than `<item column> = <parent column>`. On a parent's first declaration read: an ordered pivot relation reaches a watched related model that does not use `OrdersThroughPivots`, or that omits the parent from `#[OrderedThrough]`. |
+| `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a membership declares a timestamp that Eloquent sets, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order or a declared parent column after the package prepared the write, a watched related column changed without a prepared order write, a relation reads a parent column in a form other than `<item column> = <parent column>`, or a relation filters through a subquery that reads a table outside it. On a parent's first declaration read: an ordered pivot relation reaches a related model that does not use `OrdersThroughPivots`, or that omits the parent from `#[OrderedThrough]`. |

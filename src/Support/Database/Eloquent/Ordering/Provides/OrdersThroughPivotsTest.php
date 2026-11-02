@@ -23,8 +23,10 @@ use Support\Database\Eloquent\Ordering\PositionChange;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
 use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
+use Tests\Fixtures\Support\Agencies\PlainAgency;
 use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Customers\PlainCustomer;
 use Tests\Fixtures\Support\Customers\ShortlistedCustomer;
 use Tests\Fixtures\Support\Customers\TwiceOrderedCustomer;
 use Tests\Fixtures\Support\Events\ModelEvents;
@@ -131,6 +133,41 @@ class OrdersThroughPivotsTest extends TestCase
 
         $this->assertSame([1, 2], $read->map(fn (Speaker $speaker): null|int => $speaker->position)->all());
         $this->assertSame([2, 1], $read->map(fn (Speaker $speaker): mixed => $speaker->getRelation('pivot')->getAttribute('position'))->all());
+    }
+
+    #[Test]
+    public function it_selects_the_pivot_position_in_every_read_of_a_related_model_that_no_order_watches(): void
+    {
+        $agency = PlainAgency::query()->create();
+        $other = PlainAgency::query()->create();
+        [$first, $second] = [PlainCustomer::query()->create(), PlainCustomer::query()->create()];
+        $agency->customers()->attach([$second->id, $first->id]);
+        $other->customers()->attach($first->id);
+        $position = fn (Model $model): mixed => $model->getRelation('pivot')->getAttribute('position');
+
+        $lazy = $agency->customers()->orderBy('customers.id')->get()->map($position)->all();
+        $eager = PlainAgency::query()->with('customers')->findOrFail($agency->id)->customers->sortBy('id')->map($position)->values()->all();
+        $ordered = $agency->orderedRelation(AgencyRevision::CustomersOrder)->query()->get()->map($position)->all();
+        $inverse = $first->agencies()->orderBy('agencies.id')->get()->map($position)->all();
+
+        $this->assertSame([2, 1], $lazy);
+        $this->assertSame([2, 1], $eager);
+        $this->assertSame([1, 2], $ordered);
+        $this->assertSame([2, 1], $inverse);
+    }
+
+    #[Test]
+    public function it_locks_no_related_row_for_an_attach_when_no_order_watches_the_related_model(): void
+    {
+        $agency = PlainAgency::query()->create();
+        $customer = PlainCustomer::query()->create();
+        DB::enableQueryLog();
+
+        $agency->customers()->attach($customer->id);
+
+        $queries = array_column(DB::getQueryLog(), 'query');
+        $this->assertNotNull(array_find($queries, fn (string $query): bool => str_starts_with($query, 'insert into "agency_customer"')));
+        $this->assertNull(array_find($queries, fn (string $query): bool => str_contains($query, 'from "customers"') && str_ends_with($query, 'for share')));
     }
 
     #[DataProvider('pivots')]
