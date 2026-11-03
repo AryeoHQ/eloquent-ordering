@@ -150,12 +150,17 @@ Asset::query()->withoutPositions()->get();                    // no count, no po
 ```php
 class Asset extends Model implements Ordered
 {
+    /** @use HasBuilder<Builder<static>> */
     use HasBuilder;
+
     use IsOrdered;
 
+    /**
+     * @return Builder<static>
+     */
     public function newQueryWithoutScopes()
     {
-        return $this->selectPositionOnKeyQuery(parent::newQueryWithoutScopes());
+        return $this->selectPositionOnKeyQuery(parent::newQueryWithoutScopes()); // @phpstan-ignore return.type
     }
 }
 ```
@@ -194,6 +199,23 @@ Schema::table('assets', function (Blueprint $table): void {
 });
 
 DB::statement(<<<'SQL'
+    do $$
+    begin
+        if exists (
+            select 1
+            from assets
+            where deleted_at is null
+              and section_id in (select section_id from assets where rank_key is null and deleted_at is null)
+            group by section_id
+            having count(*) > 3844
+        ) then
+            raise exception 'A section to key holds more than 3844 live assets.';
+        end if;
+    end
+    $$
+    SQL);
+
+DB::statement(<<<'SQL'
     update assets
     set rank_key = 'b' || substr(digits.d, ranked.n / 62 + 1, 1) || substr(digits.d, ranked.n % 62 + 1, 1)
     from (
@@ -212,12 +234,14 @@ Schema::table('assets', function (Blueprint $table): void {
 ```
 
 - **A row without a rank key is not a member.** It has no `position`, `arrange()` does not take it, and the order digest leaves it out. A save that keeps its parent assigns it no key, so key every live row in the migration.
-- The statement keys each parent that holds a live row without a key. It keeps the parent's current key order, puts the rows without a key after them, and orders those by `sort_order`, then by `id`. `sort_order` stands for the column that holds the order today. Leave it out of the `order by` when no such column exists.
+- The `update` keys each parent that holds a live row without a key. It keeps the parent's current key order, puts the rows without a key after them, and orders those by `sort_order`, then by `id`. `sort_order` stands for the column that holds the order today. Leave it out of the `order by` when no such column exists.
 - A parent whose live rows all have keys keeps those keys. Trashed rows keep a `null` key, as the package leaves them.
-- The keys run from `b00` to `bzz`, so one parent takes at most 3,844 live rows.
-- Run the statement before `rankKeyIndex()`. PostgreSQL checks a unique index on each row, so a rekey can collide with a key that the same statement replaces later.
-- For a table without `deleted_at`, drop both `deleted_at is null` conditions. For a morph parent, partition and match by both columns. For a pivot table, partition by the parent key.
-- The statement bypasses Eloquent: it takes no lock and dispatches no `Reordered`. Code that predates the package and still runs during the rollout inserts rows without a key. Run the statement again once that code stops.
+- The keys run from `b00` to `bzz`, so the `update` keys at most 3,844 live rows per parent. The `do` block runs first and raises an error for a parent to key with more, so the `update` writes no invalid key.
+- Run the `update` before `rankKeyIndex()`. PostgreSQL checks a unique index on each row, so a rekey can collide with a key that the same statement replaces later.
+- For a table without `deleted_at`, drop every `deleted_at is null` condition. For a morph parent, partition, group, and match by both columns.
+- **A pivot table needs more first.** Give it an `id` primary key (UUID or integer) and `softDeletesTz()`. Remove every live duplicate `(parent key, related key)` pivot but one. Then run both statements, partitioned, grouped, and matched by the parent key. Last, add `rankKeyIndex()` with the parent key, and the partial unique index from [Supported shapes](#supported-shapes).
+- **Stop the code that predates the package before the migration runs, and run the statements once.** They bypass Eloquent: they take no lock and dispatch no `Reordered`. That code inserts rows without a key.
+- **A rollout that cannot stop that code first keys its new rows in one more migration, after the code stops.** That migration drops the index with `dropIndex('assets_section_id_rank_key_unique')`, runs both statements, and adds `rankKeyIndex('section_id')` again. With the index in place, the `update` fails. It renumbers every live row of a parent, and a package write can leave a key that a renumbered row takes.
 - A table that already has a `rank_key` column changes it with `$table->rankKey()->change()`. That makes it `varchar(64) collate "C" null`, and keeps every value.
 - A legacy column named `position` must go after the backfill. See [Limits](#limits).
 
@@ -253,7 +277,7 @@ class Asset extends Model implements Ordered
 }
 ```
 
-A pivot order also needs `#[OrderedThrough]` on the related model. See [A related model of an ordered pivot](#a-related-model-of-an-ordered-pivot). It also needs the partial unique index from [Supported shapes](#supported-shapes).
+A pivot order also needs `#[OrderedThrough]` on the related model. See [A related model of an ordered pivot](#a-related-model-of-an-ordered-pivot).
 
 **3. Read positions with no other call.**
 
@@ -372,7 +396,7 @@ The package checks each relation once per process, when it first resolves. The c
 - with the parent column set to `null`, the relation compiles that pair as anything but `whereNull('<item column>')`. A fallback such as `$this->kind ?? 'audio'` fails this check, and so does a clause that applies only when the column is set;
 - a `whereIn()` or `whereNotIn()` subquery reads a table outside its own `from`, such as the item table. The position query counts the members under an alias.
 
-The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The parent's `id` needs none either, but a filter that reads it must take the pair form, such as `where('assets.root_id', $this->id)`. The check reads the relation's clauses before any global scope applies, and an order write ignores every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query. A relation with a subquery filter runs one `explain` of its position query on PostgreSQL, inside a savepoint.
+The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The parent's `id` needs none either, but a filter that reads it must take the pair form, such as `where('assets.root_id', $this->id)`. The check reads the relation's clauses before any global scope applies, and an order write ignores every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query. A relation with a subquery filter runs one `explain` of its position query on PostgreSQL, inside a transaction, or a savepoint when the caller holds one.
 
 The probe bypasses the column's cast, so `where('tracks.kind', $this->kind)` works when `kind` casts to an enum. A relation that reads the column through an accessor, or reads a property of the cast value such as `$this->kind->value`, throws `LogicException`.
 
@@ -583,11 +607,11 @@ The package opens these transactions around the application's writes. Laravel's 
 
 | Write | What the package opens |
 |---|---|
-| `save()` or `delete()` of an item, of a parent that uses `HasOrderedRelations`, or of a related model that uses `OrdersThroughPivots` | One transaction, through eloquent-concurrency's `WritesInTransactions`, whether or not the write changes an order. The events that `save()` and `delete()` fire run inside it. `update()`, `restore()`, `forceDelete()`, `attach()`, and `detach()` reach `save()` or `delete()`, so each opens one too. `restoring`, `restored`, `forceDeleting`, and `forceDeleted` fire outside it. |
+| `save()` or `delete()` of an item, of a parent that uses `HasOrderedRelations`, or of a related model that uses `OrdersThroughPivots` | One transaction, through eloquent-concurrency's `WritesInTransactions`, whether or not the write changes an order. The events that `save()` and `delete()` fire run inside it. `update()`, `restore()`, and `forceDelete()` reach `save()` or `delete()`, so each opens one too. `restoring`, `restored`, `forceDeleting`, and `forceDeleted` fire outside it. `attach()` and `detach()` save or delete each pivot row, so each opens one transaction per pivot row. A batch of pivots is atomic only inside an application transaction. |
 | `move()`, `arrange()`, `moveIn()`, and `createInOrder()` | One transaction. The copies that the write saves open none, so their events run directly inside it. Each record that `createInOrder()` creates goes through `save()`, which opens one more. |
 | `lockedMembers()` | No transaction: it requires the caller's. |
 | Each attempt to lock an order, inside any write above or `lockedMembers()` | One savepoint. The package releases it once it holds the locks, or rolls back to it before the next attempt. |
-| The first check of a relation that filters through a subquery | One savepoint around one `explain`, once per relation and process. |
+| The first check of a relation that filters through a subquery | One transaction around one `explain`, once per relation and process. Inside the caller's transaction it is a savepoint. |
 
 `Reordered` and `Rebalanced` dispatch after the outermost transaction commits.
 

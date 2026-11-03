@@ -2,7 +2,7 @@
 
 ## From 0.0.1
 
-This release runs on `aryeo/eloquent-concurrency` `0.1.0`, so upgrade both packages together. An order revision is now a digest that PostgreSQL computes on demand. No trigger and no revision column take part. Every query of an item selects its `position`.
+This release runs on `aryeo/eloquent-concurrency` `0.1.0`, so upgrade both packages together. An order revision is now a digest that PostgreSQL computes on demand. No trigger and no revision column take part. A query of an item selects its `position` unless its shape cannot carry the column. The `UnselectedPosition` row of [Exceptions](README.md#exceptions) lists those shapes, such as an explicit select list, `distinct`, and a locking read outside a transaction. [Declaring an ordered relation](README.md#declaring-an-ordered-relation) explains each one.
 
 Read the [README](README.md) for each replacement. [Adopting on an existing table](README.md#adopting-on-an-existing-table) covers the schema.
 
@@ -11,9 +11,20 @@ Read the [README](README.md) for each replacement. [Adopting on an existing tabl
 | 0.0.1 | Now |
 |---|---|
 | `OrderedRelations::createTrigger()`, `createMorphTrigger()`, `createParentTrigger()`, `createRelatedTrigger()`, `createRelatedMorphTrigger()`, `dropTrigger()`, and `ConcurrencyRevisions::createTrigger()` | Removed. eloquent-concurrency's migration `2026_11_02_000001_drop_the_revision_trigger_functions` drops the trigger functions with `CASCADE`, which removes each installed trigger. Delete these calls from every migration, including the ones that already ran, because a fresh `migrate` runs them again. |
-| The `concurrencyRevision()` and `namedConcurrencyRevision()` Blueprint calls, and the revision columns they added | Removed. Delete the calls the same way. Drop `concurrency_revision` and each `<name>_concurrency_revision` in a new migration. No package reads them. |
-| `rankKey()` alone | `rankKey()`, then `rankKeyIndex()` with the parent columns. An existing `rank_key` column changes with `$table->rankKey()->change()`. |
+| The `concurrencyRevision()` and `namedConcurrencyRevision()` Blueprint calls, and the revision columns they added | Removed. Delete the calls the same way. Drop `concurrency_revision` and each `<name>_concurrency_revision` in a new migration, guarded as below. No package reads them. |
+| `rankKey()`, and the 0.0.1 README's raw `create unique index <table>_<parent columns>_rank_key_unique` statement | Keep the index on an existing database: `rankKeyIndex()` with the parent columns generates the same name and definition. Add no new index. For a fresh install, replace the raw statement in its original migration with `rankKeyIndex()`. An existing `rank_key` column changes with `$table->rankKey()->change()`. |
+| `rankKey()` with no unique index | `rankKey()`, then `rankKeyIndex()` with the parent columns. |
 | A table column named `position` | Not allowed on an ordered table, because the package selects a computed `position`. Rename or drop it. |
+
+**Guard each column drop.** A fresh `migrate` runs the edited migrations, which no longer add the revision columns, so an unguarded `dropColumn()` fails there:
+
+```php
+if (Schema::hasColumn('sections', 'concurrency_revision')) {
+    Schema::table('sections', function (Blueprint $table): void {
+        $table->dropColumn('concurrency_revision');
+    });
+}
+```
 
 ### API
 
@@ -25,8 +36,8 @@ Read the [README](README.md) for each replacement. [Adopting on an existing tabl
 | `$parent->orderedRelation(Revision::X)->query()` | `$parent->assets()`. |
 | `$parent->orderedRelation(Revision::X)->concurrencyRevision()` | `$parent->concurrencyRevision(Revision::X)`, a string digest. |
 | `$item->orderingRelation()` | Removed. Read the item's own parent relation. |
-| `withPositions()` | Removed. Every query selects `position`. |
-| `loadPositions()` | Removed. Every query selects `position`. |
+| `withPositions()` | Removed. A query selects `position` unless its shape cannot carry the column. A caller that reads `position` from such a query changes the query, or stops reading `position`. |
+| `loadPositions()` | Removed. A query selects `position` unless its shape cannot carry the column. A caller that reads `position` from such a query changes the query, or stops reading `position`. |
 | `OrderedCollection` and `#[CollectedBy(OrderedCollection::class)]` | Removed. Use any collection class. |
 | `move(Placement, null\|int $expected)` | `move(Placement, null\|string $expected)`. `arrange()` and `moveIn()` also require `expected`. |
 | `OrderChange::$relation` and the integer `OrderChange::$revision` | `$parent`, `$revision` (the `NamesConcurrencyRevision`), and `$digest` (the order digest after the write). |
@@ -39,7 +50,7 @@ Read the [README](README.md) for each replacement. [Adopting on an existing tabl
 | No batch writes | `moveIn()` and `createInOrder()`, each with one `Reordered` per parent it changes. |
 | No way to lock a parent and read its members | `lockedMembers()`, inside a transaction. |
 
-**Map `NotAMember` beside `MembershipMismatch`.** Both extend `InvalidArgumentException`, not `LogicException`, so a handler that maps `LogicException` to a 500 does not catch them. `UnavailableParent` extends `RuntimeException`. Map it to a 422 or a 404 by its `reason`.
+**Map `NotAMember` beside `MembershipMismatch`.** `NotAMember`, `MembershipMismatch`, `InvalidAnchor`, and `InvalidKey` extend `InvalidArgumentException`, which extends `LogicException`. A handler that maps `LogicException` to a 500 catches all four. Register their mappings before any general `LogicException` mapping. `UnavailableParent` extends `RuntimeException`. Map it to a 422 or a 404 by its `reason`.
 
 **PHPStan.** The relation macros read as dynamic calls to static methods. See the `rules.neon` paragraph in [Declaring an ordered relation](README.md#declaring-an-ordered-relation).
 
