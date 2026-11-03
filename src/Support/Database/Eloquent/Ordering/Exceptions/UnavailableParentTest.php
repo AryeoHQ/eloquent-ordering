@@ -12,12 +12,15 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
 use Support\Database\Eloquent\Ordering\Placement;
+use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Drawers\Drawer;
 use Tests\Fixtures\Support\Drawers\DrawerRevision;
 use Tests\Fixtures\Support\Notes\Note;
+use Tests\Fixtures\Support\Pages\Page;
 use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Scenes\Scene;
+use Tests\Fixtures\Support\Shelves\Shelf;
 use Tests\Fixtures\Support\Speakers\Speaker;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\TestCase;
@@ -147,6 +150,47 @@ class UnavailableParentTest extends TestCase
         $this->assertUnavailable($tour, UnavailableParent::MISSING, fn (): mixed => self::restore(Scene::withTrashed()->findOrFail($scene->id)));
 
         $this->assertNotNull(DB::table('scenes')->where('id', $scene->id)->value('deleted_at'));
+    }
+
+    #[Test]
+    public function it_refuses_a_create_in_a_filtered_parent_whose_row_is_gone_while_missing_attributes_are_prevented(): void
+    {
+        $gone = Binder::create(['shelf_id' => Shelf::create()->id]);
+        DB::table('binders')->where('id', $gone->id)->delete();
+        $preventing = Model::preventsAccessingMissingAttributes();
+        Model::preventAccessingMissingAttributes();
+
+        try {
+            $this->assertUnavailable($gone, UnavailableParent::MISSING, fn (): Page => Page::create(['binder_id' => $gone->id]));
+        } finally {
+            Model::preventAccessingMissingAttributes($preventing);
+        }
+
+        $this->assertSame(0, DB::table('pages')->count());
+    }
+
+    #[Test]
+    public function it_refuses_a_save_that_moves_a_member_into_a_filtered_parent_whose_row_is_gone_while_missing_attributes_are_prevented(): void
+    {
+        $shelf = Shelf::create();
+        $source = Binder::create(['shelf_id' => $shelf->id]);
+        $gone = Binder::create(['shelf_id' => $shelf->id]);
+        $page = Page::create(['binder_id' => $source->id]);
+        DB::table('binders')->where('id', $gone->id)->delete();
+        $before = DB::table('pages')->get()->map(fn (object $row): array => (array) $row)->all();
+        $preventing = Model::preventsAccessingMissingAttributes();
+        Model::preventAccessingMissingAttributes();
+
+        try {
+            $reloaded = Page::query()->findOrFail($page->id);
+            $reloaded->binder_id = $gone->id;
+
+            $this->assertUnavailable($gone, UnavailableParent::MISSING, fn (): bool => $reloaded->save());
+        } finally {
+            Model::preventAccessingMissingAttributes($preventing);
+        }
+
+        $this->assertSame($before, DB::table('pages')->get()->map(fn (object $row): array => (array) $row)->all());
     }
 
     #[Test]

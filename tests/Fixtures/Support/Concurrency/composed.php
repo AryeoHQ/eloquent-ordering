@@ -22,6 +22,13 @@ try {
         ComposedItem::query()->findOrFail($first)->move(Placement::last()->in(ComposedItem::query()->findOrFail($second)), expected: null);
 
         echo json_encode(['moved']);
+    } elseif ($action === 'stale') {
+        $parent = ComposedItem::query()->findOrFail($second);
+        $parent->setRawAttributes(['parent_id' => $_SERVER['argv'][4], ...array_diff_key($parent->getAttributes(), ['parent_id' => true])], true);
+
+        ComposedItem::query()->findOrFail($first)->move(Placement::last()->in($parent), expected: null);
+
+        echo json_encode(['moved']);
     } else {
         $members = DB::transaction(static fn (): array => ComposedItem::query()->findOrFail($first)->children()->lockedMembers(ComposedItem::query()->findOrFail($second))->map(static fn (Model $member): mixed => $member->getKey())->all());
 

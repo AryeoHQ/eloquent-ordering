@@ -635,6 +635,8 @@ final class OrderedRelation
             $this->parent->getKey(),
         ));
 
+        $this->requireLockable($alsoLock);
+
         return $this->lockWith(
             static fn (): null => null,
             static fn (): array => $alsoLock,
@@ -1385,7 +1387,7 @@ final class OrderedRelation
     private static function missingParent(array $membership, array $attributes): Model&OrdersRelations&Revisioned
     {
         $parent = $membership['parent']->newInstance([], true);
-        $parent->setRawAttributes([$membership['keys']->ownerKey => $attributes[$membership['keys']->foreignKey]], true);
+        $parent->setRawAttributes([...array_fill_keys(self::columnsOf($parent), null), $membership['keys']->ownerKey => $attributes[$membership['keys']->foreignKey]], true);
 
         return $parent;
     }
@@ -1797,15 +1799,23 @@ final class OrderedRelation
             }
         };
 
-        $connection = $parent->getConnection();
-        $table = $parent->getTable();
-        $columns = self::$parentTableColumns[$connection->getName().':'.$table] ??= $connection->getSchemaBuilder()->getColumnListing($table);
         $expected = $build(clone $parent);
 
         return array_values(array_map(
             $parent->qualifyColumn(...),
-            array_filter($columns, static fn (string $column): bool => $build(self::probed($parent, [$column])) !== $expected),
+            array_filter(self::columnsOf($parent), static fn (string $column): bool => $build(self::probed($parent, [$column])) !== $expected),
         ));
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function columnsOf(Model $parent): array
+    {
+        $connection = $parent->getConnection();
+        $table = $parent->getTable();
+
+        return self::$parentTableColumns[$connection->getName().':'.$table] ??= $connection->getSchemaBuilder()->getColumnListing($table);
     }
 
     /**
@@ -2152,7 +2162,8 @@ final class OrderedRelation
             $stored[$index] = self::storedMembershipOf($model);
             $held = $model instanceof LocksParentsFirst ? $model->parentsToLockFirst() : [];
             $named = $stored[$index] !== null && $model instanceof Ordered ? self::namedParents($model, $stored[$index], $held) : [];
-            $parents[$index] = array_values(array_unique(array_map($indexOf, [...$held, ...$named])));
+            $parents[$index] = array_values(array_unique(array_map($indexOf, [...$named, ...Provider::parentsReachedBy($model)])));
+            array_map($indexOf, $held);
         }
 
         $depths = [];
@@ -2759,8 +2770,22 @@ final class OrderedRelation
         $from = array_map(static fn (null|self $source): self => $source ?? throw new LogicException('Each member has a source.'), $sources);
         $entering = array_filter($from, fn (self $source): bool => $source !== $this);
 
-        if ($items === [] || ($entering === [] && $this->holdsPlaces($ids, $placement))) {
+        if ($items === []) {
             return $this->change([]);
+        }
+
+        if ($entering === []) {
+            $current = $this->rankKeys($this->rows($ids));
+
+            if ($this->holdsPlaces($ids, $current, $placement)) {
+                foreach ($items as $index => $item) {
+                    $stored = [...($rows[(string) $ids[$index]] ?? []), self::RANK_KEY => $current[$ids[$index]] ?? null];
+                    $item->forceFill($stored)->syncOriginalAttributes(array_keys($stored));
+                    $this->settle($item, $previous[$index] ?? null, [$original[$index], $stored]);
+                }
+
+                return $this->change([]);
+            }
         }
 
         if ($entering !== []) {
@@ -2820,8 +2845,7 @@ final class OrderedRelation
                 $moved[$ids[$index]] = $before;
             }
 
-            $item->forceFill([self::POSITION => $position])->syncOriginalAttributes([self::POSITION]);
-            self::followParent($item, [$original[$index], $rows[(string) $ids[$index]] ?? []], $this->parent);
+            $this->settle($item, $position, [$original[$index], $rows[(string) $ids[$index]] ?? []]);
         }
 
         $change = $this->change($moved, count($left) === 1 ? $left[0] : null, $order);
@@ -2836,11 +2860,20 @@ final class OrderedRelation
     }
 
     /**
-     * @param  list<int|string>  $ids
+     * @param  list<array<string, mixed>>  $left
      */
-    private function holdsPlaces(array $ids, Placement $placement): bool
+    private function settle(Model&Ordered $item, null|int $position, array $left): void
     {
-        $keys = $this->rankKeys($this->rows($ids));
+        $item->forceFill([self::POSITION => $this->unavailable === null ? $position : null])->syncOriginalAttributes([self::POSITION]);
+        self::followParent($item, $left, $this->parent);
+    }
+
+    /**
+     * @param  list<int|string>  $ids
+     * @param  array<int|string, string>  $keys
+     */
+    private function holdsPlaces(array $ids, array $keys, Placement $placement): bool
+    {
         [$previous, $upper] = $this->bounds($placement, $ids, $this->members(...));
 
         foreach ($ids as $id) {
