@@ -171,7 +171,7 @@ abstract class Shape
     /**
      * @param  list<int|string>  $ids
      */
-    public function arrange(Model $parent, array $ids, null|string $expected = null): OrderChange
+    public function arrange(Model $parent, array $ids, null|string $expected): OrderChange
     {
         return $this->relation($parent)->arrange($ids, $expected);
     }

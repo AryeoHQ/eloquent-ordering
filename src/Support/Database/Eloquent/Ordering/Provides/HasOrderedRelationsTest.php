@@ -387,7 +387,7 @@ class HasOrderedRelationsTest extends TestCase
     {
         $section = Section::create();
 
-        $change = $section->assets()->arrange([]);
+        $change = $section->assets()->arrange([], expected: null);
 
         $this->assertSame($section, $change->parent);
         $this->assertSame(SectionRevision::AssetsOrder, $change->revision);
@@ -456,7 +456,7 @@ class HasOrderedRelationsTest extends TestCase
         $relation = $relation();
 
         try {
-            $relation->arrange([]);
+            $relation->arrange([], expected: null);
             $this->fail('A relation that orders nothing was arranged.');
         } catch (LogicException $exception) {
             $this->assertSame($message, $exception->getMessage());
@@ -471,7 +471,7 @@ class HasOrderedRelationsTest extends TestCase
         $second = Asset::create(['section_id' => $section->id]);
 
         try {
-            $section->hasMany(Asset::class, 'gallery_section_id')->arrange([$second->id, $first->id]);
+            $section->hasMany(Asset::class, 'gallery_section_id')->arrange([$second->id, $first->id], expected: null);
             $this->fail('A relation by another foreign key arranged the declared order.');
         } catch (LogicException $exception) {
             $this->assertSame(sprintf('The [%s] relation of [%s] to [%s] orders nothing.', HasMany::class, Section::class, Asset::class), $exception->getMessage());
@@ -498,7 +498,7 @@ class HasOrderedRelationsTest extends TestCase
         $video = $this->addVideo($section);
 
         $item = $video->move(Placement::last(), expected: null);
-        $parent = $video->clips()->arrange([]);
+        $parent = $video->clips()->arrange([], expected: null);
 
         $this->assertSame($section, $item->parent);
         $this->assertSame(SectionRevision::VideosOrder, $item->revision);
@@ -618,7 +618,7 @@ class HasOrderedRelationsTest extends TestCase
         $parent->save();
 
         try {
-            $parent->hasMany(Asset::class, 'section_id')->arrange([]);
+            $parent->hasMany(Asset::class, 'section_id')->arrange([], expected: null);
             $this->fail('A method that declares no HasMany relation was accepted.');
         } catch (LogicException) {
             $this->assertTrue(DB::table('sections')->where('id', $parent->getKey())->exists());

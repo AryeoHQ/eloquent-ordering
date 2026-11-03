@@ -142,7 +142,7 @@ class OrderedRelationTest extends TestCase
     public static function untimedPivotWrites(): iterable
     {
         yield 'a reorder' => [
-            fn (Agency $agency, array $ids, Agency $other): OrderChange => $agency->customers()->arrange(array_reverse($ids)),
+            fn (Agency $agency, array $ids, Agency $other): OrderChange => $agency->customers()->arrange(array_reverse($ids), expected: null),
             [2, 1, 0],
             [],
         ];
@@ -315,7 +315,7 @@ class OrderedRelationTest extends TestCase
         $relation = $shape->relation($parent);
 
         $cleared = $relation->orderByDesc('id')->reorder();
-        $change = $shape->relation($parent)->arrange([$this->key($second), $this->key($first)]);
+        $change = $shape->relation($parent)->arrange([$this->key($second), $this->key($first)], expected: null);
 
         $this->assertSame($shape->relationClass(), $relation::class);
         $this->assertSame($relation, $cleared);
@@ -336,11 +336,11 @@ class OrderedRelationTest extends TestCase
         $visible = $shape->add($parent);
 
         $trashed->delete();
-        $change = $shape->arrange($parent, [$this->key($visible), $this->key($hidden)]);
+        $change = $shape->arrange($parent, [$this->key($visible), $this->key($hidden)], expected: null);
 
         $this->assertSame([$visible->getKey(), $hidden->getKey()], $change->order);
         $this->assertSame([$visible->getKey(), $hidden->getKey()], $shape->members($parent));
-        $this->assertRejected($shape, MembershipMismatch::class, $parent, fn (): OrderChange => $shape->arrange($parent, [$this->key($visible)]));
+        $this->assertRejected($shape, MembershipMismatch::class, $parent, fn (): OrderChange => $shape->arrange($parent, [$this->key($visible)], expected: null));
     }
 
     #[DataProvider('shapes')]
@@ -497,12 +497,12 @@ class OrderedRelationTest extends TestCase
 
         $this->assertSame([$alpha->id => 2, $zebra->id => 1], Shape::relationOf($parent, SectionRevision::AssetsOrder)->get()->pluck('position', 'id')->all());
 
-        $unchanged = Shape::relationOf($parent, SectionRevision::AssetsOrder)->arrange([$zebra->id, $alpha->id]);
+        $unchanged = Shape::relationOf($parent, SectionRevision::AssetsOrder)->arrange([$zebra->id, $alpha->id], expected: null);
 
         $this->assertSame([], $unchanged->changed);
         $this->assertSame([$zebra->id, $alpha->id], $unchanged->order);
 
-        $change = Shape::relationOf($parent, SectionRevision::AssetsOrder)->arrange([$alpha->id, $zebra->id]);
+        $change = Shape::relationOf($parent, SectionRevision::AssetsOrder)->arrange([$alpha->id, $zebra->id], expected: null);
 
         $this->assertSame([$alpha->id, $zebra->id], $change->order);
         $this->assertSame([
@@ -623,16 +623,16 @@ class OrderedRelationTest extends TestCase
         $parent = TwoPivotListing::query()->findOrFail($listing->id);
         [$listed, $represented] = [$shape->members($listing), $this->agencyMembers($agency)];
 
-        $listings = Shape::relationOf($parent, ListingRevision::CustomersOrder)->arrange(array_reverse($listed));
+        $listings = Shape::relationOf($parent, ListingRevision::CustomersOrder)->arrange(array_reverse($listed), expected: null);
 
         $this->assertSame(ListingRevision::CustomersOrder, $listings->revision);
         $this->assertSame(array_reverse($listed), $listings->order);
         $this->assertSame(array_reverse($listed), $shape->members($listing));
         $this->assertSame($represented, $this->agencyMembers($agency));
 
-        $agencies = Shape::relationOf($parent, ListingRevision::ScenesOrder)->arrange([$represented[1], $represented[2], $represented[0]]);
+        $agencies = Shape::relationOf($parent, ListingRevision::AgencyCustomersOrder)->arrange([$represented[1], $represented[2], $represented[0]], expected: null);
 
-        $this->assertSame(ListingRevision::ScenesOrder, $agencies->revision);
+        $this->assertSame(ListingRevision::AgencyCustomersOrder, $agencies->revision);
         $this->assertSame([$represented[1], $represented[2], $represented[0]], $agencies->order);
         $this->assertSame([$represented[1], $represented[2], $represented[0]], $this->agencyMembers($agency));
         $this->assertSame(array_reverse($listed), $shape->members($listing));
@@ -830,6 +830,7 @@ class OrderedRelationTest extends TestCase
      * @param  Closure(class-string): string  $message
      */
     #[DataProvider('omittedMembershipColumns')]
+    #[DataProvider('omittedColumnClauseColumns')]
     #[DataProvider('omittedOrderedThroughParents')]
     #[DataProvider('unorderableRelationTypes')]
     #[Test]
@@ -872,7 +873,13 @@ class OrderedRelationTest extends TestCase
             '[%s::customers()] filters its members by [customers.name], which its membership does not declare.',
             $parent,
         )];
+    }
 
+    /**
+     * @return iterable<string, array{Closure(): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision, Closure(class-string): string}>
+     */
+    public static function omittedColumnClauseColumns(): iterable
+    {
         yield 'the second column of a column clause its membership omits' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;

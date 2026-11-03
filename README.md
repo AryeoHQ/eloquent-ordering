@@ -169,6 +169,8 @@ $section->assets()->arrange([$thirdId, $firstId, $secondId], expected: $digest);
 
 `arrange()` is a macro on every Eloquent relation. It resolves the declaration by the ordered item class: the related class of a HasMany or MorphMany, and the pivot class of a BelongsToMany or MorphToMany. The relation must also match the declared relation's keys: the foreign key, the owner key, and the morph type and class. A pivot relation must also match the pivot table, the related pivot key, the related table, and the related key. A relation that orders nothing throws `LogicException`.
 
+PHPStan reports a macro call such as `arrange()` as a dynamic call to a static method. The package's `tooling/phpstan/rules.neon` already suppresses that error for consumers, so an adopter adds nothing.
+
 ## Supported shapes
 
 | Relation | Item | Example fixture |
@@ -291,10 +293,10 @@ While it holds the lock, the package writes each stored declared parent column i
 ## Reading an order
 
 ```php
-$section->assets()->reorder('assets.rank_key')->get();         // members in order, each with its position
+$section->assets()->reorder('assets.rank_key')->orderBy('assets.id')->get();   // members in order, each with its position
 $section->concurrencyRevision(SectionRevision::AssetsOrder);   // the order digest, one query
 
-$listing->customers()->withPivot('id')->reorder('listing_customer.rank_key')->get();   // each pivot carries its id and position
+$listing->customers()->withPivot('id')->reorder('listing_customer.rank_key')->orderBy('listing_customer.id')->get();   // each pivot carries its id and position
 ```
 
 Read the members through the parent's Eloquent relation. It keeps the global scopes that the related model declares. `reorder()` replaces any order that the relation method declares. Qualify `rank_key` with the item table, because a pivot query also joins the related table. For a pivot relation, order by the pivot table's `rank_key`, and the pivot carries the position. Select the pivot id with `withPivot('id')`, in the read or in the relation method. Eloquent selects only the two pivot keys, so a pivot read without it has a `null` id, which neither `arrange()` nor an anchor accepts. Each `position` counts the row among every member, including a member that a global scope hides.

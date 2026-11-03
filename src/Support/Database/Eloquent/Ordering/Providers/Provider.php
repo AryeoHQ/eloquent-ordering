@@ -40,7 +40,7 @@ class Provider extends ServiceProvider
             return $this->withoutGlobalScope(SelectsPosition::class);
         });
 
-        Relation::macro('arrange', /** @param list<int|string> $ids */ function (array $ids, null|string $expected = null): OrderChange {
+        Relation::macro('arrange', /** @param list<int|string> $ids */ function (array $ids, null|string $expected): OrderChange {
             return OrderedRelation::ordering($this)->arrange($ids, $expected);
         });
 
