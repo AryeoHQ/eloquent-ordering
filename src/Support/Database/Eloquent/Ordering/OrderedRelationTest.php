@@ -22,6 +22,7 @@ use Illuminate\Database\Query\JoinClause;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Str;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -49,6 +50,7 @@ use Tests\Fixtures\Support\Agencies\AgencyCustomer;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Binders\Binder;
+use Tests\Fixtures\Support\Composed\ComposedItem;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Documents\DatedDocument;
 use Tests\Fixtures\Support\Documents\Document;
@@ -715,6 +717,99 @@ class OrderedRelationTest extends TestCase
             $racer->table('shelves')->whereIn('id', [$first->id, $second->id])->delete();
             $racer->table('sections')->where('id', $section->id)->delete();
         }
+    }
+
+    #[Test]
+    public function it_locks_the_members_again_when_a_model_to_also_lock_reaches_another_parent_through_a_pivot_between_the_read_of_its_parents_and_the_lock(): void
+    {
+        $racer = $this->racer();
+        config()->set('database.connections.mover', config('database.connections.pgsql'));
+        [$first, $second] = [Listing::on('racer')->create(), Listing::on('racer')->create()];
+        $customer = Customer::on('racer')->create();
+        $first->customers()->attach($customer->id);
+        $attached = false;
+
+        try {
+            DB::listen(function (QueryExecuted $query) use (&$attached, $customer, $second): void {
+                if ($attached || $query->connectionName !== 'racer' || ! str_contains($query->sql, 'from "listings"') || ! str_ends_with($query->sql, 'for no key update')) {
+                    return;
+                }
+
+                $attached = true;
+                DB::connection('mover')->statement("set lock_timeout = '2s'");
+                DB::connection('mover')->table('listing_customer')->insert(['id' => (string) Str::uuid(), 'listing_id' => $second->id, 'customer_id' => $customer->id, 'rank_key' => 'a0']);
+            });
+            $racer->enableQueryLog();
+
+            $members = $racer->transaction(fn (): mixed => $first->customers()->lockedMembers($customer));
+
+            $this->assertTrue($attached, 'The model to also lock never reached another parent while the members were locked.');
+            $this->assertSame([$customer->id], $members->modelKeys());
+            $this->assertSame([
+                ['listings', $first->id], ['customers', $customer->id], ['listings', $first->id],
+                ['listings', $first->id], ['listings', $second->id], ['customers', $customer->id], ['listings', $first->id],
+            ], $this->parentLocks($racer->getQueryLog(), 'listings|customers'));
+        } finally {
+            $racer->table('listing_customer')->where('customer_id', $customer->id)->delete();
+            $racer->table('customers')->where('id', $customer->id)->delete();
+            $racer->table('listings')->whereIn('id', [$first->id, $second->id])->delete();
+        }
+    }
+
+    #[Test]
+    public function it_finishes_locking_the_children_of_a_composed_item_with_a_child_beside_a_move_of_a_grandchild_into_it_without_a_deadlock(): void
+    {
+        $racer = $this->racer();
+        [$lower, $higher] = [(string) Str::uuid(), (string) Str::uuid()];
+        [$lower, $higher] = strcmp($lower, $higher) < 0 ? [$lower, $higher] : [$higher, $lower];
+        $root = ComposedItem::withoutEvents(fn (): ComposedItem => tap((new ComposedItem)->setConnection('racer')->forceFill(['id' => $higher]))->save());
+        $child = (new ComposedItem)->setConnection('racer')->forceFill(['id' => $lower]);
+        $child->parent()->associate($root);
+        $child->save();
+        $grandchild = (new ComposedItem)->setConnection('racer');
+        $grandchild->parent()->associate($child);
+        $grandchild->save();
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('composed_items')->where('id', $child->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('composed.php', 'move', $grandchild->id, $root->id);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('composed.php', 'locked', $root->id, $child->id);
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
+
+            $this->assertSame([['moved'], ['locked', [$child->id, $grandchild->id]]], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            foreach ($rivals as $rival) {
+                $rival->wait();
+            }
+
+            $racer->table('composed_items')->whereIn('id', [$grandchild->id, $child->id, $root->id])->delete();
+        }
+    }
+
+    #[Test]
+    public function it_returns_no_members_of_a_held_parent_whose_row_is_gone(): void
+    {
+        $tour = Tour::create();
+        $tour->scenes()->create();
+        $tour->scenes()->create();
+        DB::table('tours')->where('id', $tour->id)->delete();
+
+        $members = DB::transaction(fn (): mixed => $tour->scenes()->lockedMembers());
+
+        $this->assertSame([], $members->all());
     }
 
     #[Test]
@@ -2395,12 +2490,12 @@ class OrderedRelationTest extends TestCase
      * @param  array<int, array{query: string, bindings: array<int, mixed>}>  $statements
      * @return list<array{string, mixed}>
      */
-    private function parentLocks(array $statements): array
+    private function parentLocks(array $statements, string $tables = 'shelves|binders'): array
     {
         $locks = [];
 
         foreach ($statements as $statement) {
-            if (preg_match('/ from "(shelves|binders)" .*for no key update$/', $statement['query'], $match) === 1) {
+            if (preg_match('/ from "('.$tables.')" .*for no key update$/', $statement['query'], $match) === 1) {
                 $locks[] = [$match[1], $statement['bindings'][0]];
             }
         }

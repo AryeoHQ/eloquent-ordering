@@ -49,6 +49,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
+use Support\Database\Eloquent\Ordering\Providers\Provider;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
 use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
@@ -637,7 +638,7 @@ final class OrderedRelation
         return $this->lockWith(
             static fn (): null => null,
             static fn (): array => $alsoLock,
-            fn (): Collection => $this->currentMembers(),
+            fn (): Collection => $this->unavailable === UnavailableParent::MISSING ? new Collection : $this->currentMembers(),
         );
     }
 
@@ -2071,7 +2072,8 @@ final class OrderedRelation
      */
     private static function inLockOrder(array $relations): array
     {
-        usort($relations, static fn (self $first, self $second): int => self::lockOrder($first->parent, $second->parent));
+        $order = self::lockOrder(array_map(static fn (self $relation): Model => $relation->parent, array_values($relations)));
+        usort($relations, static fn (self $first, self $second): int => $order($first->parent) <=> $order($second->parent));
 
         return $relations;
     }
@@ -2081,11 +2083,37 @@ final class OrderedRelation
      */
     private static function lockInOrder(array $parents): void
     {
-        usort($parents, self::lockOrder(...));
+        $order = self::lockOrder($parents);
+        usort($parents, static fn (Model $first, Model $second): int => $order($first) <=> $order($second));
 
         foreach ($parents as $parent) {
             self::lockRow($parent);
         }
+    }
+
+    /**
+     * @param  list<Model>  $models
+     * @return Closure(Model): list<mixed>
+     */
+    private static function lockOrder(array $models): Closure
+    {
+        $rows = array_unique(array_map(static fn (Model $model): string => $model->getMorphClass()."\0".$model->getKey(), $models));
+
+        if (count($rows) < 2 || ! array_any($models, static fn (Model $model): bool => $model instanceof Ordered || $model instanceof LocksParentsFirst)) {
+            return static fn (Model $model): array => [$model->getMorphClass(), $model->getKey()];
+        }
+
+        [$ordered] = self::withOrderingParents($models);
+
+        return static fn (Model $model): array => [array_find_key($ordered, static fn (Model $kept): bool => $kept->is($model))];
+    }
+
+    /**
+     * @param  list<Model>  $locked
+     */
+    private static function holdsParentsOf(Model $model, array $locked): bool
+    {
+        return array_all(Provider::parentsReachedBy($model), static fn (Model $parent): bool => array_any($locked, static fn (Model $held): bool => $held->is($parent)));
     }
 
     private static function lockRow(Model $model): void
@@ -2167,11 +2195,6 @@ final class OrderedRelation
         $row = $model->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($model->getKey())->toBase()->useWritePdo()->first(self::membershipColumns($model));
 
         return $row === null ? null : (array) $row;
-    }
-
-    private static function lockOrder(Model $first, Model $second): int
-    {
-        return [$first->getMorphClass(), $first->getKey()] <=> [$second->getMorphClass(), $second->getKey()];
     }
 
     /**
@@ -2584,7 +2607,11 @@ final class OrderedRelation
 
                     $this->lock();
 
-                    throw_unless([array_map(self::storedMembershipOf(...), $models), $read()] === [$stored, $rows], $moved);
+                    throw_unless(
+                        [array_map(self::storedMembershipOf(...), $models), $read()] === [$stored, $rows]
+                            && array_all($models, static fn (Model $model): bool => self::holdsParentsOf($model, $models)),
+                        $moved,
+                    );
 
                     return $locked($rows, $also);
                 });
