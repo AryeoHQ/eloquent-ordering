@@ -598,7 +598,7 @@ $this->deleteOnFirstRead($asset);                     // trashes the row and cle
 $this->moveOnFirstRead($asset->section(), $other);    // points the foreign key at $other, after its last member
 ```
 
-`deleteOnFirstRead()` deletes the row of a model that does not soft delete. The forged write runs on the model's connection, inside the test's transaction, when the test opens one. Nothing refuses it, because a write that bypasses Eloquent is unsupported.
+`deleteOnFirstRead()` deletes the row of a model that does not soft delete. `moveOnFirstRead()` clears every other declared membership of an ordered row, so the row sits in one order only. The forged write runs on the model's connection, inside the test's transaction, when the test opens one. Nothing refuses it, because a write that bypasses Eloquent is unsupported.
 
 ## Limits
 

@@ -70,7 +70,11 @@ trait ChangesRowsOnFirstRead
 
             $last = $members->max(OrderedRelation::RANK_KEY);
 
-            return $row->update([...$membership, OrderedRelation::RANK_KEY => FractionalIndex::keyBetween(is_string($last) ? $last : null, null)]);
+            return $row->update([
+                ...array_fill_keys(OrderedRelation::membershipColumns($child), null),
+                ...$membership,
+                OrderedRelation::RANK_KEY => FractionalIndex::keyBetween(is_string($last) ? $last : null, null),
+            ]);
         });
     }
 
@@ -88,7 +92,7 @@ trait ChangesRowsOnFirstRead
         $connection = $model->getConnection();
         $quoted = preg_quote($connection->getQueryGrammar()->wrapTable($model->getTable()), '/');
         $unquoted = preg_quote($connection->getTablePrefix().$model->getTable(), '/');
-        $source = '/\b(?i:from|join)\s+(?:'.$quoted.'|(?i:'.$unquoted.')\b)/';
+        $source = '/\b(?i:from|join)\s+(?:'.$quoted.'|(?i:'.$unquoted.')(?![\w$]))/';
         $changed = false;
 
         DB::listen(function (QueryExecuted $query) use ($model, $key, $change, $connection, $source, &$changed): void {
