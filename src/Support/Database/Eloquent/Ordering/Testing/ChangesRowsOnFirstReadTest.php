@@ -13,6 +13,7 @@ use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
+use Support\Database\Eloquent\Ordering\Exceptions\ParentUnavailability;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Tests\Fixtures\Support\Assets\Asset;
@@ -74,7 +75,7 @@ class ChangesRowsOnFirstReadTest extends TestCase
             $note->save();
             $this->fail('The create placed a member in a trashed parent.');
         } catch (UnavailableParent $refused) {
-            $this->assertSame(UnavailableParent::TRASHED, $refused->reason);
+            $this->assertSame(ParentUnavailability::Trashed, $refused->reason);
         }
     }
 
