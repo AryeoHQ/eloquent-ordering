@@ -16,6 +16,7 @@ use Support\Database\Eloquent\Concurrency\Concerns\WritesInTransactions;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Exceptions\ContendedOrder;
+use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
 use Support\Database\Eloquent\Ordering\Exceptions\UnselectedPosition;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
@@ -210,7 +211,11 @@ trait IsOrdered
             [$source, , , $stored] = $this->lockCurrentOrderedRelations(static fn (): null|OrderedRelation => $destination);
 
             if ($source === null || $stored === null) {
-                throw new LogicException(sprintf('[%s:%s] has no parent that orders it.', static::class, $this->getKey()));
+                throw new NotAMember(static::class, [OrderedRelation::keyOf($this)]);
+            }
+
+            if ($destination !== null && ! $destination->is($source)) {
+                $destination->refuseUnavailable();
             }
 
             if ($expected !== null) {
@@ -309,6 +314,11 @@ trait IsOrdered
 
         if (! $item->exists) {
             $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
+
+            foreach ($item->lockedOrderedRelations as $relation) {
+                $relation->refuseUnavailable();
+            }
+
             $item->lockRelatedOfOrderedRelations();
         } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
             [$current, $item->lockedOrderedRelations, $next, $membership] = $item->lockCurrentOrderedRelations(
@@ -342,6 +352,7 @@ trait IsOrdered
                 }
 
                 if ($stored[OrderedRelations::DELETED_AT] !== null) {
+                    $next?->refuseUnavailable();
                     $item->assignRankKey($next?->keyAt(Placement::last()));
                     $item->restoredInto = $next;
 
@@ -429,6 +440,7 @@ trait IsOrdered
             return;
         }
 
+        $next?->refuseUnavailable();
         $this->reparented = [$current, $next, $current?->memberPosition($this)];
         $this->assignRankKey($next?->keyAt(Placement::last()));
     }

@@ -17,6 +17,7 @@ use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Query\JoinClause;
+use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use LogicException;
@@ -41,10 +42,12 @@ use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Agencies\AgencyCustomer;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Documents\Document;
 use Tests\Fixtures\Support\Documents\DocumentKind;
 use Tests\Fixtures\Support\Documents\KindedDocument;
+use Tests\Fixtures\Support\Drawers\Drawer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Folders\FolderRevision;
 use Tests\Fixtures\Support\Listings\Listing;
@@ -54,6 +57,8 @@ use Tests\Fixtures\Support\Listings\NamedListing;
 use Tests\Fixtures\Support\Listings\PivotedListing;
 use Tests\Fixtures\Support\Listings\TitledListing;
 use Tests\Fixtures\Support\Listings\TwoPivotListing;
+use Tests\Fixtures\Support\Notes\Note;
+use Tests\Fixtures\Support\Pages\Page;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Sections\Section;
@@ -61,6 +66,7 @@ use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
+use Tests\Fixtures\Support\Shelves\Shelf;
 use Tests\Fixtures\Support\Tracks\Track;
 use Tests\TestCase;
 use Throwable;
@@ -341,6 +347,121 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([$visible->getKey(), $hidden->getKey()], $change->order);
         $this->assertSame([$visible->getKey(), $hidden->getKey()], $shape->members($parent));
         $this->assertRejected($shape, MembershipMismatch::class, $parent, fn (): OrderChange => $shape->arrange($parent, [$this->key($visible)]));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_returns_the_locked_members_in_order_with_their_positions_including_one_a_global_scope_hides_but_no_trashed_member(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $hidden = $shape->add($parent, Placement::first(), hidden: true);
+        $shape->add($parent)->delete();
+        $shape->arrange($parent, [$this->key($third), $this->key($hidden), $this->key($first), $this->key($second)]);
+
+        $members = DB::transaction(fn (): mixed => $shape->relation($parent)->lockedMembers());
+
+        $this->assertSame(
+            [$third->getKey() => 1, $hidden->getKey() => 2, $first->getKey() => 3, $second->getKey() => 4],
+            $shape->selectedPositions($members),
+        );
+    }
+
+    #[Test]
+    public function it_locks_the_parent_and_each_model_to_also_lock_in_lock_order_before_it_reads_the_members(): void
+    {
+        [$lower, $higher] = [Section::create(), Section::create()];
+        $asset = Asset::create(['section_id' => $higher->id]);
+        DB::enableQueryLog();
+
+        $members = DB::transaction(fn (): mixed => $higher->assets()->lockedMembers($lower));
+
+        $statements = DB::getQueryLog();
+        $read = array_find_key($statements, fn (array $statement): bool => str_starts_with($statement['query'], 'select "assets".*'));
+        $locks = array_values(array_filter($statements, fn (array $statement, int $index): bool => $index < $read && str_contains($statement['query'], 'from "sections"') && str_ends_with($statement['query'], 'for no key update'), ARRAY_FILTER_USE_BOTH));
+
+        $this->assertSame([$asset->id], $members->modelKeys());
+        $this->assertSame([[$lower->id], [$higher->id]], array_slice(array_column($locks, 'bindings'), 0, 2));
+    }
+
+    #[Test]
+    public function it_locks_the_ordering_parents_of_a_parent_that_is_also_a_member_and_reads_its_membership_from_the_locked_row(): void
+    {
+        $shelf = Shelf::create();
+        $binder = (new Binder(['kind' => 'audio']))->shelf()->associate($shelf);
+        $binder->save();
+        $audio = Page::create(['binder_id' => $binder->id, 'kind' => 'audio']);
+        $video = Page::create(['binder_id' => $binder->id, 'kind' => 'video']);
+        DB::table('binders')->where('id', $binder->id)->update(['kind' => 'video']);
+        DB::enableQueryLog();
+
+        $members = DB::transaction(fn (): mixed => $binder->pages()->lockedMembers());
+
+        $statements = DB::getQueryLog();
+        $read = array_find_key($statements, fn (array $statement): bool => str_starts_with($statement['query'], 'select "pages".*'));
+        $locked = array_filter($statements, fn (array $statement, int $index): bool => $index < $read && str_ends_with($statement['query'], 'for no key update'), ARRAY_FILTER_USE_BOTH);
+
+        $this->assertSame([$video->id], $members->modelKeys());
+        $this->assertSame('video', $binder->kind);
+        $this->assertNotContains($audio->id, $members->modelKeys());
+        $this->assertSame(
+            [['binders', $binder->id], ['shelves', $shelf->id]],
+            array_slice(array_map(fn (array $statement): array => [str_contains($statement['query'], 'from "binders"') ? 'binders' : 'shelves', $statement['bindings'][0]], array_values($locked)), 0, 2),
+        );
+    }
+
+    #[Test]
+    public function it_refuses_to_lock_the_members_outside_a_transaction(): void
+    {
+        $this->racer();
+        $section = (new Section)->setConnection('racer')->forceFill(['id' => 1]);
+
+        try {
+            $section->assets()->lockedMembers();
+            $this->fail('The members were locked outside a transaction.');
+        } catch (LogicException $exception) {
+            $this->assertSame(sprintf('Lock the members of [%s:1] inside a transaction, because its row locks end with the statement otherwise.', $section->getMorphClass()), $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function it_finishes_a_locked_move_out_of_a_parent_and_its_delete_beside_an_opposite_locked_move_without_a_deadlock(): void
+    {
+        $racer = $this->racer();
+        [$emptied, $other] = [Drawer::on('racer')->create(), Drawer::on('racer')->create()];
+        $leaving = [$this->addNote($emptied, 'racer'), $this->addNote($emptied, 'racer')];
+        $staying = [$this->addNote($other, 'racer')];
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('drawers')->where('id', $emptied->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('locked-members.php', (string) $emptied->id, (string) $other->id, 'delete');
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('locked-members.php', (string) $other->id, (string) $emptied->id);
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
+            $ids = fn (array $notes): array => array_map(fn (Note $note): int => $note->id, $notes);
+
+            $this->assertSame([['moved', $ids($leaving)], ['unavailable', 'trashed']], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertNotNull($racer->table('drawers')->where('id', $emptied->id)->value('deleted_at'));
+            $this->assertSame([...$ids($staying), ...$ids($leaving)], $racer->table('notes')->where('drawer_id', $other->id)->orderBy('rank_key')->pluck('id')->all());
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            foreach ($rivals as $rival) {
+                $rival->wait();
+            }
+
+            $racer->table('notes')->whereIn('drawer_id', [$emptied->id, $other->id])->delete();
+            $racer->table('drawers')->whereIn('id', [$emptied->id, $other->id])->delete();
+        }
     }
 
     #[DataProvider('shapes')]
@@ -1405,6 +1526,15 @@ class OrderedRelationTest extends TestCase
                 );
             }
         };
+    }
+
+    private function addNote(Drawer $drawer, string $connection): Note
+    {
+        $note = (new Note)->setConnection($connection);
+        $note->drawer()->associate($drawer);
+        $note->save();
+
+        return $note;
     }
 
     /**

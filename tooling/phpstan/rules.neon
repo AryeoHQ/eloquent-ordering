@@ -6,5 +6,8 @@ parameters:
         -
             identifier: staticMethod.dynamicCall
             message: '#^Dynamic call to static method Illuminate\\Database\\Eloquent\\Relations\\\w+<.+>::arrange\(\)\.$#'
+        -
+            identifier: staticMethod.dynamicCall
+            message: '#^Dynamic call to static method Illuminate\\Database\\Eloquent\\Relations\\\w+<.+>::lockedMembers\(\)\.$#'
 
 services: []

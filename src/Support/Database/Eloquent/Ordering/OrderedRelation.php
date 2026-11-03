@@ -8,6 +8,7 @@ use Closure;
 use Illuminate\Contracts\Database\Query\Expression as ExpressionContract;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
@@ -43,6 +44,8 @@ use Support\Database\Eloquent\Ordering\Events\Rebalanced;
 use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
+use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
+use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
@@ -115,6 +118,9 @@ final class OrderedRelation
 
     /** @var list<int|string> */
     private array $rebalanced = [];
+
+    /** @var null|UnavailableParent::TRASHED|UnavailableParent::MISSING */
+    private null|string $unavailable = null;
 
     public function __construct(
         public readonly Model&OrdersRelations&Revisioned $parent,
@@ -258,6 +264,12 @@ final class OrderedRelation
 
         foreach ($locked as $relation) {
             $relation->lock();
+        }
+
+        foreach ($relations as $relation) {
+            if ($relation !== null) {
+                $relation->unavailable = $unique[spl_object_id($relation->parent)]->unavailable;
+            }
         }
 
         return $locked;
@@ -567,7 +579,7 @@ final class OrderedRelation
     public function move(Model&Ordered $item, Placement $placement, self $source): OrderChange
     {
         $id = self::keyOf($item);
-        $previous = $source->memberPosition($item) ?? throw new LogicException(sprintf('[%s:%s] has no place in its order.', $item::class, $id));
+        $previous = $source->memberPosition($item) ?? throw new NotAMember($item::class, [$id]);
 
         if ($this->is($source)) {
             if ($this->holdsPlace($id, $placement)) {
@@ -586,6 +598,48 @@ final class OrderedRelation
         ]);
 
         return $this->entered($item, $source, $previous);
+    }
+
+    /**
+     * @param  list<Model>  $alsoLock
+     * @return Collection<int, Model>
+     */
+    public function lockedMembers(array $alsoLock): Collection
+    {
+        throw_if($this->parent->getConnection()->transactionLevel() === 0, LogicException::class, sprintf(
+            'Lock the members of [%s:%s] inside a transaction, because its row locks end with the statement otherwise.',
+            $this->parent->getMorphClass(),
+            $this->parent->getKey(),
+        ));
+
+        self::lockInOrder([
+            $this->parent,
+            ...$alsoLock,
+            ...$this->parent instanceof LocksParentsFirst ? $this->parent->parentsToLockFirst() : [],
+        ]);
+        $this->lock();
+
+        $relation = self::relation($this->parent, $this->relationName);
+        $related = $relation->getRelated();
+        $relation->withoutGlobalScopes(array_values(array_diff(array_keys($related->getGlobalScopes()), [SoftDeletingScope::class, SelectsPosition::class])));
+        $rankKey = $this->keys->item->qualifyColumn(self::RANK_KEY);
+
+        if ($relation instanceof BelongsToMany) {
+            $relation->withPivot($this->keys->item->getKeyName());
+        }
+
+        /** @var Collection<int, Model> */
+        return $relation->reorder()->whereNotNull($rankKey)->orderBy($rankKey)->orderBy($this->keys->item->getQualifiedKeyName())->get();
+    }
+
+    /**
+     * @internal
+     */
+    public function refuseUnavailable(): void
+    {
+        if ($this->unavailable !== null) {
+            throw new UnavailableParent($this->parent, $this->unavailable);
+        }
     }
 
     /**
@@ -1719,7 +1773,10 @@ final class OrderedRelation
         return ($item instanceof Pivot ? $template : $item)->usesTimestamps();
     }
 
-    private static function keyOf(Model $item): int|string
+    /**
+     * @internal
+     */
+    public static function keyOf(Model $item): int|string
     {
         $key = $item->getKey();
 
@@ -2090,6 +2147,12 @@ final class OrderedRelation
     {
         /** @var array<string, mixed> $row */
         $row = (array) ($this->parentRow()->lock('for no key update')->first() ?? []);
+        $deletedAt = in_array(SoftDeletes::class, class_uses_recursive($this->parent), true) && method_exists($this->parent, 'getDeletedAtColumn') ? $this->parent->getDeletedAtColumn() : null;
+        $this->unavailable = match (true) {
+            $row === [] => UnavailableParent::MISSING,
+            is_string($deletedAt) && ($row[$deletedAt] ?? null) !== null => UnavailableParent::TRASHED,
+            default => null,
+        };
         $declared = array_diff_key(array_intersect_key($row, array_flip($this->parentColumns)), $this->parent->getDirty());
 
         if ($declared !== []) {

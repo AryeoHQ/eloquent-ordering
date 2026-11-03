@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering\Providers;
 
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\MorphToMany;
@@ -42,6 +43,10 @@ class Provider extends ServiceProvider
 
         Relation::macro('arrange', /** @param list<int|string> $ids */ function (array $ids, null|string $expected = null): OrderChange {
             return OrderedRelation::ordering($this)->arrange($ids, $expected);
+        });
+
+        Relation::macro('lockedMembers', /** @return Collection<int, Model> */ function (Model ...$alsoLock): Collection {
+            return OrderedRelation::ordering($this)->lockedMembers(array_values($alsoLock));
         });
 
         Event::listen(['eloquent.creating: *', 'eloquent.updating: *'], self::requirePreparedOrder(...));
