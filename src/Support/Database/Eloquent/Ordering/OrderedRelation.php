@@ -47,6 +47,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\ContendedOrder;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
+use Support\Database\Eloquent\Ordering\Exceptions\ParentUnavailability;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
@@ -117,6 +118,9 @@ final class OrderedRelation
     /** @var list<self> */
     private static array $creating = [];
 
+    /** @var null|WeakMap<Model, array{self, string}> */
+    private static null|WeakMap $inFlight = null;
+
     private readonly string $relationName;
 
     private readonly RelationKeys $keys;
@@ -127,8 +131,7 @@ final class OrderedRelation
     /** @var list<int|string> */
     private array $rebalanced = [];
 
-    /** @var null|UnavailableParent::TRASHED|UnavailableParent::MISSING */
-    private null|string $unavailable = null;
+    private null|ParentUnavailability $unavailable = null;
 
     /** @var list<string> */
     private array $pendingKeys = [];
@@ -640,8 +643,31 @@ final class OrderedRelation
         return $this->lockWith(
             static fn (): null => null,
             static fn (): array => $alsoLock,
-            fn (): Collection => $this->unavailable === UnavailableParent::MISSING ? new Collection : $this->currentMembers(),
+            fn (): Collection => $this->unavailable === ParentUnavailability::Missing ? new Collection : $this->currentMembers(),
         );
+    }
+
+    /**
+     * @internal
+     *
+     * @template TLocked
+     *
+     * @param  Closure(RuntimeException): TLocked  $lock
+     * @return TLocked
+     */
+    public static function retryWhileMoved(Model $contended, Closure $lock): mixed
+    {
+        $moved = new RuntimeException;
+
+        for ($attempt = 1; $attempt <= self::LOCK_ATTEMPTS; $attempt++) {
+            try {
+                return $lock($moved);
+            } catch (RuntimeException $exception) {
+                throw_unless($exception === $moved, $exception);
+            }
+        }
+
+        throw new ContendedOrder($contended, self::LOCK_ATTEMPTS);
     }
 
     /**
@@ -670,20 +696,11 @@ final class OrderedRelation
                 },
             );
 
-            $previous = $this->requireMembers($items, $sources);
-
             if ($expected !== null) {
-                foreach ($items as $index => $item) {
-                    $source = $sources[$index] ?? throw new LogicException('Each member has a source.');
-                    $read = self::sourceOf($item, $original[$index], [$source->parent]);
-
-                    if ($read === null || ! $read->is($source)) {
-                        throw new StaleConcurrencyRevision(($read ?? $source)->parent, ($read ?? $source)->revision, $expected);
-                    }
-                }
-
-                $this->compareConcurrencyRevision($expected);
+                $this->compareExpected($items, $original, $sources, $expected);
             }
+
+            $previous = $this->requireMembers($items, $sources);
 
             return $this->moveMembersIn($items, $placement, $rows, $sources, $previous, $original);
         });
@@ -773,7 +790,11 @@ final class OrderedRelation
      */
     public function keyForCreate(Model&Ordered $item, Placement $placement): string
     {
-        return $this->batchOf($item)?->nextPendingKey() ?? $this->keyAt($placement);
+        $key = $this->batchOf($item)?->nextPendingKey() ?? $this->keyAt($placement);
+        self::$inFlight ??= new WeakMap;
+        self::$inFlight[$item] = [$this, $key];
+
+        return $key;
     }
 
     /**
@@ -872,7 +893,7 @@ final class OrderedRelation
      */
     public function memberPosition(Model $item): null|int
     {
-        if ($this->unavailable === UnavailableParent::MISSING) {
+        if ($this->unavailable === ParentUnavailability::Missing) {
             return null;
         }
 
@@ -2137,6 +2158,24 @@ final class OrderedRelation
      */
     private static function withOrderingParents(array $models): array
     {
+        [$found, $parents, $stored] = self::orderingParentsOf($models);
+        $depths = self::depthsBelowRoots($parents);
+        $order = array_keys($found);
+        usort($order, static fn (int $first, int $second): int => [$depths[$first], $found[$first]->getMorphClass(), $found[$first]->getKey()]
+            <=> [$depths[$second], $found[$second]->getMorphClass(), $found[$second]->getKey()]);
+
+        return [
+            array_map(static fn (int $index): Model => $found[$index], $order),
+            array_map(static fn (int $index): null|array => $stored[$index], $order),
+        ];
+    }
+
+    /**
+     * @param  list<Model>  $models
+     * @return array{list<Model>, array<int, list<int>>, array<int, null|array<string, mixed>>}
+     */
+    private static function orderingParentsOf(array $models): array
+    {
         $found = [];
         $parents = [];
         $stored = [];
@@ -2166,32 +2205,29 @@ final class OrderedRelation
             array_map($indexOf, $held);
         }
 
-        $depths = [];
-        $depthOf = static function (int $index, array $path) use (&$depthOf, &$depths, $parents): int {
-            if (array_key_exists($index, $depths)) {
-                return $depths[$index];
-            }
+        return [$found, $parents, $stored];
+    }
 
-            $path[$index] = true;
-            $depth = 0;
+    /**
+     * @param  array<int, list<int>>  $parents
+     * @return array<int, int>
+     */
+    private static function depthsBelowRoots(array $parents): array
+    {
+        $depths = array_fill_keys(array_keys($parents), 0);
+        $previous = [];
 
-            foreach ($parents[$index] as $parent) {
-                if (! array_key_exists($parent, $path)) {
-                    $depth = max($depth, $depthOf($parent, $path) + 1);
+        for ($pass = 0; $pass < count($parents) && $depths !== $previous; $pass++) {
+            $previous = $depths;
+
+            foreach ($parents as $index => $reached) {
+                foreach ($reached as $parent) {
+                    $depths[$index] = max($depths[$index], $previous[$parent] + 1);
                 }
             }
+        }
 
-            return $depths[$index] = $depth;
-        };
-
-        $order = array_keys($found);
-        usort($order, static fn (int $first, int $second): int => [$depthOf($first, []), $found[$first]->getMorphClass(), $found[$first]->getKey()]
-            <=> [$depthOf($second, []), $found[$second]->getMorphClass(), $found[$second]->getKey()]);
-
-        return [
-            array_map(static fn (int $index): Model => $found[$index], $order),
-            array_map(static fn (int $index): null|array => $stored[$index], $order),
-        ];
+        return $depths;
     }
 
     /**
@@ -2232,22 +2268,66 @@ final class OrderedRelation
         );
 
         if ($placement->first) {
-            return [null, self::keyOrNull($others($rows())->min($rankKey))];
+            return $this->besideInFlight([null, self::keyOrNull($others($rows())->min($rankKey))], upper: true);
         }
 
         if ($placement->before !== null) {
             $anchor = $this->anchor($others($this->members()), $placement->before);
 
-            return [self::keyOrNull($others($rows())->where($rankKey, '<', $anchor)->max($rankKey)), $anchor];
+            return $this->besideInFlight([self::keyOrNull($others($rows())->where($rankKey, '<', $anchor)->max($rankKey)), $anchor], upper: false);
         }
 
         if ($placement->after !== null) {
             $anchor = $this->anchor($others($this->members()), $placement->after);
 
-            return [$anchor, self::keyOrNull($others($rows())->where($rankKey, '>', $anchor)->min($rankKey))];
+            return $this->besideInFlight([$anchor, self::keyOrNull($others($rows())->where($rankKey, '>', $anchor)->min($rankKey))], upper: true);
         }
 
-        return [self::keyOrNull($others($rows())->max($rankKey)), null];
+        return $this->besideInFlight([self::keyOrNull($others($rows())->max($rankKey)), null], upper: false);
+    }
+
+    /**
+     * @param  array{null|string, null|string}  $bounds
+     * @return array{null|string, null|string}
+     */
+    private function besideInFlight(array $bounds, bool $upper): array
+    {
+        foreach (self::$inFlight ?? [] as $item => [$relation, $key]) {
+            if ($item->exists || ! $relation->sameOrderAs($this) || ! self::between($key, ...$bounds)) {
+                continue;
+            }
+
+            $bounds[$upper ? 1 : 0] = $key;
+        }
+
+        return $bounds;
+    }
+
+    private static function between(string $key, null|string $lower, null|string $upper): bool
+    {
+        return ($lower === null || strcmp($key, $lower) > 0) && ($upper === null || strcmp($key, $upper) < 0);
+    }
+
+    /**
+     * @param  list<int|string>  $exclude
+     * @return array{null|string, null|string}
+     */
+    private function boundsAfter(Placement $placement, array $exclude, int|string $previous): array
+    {
+        $rankKey = $this->keys->item->qualifyColumn(self::RANK_KEY);
+        [$lower] = $this->bounds($placement, $exclude, $this->indexedRows(...));
+        $stored = self::keyOrNull($this->indexedRows()->where($this->keys->item->getQualifiedKeyName(), $previous)->value($rankKey));
+
+        if ($stored !== null && ($lower === null || strcmp($stored, $lower) > 0)) {
+            $lower = $stored;
+        }
+
+        $upper = $this->indexedRows()
+            ->whereNotIn($this->keys->item->getQualifiedKeyName(), $exclude)
+            ->when($lower !== null, fn (Builder $query): Builder => $query->where($rankKey, '>', $lower))
+            ->min($rankKey);
+
+        return $this->besideInFlight([$lower, self::keyOrNull($upper)], upper: true);
     }
 
     private function anchor(Builder $members, int|string $anchor): string
@@ -2602,36 +2682,28 @@ final class OrderedRelation
      */
     private function lockWith(Closure $read, Closure $alsoLock, Closure $locked): mixed
     {
-        $moved = new RuntimeException;
-
-        for ($attempt = 1; $attempt <= self::LOCK_ATTEMPTS; $attempt++) {
+        return self::retryWhileMoved($this->parent, function (RuntimeException $moved) use ($read, $alsoLock, $locked): mixed {
             $rows = $read();
             $also = $alsoLock($rows);
             [$models, $stored] = self::withOrderingParents([$this->parent, ...$also]);
             $this->requireLockable($models);
 
-            try {
-                return $this->parent->getConnection()->transaction(function () use ($read, $locked, $rows, $also, $models, $stored, $moved): mixed {
-                    foreach ($models as $model) {
-                        self::lockRow($model);
-                    }
+            return $this->parent->getConnection()->transaction(function () use ($read, $locked, $rows, $also, $models, $stored, $moved): mixed {
+                foreach ($models as $model) {
+                    self::lockRow($model);
+                }
 
-                    $this->lock();
+                $this->lock();
 
-                    throw_unless(
-                        [array_map(self::storedMembershipOf(...), $models), $read()] === [$stored, $rows]
-                            && array_all($models, static fn (Model $model): bool => self::holdsParentsOf($model, $models)),
-                        $moved,
-                    );
+                throw_unless(
+                    [array_map(self::storedMembershipOf(...), $models), $read()] === [$stored, $rows]
+                        && array_all($models, static fn (Model $model): bool => self::holdsParentsOf($model, $models)),
+                    $moved,
+                );
 
-                    return $locked($rows, $also);
-                });
-            } catch (RuntimeException $exception) {
-                throw_unless($exception === $moved, $exception);
-            }
-        }
-
-        throw new ContendedOrder($this->parent, self::LOCK_ATTEMPTS);
+                return $locked($rows, $also);
+            });
+        });
     }
 
     /**
@@ -2719,6 +2791,25 @@ final class OrderedRelation
 
     /**
      * @param  list<Model&Ordered>  $items
+     * @param  list<array<string, mixed>>  $original
+     * @param  array<int, null|self>  $sources
+     */
+    private function compareExpected(array $items, array $original, array $sources, string $expected): void
+    {
+        foreach ($items as $index => $item) {
+            $source = $sources[$index] ?? null;
+            $read = $source === null ? null : self::sourceOf($item, $original[$index], [$source->parent]);
+
+            if ($source !== null && ($read === null || ! $read->is($source))) {
+                throw new StaleConcurrencyRevision(($read ?? $source)->parent, ($read ?? $source)->revision, $expected);
+            }
+        }
+
+        $this->compareConcurrencyRevision($expected);
+    }
+
+    /**
+     * @param  list<Model&Ordered>  $items
      * @param  array<int, null|self>  $sources
      * @return array<int, int>
      */
@@ -2737,7 +2828,7 @@ final class OrderedRelation
         foreach ($groups as $indices) {
             $source = $sources[$indices[0]] ?? null;
             $members = array_map(static fn (int $index): Model => $items[$index], $indices);
-            $positions = $source === null || $source->unavailable === UnavailableParent::MISSING ? [] : self::positionsOf([$source], $members);
+            $positions = $source === null || $source->unavailable === ParentUnavailability::Missing ? [] : self::positionsOf([$source], $members);
 
             foreach ($indices as $index) {
                 $position = $positions[(string) self::keyOf($items[$index])] ?? null;
@@ -2793,7 +2884,7 @@ final class OrderedRelation
         }
 
         $keys = $this->keysAt($placement, $ids, count($ids));
-        $copies = OrderWrite::copies($this->keys->item, $ids, self::timestamps($items[0], $this->keys->item));
+        $copies = OrderWrite::copies($this->keys->item, $ids, $this->keys->item->usesTimestamps());
         $rekeyed = array_values(array_filter(
             $ids,
             fn (int|string $id, int $index): bool => $from[$index] === $this && ($copies[$id] ?? null)?->getAttribute(self::RANK_KEY) !== $keys[$index],
@@ -2805,10 +2896,30 @@ final class OrderedRelation
         }
 
         foreach ($items as $index => $item) {
+            $remaining = array_slice($ids, $index);
+
+            if ($index > 0 && ! self::between($keys[$index], ...$this->boundsAfter($placement, $remaining, $ids[$index - 1]))) {
+                $keys = [...array_slice($keys, 0, $index), ...$this->keysAt($placement, $remaining, count($remaining), $ids[$index - 1])];
+                $resident = array_values(array_filter($remaining, fn (int|string $id, int $offset): bool => $from[$index + $offset] === $this, ARRAY_FILTER_USE_BOTH));
+
+                if ($resident !== []) {
+                    $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $resident)->update([self::RANK_KEY => null]);
+
+                    foreach (array_intersect_key($copies, array_flip($resident)) as $copy) {
+                        $copy->forceFill([self::RANK_KEY => null])->syncOriginalAttribute(self::RANK_KEY);
+                    }
+                }
+            }
+
             $stored = $rows[(string) $ids[$index]] ?? [];
             $item->forceFill($stored)->syncOriginalAttributes(array_keys($stored));
+            $copy = $copies[$ids[$index]] ?? null;
 
-            self::saveCopy($item, $copies[$ids[$index]] ?? null, $from[$index] === $this
+            if ($copy !== null) {
+                $copy->timestamps = self::timestamps($item, $this->keys->item);
+            }
+
+            self::saveCopy($item, $copy, $from[$index] === $this
                 ? [self::RANK_KEY => $keys[$index]]
                 : [...$from[$index]->keys->detached(), ...$this->keys->pointingAt($this->parent), self::RANK_KEY => $keys[$index]]);
         }
@@ -2917,7 +3028,12 @@ final class OrderedRelation
 
     private function batchOf(Model&Ordered $item): null|self
     {
-        return array_find(self::$creating, fn (self $batch): bool => $batch->is($this) && $batch->claims($item));
+        return array_find(self::$creating, fn (self $batch): bool => $batch->sameOrderAs($this) && $batch->claims($item));
+    }
+
+    private function sameOrderAs(self $other): bool
+    {
+        return $this->is($other) && $this->parent->getConnection()->getName() === $other->parent->getConnection()->getName();
     }
 
     private function claims(Model&Ordered $item): bool
@@ -2943,9 +3059,10 @@ final class OrderedRelation
      * @param  list<int|string>  $exclude
      * @return list<string>
      */
-    private function keysAt(Placement $placement, array $exclude, int $count): array
+    private function keysAt(Placement $placement, array $exclude, int $count, null|int|string $after = null): array
     {
-        [$lower, $upper] = $this->bounds($placement, $exclude, $this->indexedRows(...));
+        $bounds = fn (): array => $after === null ? $this->bounds($placement, $exclude, $this->indexedRows(...)) : $this->boundsAfter($placement, $exclude, $after);
+        [$lower, $upper] = $bounds();
         $keys = FractionalIndex::keysBetween($lower, $upper, $count);
 
         if ($keys === [] || max(array_map(strlen(...), $keys)) <= self::MAX_KEY_LENGTH) {
@@ -2953,7 +3070,7 @@ final class OrderedRelation
         }
 
         $this->rebalance();
-        [$lower, $upper] = $this->bounds($placement, $exclude, $this->indexedRows(...));
+        [$lower, $upper] = $bounds();
 
         return FractionalIndex::keysBetween($lower, $upper, $count);
     }
@@ -2964,8 +3081,8 @@ final class OrderedRelation
         $row = (array) ($this->parentRow()->lock('for no key update')->first() ?? []);
         $deletedAt = in_array(SoftDeletes::class, class_uses_recursive($this->parent), true) && method_exists($this->parent, 'getDeletedAtColumn') ? $this->parent->getDeletedAtColumn() : null;
         $this->unavailable = match (true) {
-            $row === [] => UnavailableParent::MISSING,
-            is_string($deletedAt) && ($row[$deletedAt] ?? null) !== null => UnavailableParent::TRASHED,
+            $row === [] => ParentUnavailability::Missing,
+            is_string($deletedAt) && ($row[$deletedAt] ?? null) !== null => ParentUnavailability::Trashed,
             default => null,
         };
         $declared = array_diff_key(array_intersect_key($row, array_flip($this->parentColumns)), $this->parent->getDirty());

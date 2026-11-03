@@ -38,7 +38,7 @@ try {
 
     echo json_encode(['moved', $moved]);
 } catch (UnavailableParent $exception) {
-    echo json_encode(['unavailable', $exception->reason]);
+    echo json_encode(['unavailable', $exception->reason->value]);
 } catch (PDOException $exception) {
     echo str_contains($exception->getMessage(), 'SQLSTATE[40P01]') ? json_encode(['40P01']) : throw $exception;
 }

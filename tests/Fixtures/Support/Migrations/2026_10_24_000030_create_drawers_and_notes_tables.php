@@ -12,16 +12,16 @@ return new class extends Migration
     {
         Schema::create('drawers', function (Blueprint $table): void {
             $table->id();
-            $table->timestamps();
-            $table->softDeletes();
+            $table->timestampsTz();
+            $table->softDeletesTz();
         });
 
         Schema::create('notes', function (Blueprint $table): void {
             $table->id();
             $table->foreignId('drawer_id')->constrained();
             $table->rankKey();
-            $table->timestamps();
-            $table->softDeletes();
+            $table->timestampsTz();
+            $table->softDeletesTz();
             $table->rankKeyIndex('drawer_id'); // @phpstan-ignore staticMethod.dynamicCall
         });
     }

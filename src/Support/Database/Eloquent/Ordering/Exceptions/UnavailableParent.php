@@ -9,20 +9,13 @@ use RuntimeException;
 
 final class UnavailableParent extends RuntimeException
 {
-    public const string TRASHED = 'trashed';
-
-    public const string MISSING = 'missing';
-
-    /**
-     * @param  self::TRASHED|self::MISSING  $reason
-     */
-    public function __construct(public readonly Model $parent, public readonly string $reason)
+    public function __construct(public readonly Model $parent, public readonly ParentUnavailability $reason)
     {
         parent::__construct(sprintf(
             '[%s:%s] is %s, so no write can place a member in its order.',
             $parent->getMorphClass(),
             $parent->getKey(),
-            $reason,
+            $reason->value,
         ));
     }
 }

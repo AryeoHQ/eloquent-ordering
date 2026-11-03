@@ -37,7 +37,7 @@ class UnavailableParentTest extends TestCase
         $before = $this->stored($drawer);
         DB::enableQueryLog();
 
-        $this->assertUnavailable($drawer, UnavailableParent::TRASHED, fn (): Note => $this->addNote($drawer));
+        $this->assertUnavailable($drawer, ParentUnavailability::Trashed, fn (): Note => $this->addNote($drawer));
 
         $this->assertSame($before, $this->stored($drawer));
         $this->assertTrue($this->lockedBeforeRefusal($drawer));
@@ -49,7 +49,7 @@ class UnavailableParentTest extends TestCase
         $drawer = Drawer::create();
         DB::table('drawers')->where('id', $drawer->id)->delete();
 
-        $this->assertUnavailable($drawer, UnavailableParent::MISSING, fn (): Note => $this->addNote($drawer));
+        $this->assertUnavailable($drawer, ParentUnavailability::Missing, fn (): Note => $this->addNote($drawer));
 
         $this->assertSame(0, DB::table('notes')->count());
     }
@@ -65,7 +65,7 @@ class UnavailableParentTest extends TestCase
 
         $note->drawer()->associate($trashed);
 
-        $this->assertUnavailable($trashed, UnavailableParent::TRASHED, fn (): bool => $note->save());
+        $this->assertUnavailable($trashed, ParentUnavailability::Trashed, fn (): bool => $note->save());
 
         $this->assertSame($before, [$this->stored($source), $this->stored($trashed)]);
     }
@@ -79,7 +79,7 @@ class UnavailableParentTest extends TestCase
         $trashed->delete();
         $before = [$this->stored($source), $this->stored($trashed)];
 
-        $this->assertUnavailable($trashed, UnavailableParent::TRASHED, fn (): mixed => $note->move(Placement::first()->in($trashed), expected: null));
+        $this->assertUnavailable($trashed, ParentUnavailability::Trashed, fn (): mixed => $note->move(Placement::first()->in($trashed), expected: null));
 
         $this->assertSame($before, [$this->stored($source), $this->stored($trashed)]);
     }
@@ -93,7 +93,7 @@ class UnavailableParentTest extends TestCase
         $drawer->delete();
         $before = $this->stored($drawer);
 
-        $this->assertUnavailable($drawer, UnavailableParent::TRASHED, fn (): mixed => self::restore($note));
+        $this->assertUnavailable($drawer, ParentUnavailability::Trashed, fn (): mixed => self::restore($note));
 
         $this->assertSame($before, $this->stored($drawer));
     }
@@ -104,7 +104,7 @@ class UnavailableParentTest extends TestCase
         $drawer = Drawer::create();
         DB::table('drawers')->where('id', $drawer->id)->delete();
 
-        $this->assertUnavailable($drawer, UnavailableParent::MISSING, fn (): Note => Note::create(['drawer_id' => $drawer->id]));
+        $this->assertUnavailable($drawer, ParentUnavailability::Missing, fn (): Note => Note::create(['drawer_id' => $drawer->id]));
 
         $this->assertSame(0, DB::table('notes')->count());
     }
@@ -120,7 +120,7 @@ class UnavailableParentTest extends TestCase
 
         $note->drawer_id = $gone->id;
 
-        $this->assertUnavailable($gone, UnavailableParent::MISSING, fn (): bool => $note->save());
+        $this->assertUnavailable($gone, ParentUnavailability::Missing, fn (): bool => $note->save());
 
         $this->assertSame($before, $this->stored($source));
     }
@@ -134,7 +134,7 @@ class UnavailableParentTest extends TestCase
         DB::table('drawers')->where('id', $gone->id)->delete();
         $before = $this->stored($source);
 
-        $this->assertUnavailable($gone, UnavailableParent::MISSING, fn (): mixed => $note->move(Placement::first()->in($gone), expected: null));
+        $this->assertUnavailable($gone, ParentUnavailability::Missing, fn (): mixed => $note->move(Placement::first()->in($gone), expected: null));
 
         $this->assertSame($before, $this->stored($source));
     }
@@ -147,7 +147,7 @@ class UnavailableParentTest extends TestCase
         $scene->delete();
         DB::table('tours')->where('id', $tour->id)->delete();
 
-        $this->assertUnavailable($tour, UnavailableParent::MISSING, fn (): mixed => self::restore(Scene::withTrashed()->findOrFail($scene->id)));
+        $this->assertUnavailable($tour, ParentUnavailability::Missing, fn (): mixed => self::restore(Scene::withTrashed()->findOrFail($scene->id)));
 
         $this->assertNotNull(DB::table('scenes')->where('id', $scene->id)->value('deleted_at'));
     }
@@ -161,7 +161,7 @@ class UnavailableParentTest extends TestCase
         Model::preventAccessingMissingAttributes();
 
         try {
-            $this->assertUnavailable($gone, UnavailableParent::MISSING, fn (): Page => Page::create(['binder_id' => $gone->id]));
+            $this->assertUnavailable($gone, ParentUnavailability::Missing, fn (): Page => Page::create(['binder_id' => $gone->id]));
         } finally {
             Model::preventAccessingMissingAttributes($preventing);
         }
@@ -185,7 +185,7 @@ class UnavailableParentTest extends TestCase
             $reloaded = Page::query()->findOrFail($page->id);
             $reloaded->binder_id = $gone->id;
 
-            $this->assertUnavailable($gone, UnavailableParent::MISSING, fn (): bool => $reloaded->save());
+            $this->assertUnavailable($gone, ParentUnavailability::Missing, fn (): bool => $reloaded->save());
         } finally {
             Model::preventAccessingMissingAttributes($preventing);
         }
@@ -200,7 +200,7 @@ class UnavailableParentTest extends TestCase
         $speaker = Speaker::query()->create(['panel_id' => Panel::create()->id]);
         $conference->delete();
 
-        $this->assertUnavailable($conference, UnavailableParent::TRASHED, function () use ($conference, $speaker): void {
+        $this->assertUnavailable($conference, ParentUnavailability::Trashed, function () use ($conference, $speaker): void {
             $conference->speakers()->attach($speaker->id);
         });
 
@@ -271,7 +271,7 @@ class UnavailableParentTest extends TestCase
         ];
     }
 
-    private function assertUnavailable(Model $parent, string $reason, Closure $write): void
+    private function assertUnavailable(Model $parent, ParentUnavailability $reason, Closure $write): void
     {
         try {
             $write();
@@ -280,7 +280,7 @@ class UnavailableParentTest extends TestCase
             $this->assertInstanceOf(RuntimeException::class, $exception);
             $this->assertSame($reason, $exception->reason);
             $this->assertSame($parent->getKey(), $exception->parent->getKey());
-            $this->assertSame(sprintf('[%s:%s] is %s, so no write can place a member in its order.', $parent->getMorphClass(), $parent->getKey(), $reason), $exception->getMessage());
+            $this->assertSame(sprintf('[%s:%s] is %s, so no write can place a member in its order.', $parent->getMorphClass(), $parent->getKey(), $reason->value), $exception->getMessage());
         }
     }
 

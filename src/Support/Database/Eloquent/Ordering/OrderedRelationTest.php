@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering;
 
 use Closure;
+use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
@@ -16,6 +17,7 @@ use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Events\TransactionBeginning;
+use Illuminate\Database\Migrations\Migrator;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Query\JoinClause;
@@ -41,6 +43,7 @@ use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
+use Support\Database\Eloquent\Ordering\Exceptions\ParentUnavailability;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
@@ -630,33 +633,16 @@ class OrderedRelationTest extends TestCase
         $staying = Binder::on('racer')->create(['shelf_id' => $shelf->id, 'kind' => 'audio']);
         $moving = Binder::on('racer')->create(['shelf_id' => $shelf->id, 'kind' => 'audio']);
         $page = Page::on('racer')->create(['binder_id' => $moving->id, 'kind' => 'audio']);
-        $rivals = [];
 
         try {
-            $racer->beginTransaction();
-            $racer->table('shelves')->where('id', $shelf->id)->lockForUpdate()->first();
+            [$outputs, $errors] = $this->raceBehindLock($racer, 'shelves', $shelf->id, [
+                ['move-binder.php', (string) $moving->id],
+                ['locked-with-page.php', $parent, (string) ($parent === 'shelf' ? $shelf->id : $moving->id), (string) $page->id],
+            ]);
 
-            $rivals[] = $this->startRival('move-binder.php', (string) $moving->id);
-            $this->awaitLockWait(1, ...$rivals);
-
-            $rivals[] = $this->startRival('locked-with-page.php', $parent, (string) ($parent === 'shelf' ? $shelf->id : $moving->id), (string) $page->id);
-            $this->awaitLockWait(2, ...$rivals);
-
-            $racer->rollBack();
-
-            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
-
-            $this->assertSame([['moved'], ['locked', $parent === 'shelf' ? [$moving->id, $staying->id] : [$page->id]]], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertSame([['moved'], ['locked', $parent === 'shelf' ? [$moving->id, $staying->id] : [$page->id]]], $outputs, $errors);
             $this->assertSame([$moving->id, $staying->id], $racer->table('binders')->where('shelf_id', $shelf->id)->orderBy('rank_key')->pluck('id')->all());
         } finally {
-            if ($racer->transactionLevel() > 0) {
-                $racer->rollBack();
-            }
-
-            foreach ($rivals as $rival) {
-                $rival->wait();
-            }
-
             $racer->table('pages')->where('binder_id', $moving->id)->delete();
             $racer->table('binders')->where('shelf_id', $shelf->id)->delete();
             $racer->table('shelves')->where('id', $shelf->id)->delete();
@@ -779,41 +765,19 @@ class OrderedRelationTest extends TestCase
     public function it_finishes_locking_the_children_of_a_composed_item_with_a_child_beside_a_move_of_a_grandchild_into_it_without_a_deadlock(): void
     {
         $racer = $this->racer();
-        [$lower, $higher] = [(string) Str::uuid(), (string) Str::uuid()];
-        [$lower, $higher] = strcmp($lower, $higher) < 0 ? [$lower, $higher] : [$higher, $lower];
+        [$lower, $higher] = self::ascendingUuids();
         $root = ComposedItem::withoutEvents(fn (): ComposedItem => tap((new ComposedItem)->setConnection('racer')->forceFill(['id' => $higher]))->save());
-        $child = (new ComposedItem)->setConnection('racer')->forceFill(['id' => $lower]);
-        $child->parent()->associate($root);
-        $child->save();
-        $grandchild = (new ComposedItem)->setConnection('racer');
-        $grandchild->parent()->associate($child);
-        $grandchild->save();
-        $rivals = [];
+        $child = self::racerComposedItemIn($root, $lower);
+        $grandchild = self::racerComposedItemIn($child);
 
         try {
-            $racer->beginTransaction();
-            $racer->table('composed_items')->where('id', $child->id)->lockForUpdate()->first();
+            [$outputs, $errors] = $this->raceBehindLock($racer, 'composed_items', $child->id, [
+                ['composed.php', 'move', $grandchild->id, $root->id],
+                ['composed.php', 'locked', $root->id, $child->id],
+            ]);
 
-            $rivals[] = $this->startRival('composed.php', 'move', $grandchild->id, $root->id);
-            $this->awaitLockWait(1, ...$rivals);
-
-            $rivals[] = $this->startRival('composed.php', 'locked', $root->id, $child->id);
-            $this->awaitLockWait(2, ...$rivals);
-
-            $racer->rollBack();
-
-            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
-
-            $this->assertSame([['moved'], ['locked', [$child->id, $grandchild->id]]], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertSame([['moved'], ['locked', [$child->id, $grandchild->id]]], $outputs, $errors);
         } finally {
-            if ($racer->transactionLevel() > 0) {
-                $racer->rollBack();
-            }
-
-            foreach ($rivals as $rival) {
-                $rival->wait();
-            }
-
             $racer->table('composed_items')->whereIn('id', [$grandchild->id, $child->id, $root->id])->delete();
         }
     }
@@ -822,53 +786,22 @@ class OrderedRelationTest extends TestCase
     public function it_moves_a_member_into_a_parent_held_with_a_stale_parent_beside_an_opposite_move_without_a_deadlock(): void
     {
         $racer = $this->racer();
-        [$lower, $higher] = [(string) Str::uuid(), (string) Str::uuid()];
-        [$lower, $higher] = strcmp($lower, $higher) < 0 ? [$lower, $higher] : [$higher, $lower];
         $root = ComposedItem::withoutEvents(fn (): ComposedItem => tap((new ComposedItem)->setConnection('racer'))->save());
-        [$first, $second] = array_map(function (string $id) use ($root): ComposedItem {
-            $item = (new ComposedItem)->setConnection('racer')->forceFill(['id' => $id]);
-            $item->parent()->associate($root);
-            $item->save();
-
-            return $item;
-        }, [$lower, $higher]);
-        [$inFirst, $inSecond] = array_map(function (ComposedItem $parent): ComposedItem {
-            $item = (new ComposedItem)->setConnection('racer');
-            $item->parent()->associate($parent);
-            $item->save();
-
-            return $item;
-        }, [$first, $second]);
-        $rivals = [];
+        [$first, $second] = array_map(static fn (string $id): ComposedItem => self::racerComposedItemIn($root, $id), self::ascendingUuids());
+        [$inFirst, $inSecond] = array_map(static fn (ComposedItem $parent): ComposedItem => self::racerComposedItemIn($parent), [$first, $second]);
 
         try {
-            $racer->beginTransaction();
-            $racer->table('composed_items')->where('id', $first->id)->lockForUpdate()->first();
+            [$outputs, $errors] = $this->raceBehindLock($racer, 'composed_items', $first->id, [
+                ['composed.php', 'move', $inFirst->id, $second->id],
+                ['composed.php', 'stale', $inSecond->id, $first->id, $second->id],
+            ]);
 
-            $rivals[] = $this->startRival('composed.php', 'move', $inFirst->id, $second->id);
-            $this->awaitLockWait(1, ...$rivals);
-
-            $rivals[] = $this->startRival('composed.php', 'stale', $inSecond->id, $first->id, $second->id);
-            $this->awaitLockWait(2, ...$rivals);
-
-            $racer->rollBack();
-
-            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
-
-            $this->assertSame([['moved'], ['moved']], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertSame([['moved'], ['moved']], $outputs, $errors);
             $this->assertSame([$second->id, $first->id], [
                 $racer->table('composed_items')->where('id', $inFirst->id)->value('parent_id'),
                 $racer->table('composed_items')->where('id', $inSecond->id)->value('parent_id'),
             ]);
         } finally {
-            if ($racer->transactionLevel() > 0) {
-                $racer->rollBack();
-            }
-
-            foreach ($rivals as $rival) {
-                $rival->wait();
-            }
-
             $racer->table('composed_items')->whereIn('id', [$inFirst->id, $inSecond->id])->delete();
             $racer->table('composed_items')->whereIn('id', [$first->id, $second->id])->delete();
             $racer->table('composed_items')->where('id', $root->id)->delete();
@@ -1040,7 +973,7 @@ class OrderedRelationTest extends TestCase
         DB::table('drawers')->where('id', $missing->id)->delete();
         $before = DB::table('notes')->orderBy('id')->get()->all();
 
-        foreach ([UnavailableParent::TRASHED => $trashed, UnavailableParent::MISSING => $missing] as $reason => $parent) {
+        foreach ([[ParentUnavailability::Trashed, $trashed], [ParentUnavailability::Missing, $missing]] as [$reason, $parent]) {
             try {
                 $parent->notes()->moveIn([$outside], expected: null);
                 $this->fail('A move in placed a member in a parent that takes none.');
@@ -1341,7 +1274,7 @@ class OrderedRelationTest extends TestCase
         DB::table('drawers')->where('id', $missing->id)->delete();
         $before = DB::table('notes')->orderBy('id')->get()->all();
 
-        foreach ([UnavailableParent::TRASHED => $trashed, UnavailableParent::MISSING => $missing] as $reason => $parent) {
+        foreach ([[ParentUnavailability::Trashed, $trashed], [ParentUnavailability::Missing, $missing]] as [$reason, $parent]) {
             try {
                 $parent->notes()->createInOrder([[], []]);
                 $this->fail('A create in order placed members in a parent that takes none.');
@@ -1445,6 +1378,158 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([
             [$drawer->id, [[$first->id, 2, 1]]],
             [$drawer->id, [[$one, 1, null], [$two, 3, null]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_touches_each_member_of_a_move_in_by_its_own_timestamps_setting(): void
+    {
+        [$source, $destination] = [Drawer::create(), Drawer::create()];
+        $notes = [$this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql')];
+        $notes[1]->timestamps = false;
+        $notes[2]->timestamps = false;
+        $stamps = fn (): array => array_map(fn (Note $note): mixed => DB::table('notes')->where('id', $note->id)->value('updated_at'), $notes);
+        $before = $stamps();
+        $this->travel(1)->days();
+
+        $destination->notes()->moveIn([$notes[0], $notes[1]], expected: null);
+        $destination->notes()->moveIn([$notes[2], $notes[3]], expected: null);
+
+        $after = $stamps();
+        $this->assertSame(array_map(fn (Note $note): int => $note->id, $notes), $this->noteIds($destination));
+        $this->assertSame([false, true, true, false], array_map(fn (mixed $stamp, int $index): bool => $stamp === $before[$index], $after, array_keys($after)));
+    }
+
+    #[Test]
+    public function it_moves_in_after_a_listener_appends_a_member_while_the_first_member_saves(): void
+    {
+        [$source, $destination] = [Drawer::create(), Drawer::create()];
+        $resident = $this->addNote($destination, 'pgsql');
+        [$one, $two] = [$this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql')];
+        $appended = null;
+        Note::updated(function (Note $note) use ($destination, $one, &$appended): void {
+            if ($appended === null && $note->id === $one->id) {
+                $appended = $this->addNote($destination, 'pgsql');
+            }
+        });
+        $this->recordReorders();
+
+        $change = $destination->notes()->moveIn([$one, $two], expected: null);
+
+        $this->assertInstanceOf(Note::class, $appended);
+        $this->assertSame([$resident->id, $one->id, $appended->id, $two->id], $this->noteIds($destination));
+        $this->assertSame($this->noteIds($destination), $change->order);
+        $this->assertSame([2, 4], [$one->position, $two->position]);
+        $this->assertSame([
+            [$destination->id, [[$appended->id, 3, null]]],
+            [$source->id, [[$one->id, null, 1], [$two->id, null, 2]]],
+            [$destination->id, [[$one->id, 2, null], [$two->id, 4, null]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_rearranges_members_after_a_listener_appends_a_member_while_the_first_member_saves(): void
+    {
+        $drawer = Drawer::create();
+        [$one, $two, $resident] = [$this->addNote($drawer, 'pgsql'), $this->addNote($drawer, 'pgsql'), $this->addNote($drawer, 'pgsql')];
+        $appended = null;
+        Note::updated(function (Note $note) use ($drawer, $one, &$appended): void {
+            if ($appended === null && $note->id === $one->id) {
+                $appended = $this->addNote($drawer, 'pgsql');
+            }
+        });
+        $this->recordReorders();
+
+        $change = $drawer->notes()->moveIn([$one, $two], expected: null);
+
+        $this->assertInstanceOf(Note::class, $appended);
+        $this->assertSame([$resident->id, $one->id, $appended->id, $two->id], $this->noteIds($drawer));
+        $this->assertSame($this->noteIds($drawer), $change->order);
+        $this->assertSame([
+            [$drawer->id, [[$appended->id, 3, null]]],
+            [$drawer->id, [[$one->id, 2, 1], [$two->id, 4, 2]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_leaves_a_pivot_attached_on_another_connection_during_a_create_in_order_to_its_own_order(): void
+    {
+        $this->withElsewhere(function (): void {
+            $listing = Listing::create();
+            $elsewhere = Listing::on('elsewhere')->forceCreate(['id' => $listing->id]);
+            new ListingCustomer;
+            $attached = false;
+            ListingCustomer::creating(function (ListingCustomer $pivot) use ($elsewhere, &$attached): void {
+                if (! $attached) {
+                    $attached = true;
+                    Customer::on('elsewhere')->forceCreate(['id' => $pivot->customer_id]);
+                    $elsewhere->customers()->attach($pivot->customer_id);
+                }
+            });
+            $events = [];
+            Event::listen(Reordered::class, function (Reordered $event) use (&$events): void {
+                $events[] = [$event->change->parent->getConnection()->getName(), array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position], $event->change->changed)];
+            });
+
+            $listing->customers()->createInOrder([[], []]);
+
+            $pivots = DB::table('listing_customer')->where('listing_id', $listing->id)->orderBy('rank_key')->pluck('id')->all();
+            $attachedPivot = DB::connection('elsewhere')->table('listing_customer')->value('id');
+            $this->assertCount(2, $pivots);
+            $this->assertSame([
+                ['elsewhere', [[$attachedPivot, 1]]],
+                ['pgsql', [[$pivots[0], 1], [$pivots[1], 2]]],
+            ], $events);
+        });
+    }
+
+    #[Test]
+    public function it_places_a_create_that_a_creating_listener_makes_after_the_create_it_interrupts(): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $inner = null;
+        Note::creating(function () use ($drawer, &$inner): void {
+            if ($inner === null) {
+                $inner = false;
+                $inner = $this->addNote($drawer, 'pgsql');
+            }
+        });
+        $this->recordReorders();
+
+        $outer = $this->addNote($drawer, 'pgsql');
+
+        $this->assertInstanceOf(Note::class, $inner);
+        $this->assertSame([$first->id, $outer->id, $inner->id], $this->noteIds($drawer));
+        $this->assertSame([
+            [$drawer->id, [[$inner->id, 2, null]]],
+            [$drawer->id, [[$outer->id, 2, null]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_reports_a_create_in_order_that_a_creating_listener_nests_in_its_own_event(): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $nested = null;
+        Note::creating(function () use ($drawer, &$nested): void {
+            if ($nested === null) {
+                $nested = [];
+                $nested = $this->createNotesInOrder($drawer, 2);
+            }
+        });
+        $this->recordReorders();
+
+        [$outerOne, $outerTwo] = $this->createNotesInOrder($drawer, 2);
+
+        $this->assertIsArray($nested);
+        $this->assertCount(2, $nested);
+        [$innerOne, $innerTwo] = $nested;
+        $this->assertSame([$first->id, $outerOne, $innerOne, $innerTwo, $outerTwo], $this->noteIds($drawer));
+        $this->assertSame([
+            [$drawer->id, [[$innerOne, 2, null], [$innerTwo, 3, null]]],
+            [$drawer->id, [[$outerOne, 2, null], [$outerTwo, 5, null]]],
         ], $this->reorders);
     }
 
@@ -2613,6 +2698,60 @@ class OrderedRelationTest extends TestCase
     }
 
     /**
+     * @return array{string, string}
+     */
+    private static function ascendingUuids(): array
+    {
+        $ids = [(string) Str::uuid(), (string) Str::uuid()];
+        sort($ids);
+
+        return [$ids[0], $ids[1]];
+    }
+
+    private static function racerComposedItemIn(ComposedItem $parent, null|string $id = null): ComposedItem
+    {
+        $item = (new ComposedItem)->setConnection('racer')->forceFill($id === null ? [] : ['id' => $id]);
+        $item->parent()->associate($parent);
+        $item->save();
+
+        return $item;
+    }
+
+    /**
+     * @param  list<list<string>>  $starts
+     * @return array{list<mixed>, string}
+     */
+    private function raceBehindLock(Connection $racer, string $table, int|string $id, array $starts): array
+    {
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table($table)->where('id', $id)->lockForUpdate()->first();
+
+            foreach ($starts as $started => $arguments) {
+                $rivals[] = $this->startRival(...$arguments);
+                $this->awaitLockWait($started + 1, ...$rivals);
+            }
+
+            $racer->rollBack();
+
+            return [
+                array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals),
+                implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)),
+            ];
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            foreach ($rivals as $rival) {
+                $rival->wait();
+            }
+        }
+    }
+
+    /**
      * @param  array<int, array{query: string, bindings: array<int, mixed>}>  $statements
      * @return list<array{string, mixed}>
      */
@@ -2652,6 +2791,35 @@ class OrderedRelationTest extends TestCase
     private function noteIds(Drawer $drawer): array
     {
         return DB::table('notes')->where('drawer_id', $drawer->id)->whereNull('deleted_at')->orderBy('rank_key')->pluck('id')->map(fn (mixed $id): int => (int) $id)->all();
+    }
+
+    /**
+     * @param  Closure(): void  $test
+     */
+    private function withElsewhere(Closure $test): void
+    {
+        config()->set('database.connections.elsewhere', [...config()->array('database.connections.pgsql'), 'search_path' => 'elsewhere,public']);
+        $connection = DB::connection('elsewhere');
+        $connection->statement('drop schema if exists elsewhere cascade');
+        $connection->statement('create schema elsewhere');
+
+        try {
+            $migrator = $this->app?->make('migrator');
+            $this->assertInstanceOf(Migrator::class, $migrator);
+            $migrator->usingConnection('elsewhere', function () use ($migrator): void {
+                $migrator->getRepository()->createRepository();
+                $migrator->run(array_map(fn (string $migration): string => dirname(__DIR__, 5).'/tests/Fixtures/Support/Migrations/'.$migration.'.php', [
+                    '2026_10_24_000013_create_listings_table',
+                    '2026_10_24_000014_create_customers_table',
+                    '2026_10_24_000016_create_listing_customer_table',
+                ]));
+            });
+
+            $test();
+        } finally {
+            $connection->statement('drop schema elsewhere cascade');
+            DB::purge('elsewhere');
+        }
     }
 
     private function addNote(Drawer $drawer, string $connection): Note
