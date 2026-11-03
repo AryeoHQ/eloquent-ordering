@@ -1433,6 +1433,12 @@ final class OrderedRelation
                 )),
             };
 
+            throw_if($type === 'Basic' && ($where['value'] ?? null) instanceof ExpressionContract, LogicException::class, sprintf(
+                '[%s] compares its members by [%s] to an expression, which a position query cannot re-alias. Compare two columns with whereColumn().',
+                $name,
+                is_string($where['column'] ?? null) ? $where['column'] : 'an expression',
+            ));
+
             foreach ($named as $column) {
                 throw_unless(is_string($column), LogicException::class, sprintf('[%s] filters its members by an expression, which a membership declaration cannot verify.', $name));
 
