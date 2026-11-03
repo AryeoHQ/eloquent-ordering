@@ -1387,7 +1387,7 @@ final class OrderedRelation
     private static function missingParent(array $membership, array $attributes): Model&OrdersRelations&Revisioned
     {
         $parent = $membership['parent']->newInstance([], true);
-        $parent->setRawAttributes([$membership['keys']->ownerKey => $attributes[$membership['keys']->foreignKey]], true);
+        $parent->setRawAttributes([...array_fill_keys(self::columnsOf($parent), null), $membership['keys']->ownerKey => $attributes[$membership['keys']->foreignKey]], true);
 
         return $parent;
     }
@@ -1799,15 +1799,23 @@ final class OrderedRelation
             }
         };
 
-        $connection = $parent->getConnection();
-        $table = $parent->getTable();
-        $columns = self::$parentTableColumns[$connection->getName().':'.$table] ??= $connection->getSchemaBuilder()->getColumnListing($table);
         $expected = $build(clone $parent);
 
         return array_values(array_map(
             $parent->qualifyColumn(...),
-            array_filter($columns, static fn (string $column): bool => $build(self::probed($parent, [$column])) !== $expected),
+            array_filter(self::columnsOf($parent), static fn (string $column): bool => $build(self::probed($parent, [$column])) !== $expected),
         ));
+    }
+
+    /**
+     * @return list<string>
+     */
+    private static function columnsOf(Model $parent): array
+    {
+        $connection = $parent->getConnection();
+        $table = $parent->getTable();
+
+        return self::$parentTableColumns[$connection->getName().':'.$table] ??= $connection->getSchemaBuilder()->getColumnListing($table);
     }
 
     /**
@@ -2154,7 +2162,8 @@ final class OrderedRelation
             $stored[$index] = self::storedMembershipOf($model);
             $held = $model instanceof LocksParentsFirst ? $model->parentsToLockFirst() : [];
             $named = $stored[$index] !== null && $model instanceof Ordered ? self::namedParents($model, $stored[$index], $held) : [];
-            $parents[$index] = array_values(array_unique(array_map($indexOf, [...$held, ...$named])));
+            $parents[$index] = array_values(array_unique(array_map($indexOf, [...$named, ...Provider::parentsReachedBy($model)])));
+            array_map($indexOf, $held);
         }
 
         $depths = [];

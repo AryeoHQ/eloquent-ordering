@@ -819,6 +819,63 @@ class OrderedRelationTest extends TestCase
     }
 
     #[Test]
+    public function it_moves_a_member_into_a_parent_held_with_a_stale_parent_beside_an_opposite_move_without_a_deadlock(): void
+    {
+        $racer = $this->racer();
+        [$lower, $higher] = [(string) Str::uuid(), (string) Str::uuid()];
+        [$lower, $higher] = strcmp($lower, $higher) < 0 ? [$lower, $higher] : [$higher, $lower];
+        $root = ComposedItem::withoutEvents(fn (): ComposedItem => tap((new ComposedItem)->setConnection('racer'))->save());
+        [$first, $second] = array_map(function (string $id) use ($root): ComposedItem {
+            $item = (new ComposedItem)->setConnection('racer')->forceFill(['id' => $id]);
+            $item->parent()->associate($root);
+            $item->save();
+
+            return $item;
+        }, [$lower, $higher]);
+        [$inFirst, $inSecond] = array_map(function (ComposedItem $parent): ComposedItem {
+            $item = (new ComposedItem)->setConnection('racer');
+            $item->parent()->associate($parent);
+            $item->save();
+
+            return $item;
+        }, [$first, $second]);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('composed_items')->where('id', $first->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('composed.php', 'move', $inFirst->id, $second->id);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('composed.php', 'stale', $inSecond->id, $first->id, $second->id);
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
+
+            $this->assertSame([['moved'], ['moved']], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertSame([$second->id, $first->id], [
+                $racer->table('composed_items')->where('id', $inFirst->id)->value('parent_id'),
+                $racer->table('composed_items')->where('id', $inSecond->id)->value('parent_id'),
+            ]);
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            foreach ($rivals as $rival) {
+                $rival->wait();
+            }
+
+            $racer->table('composed_items')->whereIn('id', [$inFirst->id, $inSecond->id])->delete();
+            $racer->table('composed_items')->whereIn('id', [$first->id, $second->id])->delete();
+            $racer->table('composed_items')->where('id', $root->id)->delete();
+        }
+    }
+
+    #[Test]
     public function it_returns_no_members_of_a_held_parent_whose_row_is_gone(): void
     {
         $tour = Tour::create();
