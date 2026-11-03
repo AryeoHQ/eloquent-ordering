@@ -40,19 +40,19 @@ class MacrosTest extends TestCase
     {
         yield 'a table that soft deletes' => [function (Blueprint $table): void {
             $table->foreignId('section_id');
-            $table->rankKeyIndex('section_id'); // @phpstan-ignore staticMethod.dynamicCall
+            $table->rankKeyIndex('section_id');
             $table->softDeletesTz();
         }, ['section_id', 'rank_key'], ' WHERE (deleted_at IS NULL)'];
 
         yield 'a table that does not soft delete' => [function (Blueprint $table): void {
             $table->foreignId('section_id');
-            $table->rankKeyIndex('section_id'); // @phpstan-ignore staticMethod.dynamicCall
+            $table->rankKeyIndex('section_id');
         }, ['section_id', 'rank_key'], ''];
 
         yield 'a morph parent' => [function (Blueprint $table): void {
             $table->morphs('sceneable');
             $table->softDeletesTz();
-            $table->rankKeyIndex('sceneable_type', 'sceneable_id'); // @phpstan-ignore staticMethod.dynamicCall
+            $table->rankKeyIndex('sceneable_type', 'sceneable_id');
         }, ['sceneable_type', 'sceneable_id', 'rank_key'], ' WHERE (deleted_at IS NULL)'];
     }
 
@@ -85,7 +85,7 @@ class MacrosTest extends TestCase
             $table->id();
             $table->foreignId('section_id');
             $table->rankKey();
-            $table->rankKeyIndex('section_id'); // @phpstan-ignore staticMethod.dynamicCall
+            $table->rankKeyIndex('section_id');
         });
 
         try {
@@ -117,7 +117,7 @@ class MacrosTest extends TestCase
         });
 
         Schema::table('ranked', function (Blueprint $table): void {
-            $table->rankKeyIndex('section_id'); // @phpstan-ignore staticMethod.dynamicCall
+            $table->rankKeyIndex('section_id');
         });
 
         $this->assertSame(

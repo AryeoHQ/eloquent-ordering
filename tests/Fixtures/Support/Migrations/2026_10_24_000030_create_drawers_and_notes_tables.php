@@ -22,7 +22,7 @@ return new class extends Migration
             $table->rankKey();
             $table->timestamps();
             $table->softDeletes();
-            $table->rankKeyIndex('drawer_id'); // @phpstan-ignore staticMethod.dynamicCall
+            $table->rankKeyIndex('drawer_id');
         });
     }
 
