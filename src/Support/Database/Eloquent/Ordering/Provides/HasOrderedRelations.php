@@ -12,6 +12,7 @@ use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 
 /**
  * @phpstan-require-extends Model
@@ -28,6 +29,8 @@ trait HasOrderedRelations
 
     public static function bootHasOrderedRelations(): void
     {
+        static::addGlobalScope(new SelectsPosition);
+
         static::saving(static function (self $parent): void {
             if (OrderedRelation::refilters($parent)) {
                 self::lockOrderingParentsFirst($parent);

@@ -41,7 +41,7 @@ class TwoPivotListing extends Model implements OrdersRelations, Revisioned
     /**
      * @return BelongsToMany<TwoPivotCustomer, $this, AgencyCustomer>
      */
-    #[OrdersRelation(ListingRevision::ScenesOrder)]
+    #[OrdersRelation(ListingRevision::AgencyCustomersOrder)]
     public function agencyCustomers(): BelongsToMany
     {
         return $this->belongsToMany(TwoPivotCustomer::class, 'agency_customer', 'agency_id', 'customer_id')

@@ -2608,7 +2608,7 @@ class IsOrderedTest extends TestCase
 
         $third->move(Placement::first()->in($drawer), expected: null);
         $second->move(Placement::first(), expected: null);
-        $change = $drawer->notes()->arrange([$third->id, $second->id, $first->id]);
+        $change = $drawer->notes()->arrange([$third->id, $second->id, $first->id], expected: null);
 
         $this->assertSame([$third->id, $second->id, $first->id], $change->order);
         $this->assertSame([$third->id, $second->id, $first->id], DB::table('notes')->where('drawer_id', $drawer->id)->orderBy('rank_key')->pluck('id')->all());

@@ -96,7 +96,7 @@ class OrdersThroughPivotsTest extends TestCase
         })->all();
         $order = array_reverse($ids);
 
-        $shape->customers($parent)->arrange($order);
+        $shape->customers($parent)->arrange($order, expected: null);
 
         $this->assertEquals(array_combine($order, [1, 2, 3]), $shape->selectedPositions($read()));
     }

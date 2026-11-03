@@ -142,21 +142,7 @@ trait IsOrdered
             $restored?->placed($item);
 
             if ($reparented !== null) {
-                [$source, $destination, $previous] = $reparented;
-
-                if ($destination !== null) {
-                    $item->resolvedOrderedRelation = $destination;
-                }
-
-                if ($source !== null && $previous !== null) {
-                    if ($destination === null) {
-                        $source->removed($item, $previous);
-                    } else {
-                        $destination->entered($item, $source, $previous);
-                    }
-                } elseif ($destination !== null) {
-                    $destination->placed($item);
-                }
+                $item->announceReparent(...$reparented);
             }
 
             foreach ($relations as $relation) {
@@ -391,6 +377,23 @@ trait IsOrdered
     private function forgetPosition(): void
     {
         unset($this->attributes[OrderedRelation::POSITION], $this->original[OrderedRelation::POSITION]);
+    }
+
+    private function announceReparent(null|OrderedRelation $source, null|OrderedRelation $destination, null|int $previous): void
+    {
+        if ($destination !== null) {
+            $this->resolvedOrderedRelation = $destination;
+        }
+
+        if ($source !== null && $previous !== null) {
+            if ($destination === null) {
+                $source->removed($this, $previous);
+            } else {
+                $destination->entered($this, $source, $previous);
+            }
+        } elseif ($destination !== null) {
+            $destination->placed($this);
+        }
     }
 
     private function selectStoredPosition(): void

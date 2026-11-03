@@ -13,7 +13,7 @@ require __DIR__.'/../../../../vendor/autoload.php';
 Application::create(options: ['extra' => ['providers' => [Provider::class]]]);
 
 try {
-    Section::query()->findOrFail($section)->assets()->arrange(array_map(intval(...), explode(',', $ids)));
+    Section::query()->findOrFail($section)->assets()->arrange(array_map(intval(...), explode(',', $ids)), expected: null);
 
     echo 'reordered';
 } catch (PDOException $exception) {
