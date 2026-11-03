@@ -214,12 +214,10 @@ trait IsOrdered
                 throw new NotAMember(static::class, [OrderedRelation::keyOf($this)]);
             }
 
-            if ($destination !== null && ! $destination->is($source)) {
-                $destination->refuseUnavailable();
-            }
+            $source->requireMember($this);
 
             if ($expected !== null) {
-                $read = $this->resolveOrderedRelation($this->getRawOriginal());
+                $read = $this->remember(OrderedRelation::sourceOf($this, $this->getRawOriginal(), $this->heldOrderedParents()));
 
                 if ($read === null || ! $read->is($source)) {
                     throw new StaleConcurrencyRevision(($read ?? $source)->parent, ($read ?? $source)->revision, $expected);
@@ -313,7 +311,7 @@ trait IsOrdered
         }
 
         if (! $item->exists) {
-            $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
+            $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->remember(OrderedRelation::destinationOf($item, $item->getAttributes(), $item->heldOrderedParents()))]);
 
             foreach ($item->lockedOrderedRelations as $relation) {
                 $relation->refuseUnavailable();
@@ -322,7 +320,7 @@ trait IsOrdered
             $item->lockRelatedOfOrderedRelations();
         } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
             [$current, $item->lockedOrderedRelations, $next, $membership] = $item->lockCurrentOrderedRelations(
-                static fn (null|array $stored): null|OrderedRelation => OrderedRelation::of(
+                static fn (null|array $stored): null|OrderedRelation => OrderedRelation::destinationOf(
                     $item,
                     $stored === null ? $item->getAttributes() : [...$stored, ...array_intersect_key($item->getDirty(), $stored)],
                     $item->heldOrderedParents(),
@@ -423,8 +421,11 @@ trait IsOrdered
      */
     private function resolveOrderedRelation(array $attributes): null|OrderedRelation
     {
-        $relation = OrderedRelation::of($this, $attributes, $this->heldOrderedParents());
+        return $this->remember(OrderedRelation::of($this, $attributes, $this->heldOrderedParents()));
+    }
 
+    private function remember(null|OrderedRelation $relation): null|OrderedRelation
+    {
         if ($relation !== null) {
             $this->resolvedOrderedRelation = $relation;
         }
@@ -498,7 +499,7 @@ trait IsOrdered
 
         for ($attempt = 1; $attempt <= self::ORDER_LOCK_ATTEMPTS; $attempt++) {
             $stored = $this->storedOrderedAttributes(OrderedRelation::membershipColumns($this));
-            $current = $stored === null ? null : $this->resolveOrderedRelation($stored);
+            $current = $stored === null ? null : $this->remember(OrderedRelation::sourceOf($this, $stored, $this->heldOrderedParents()));
             $next = $resolveNext === null ? null : $resolveNext($stored);
 
             try {

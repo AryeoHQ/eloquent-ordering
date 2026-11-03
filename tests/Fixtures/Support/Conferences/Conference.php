@@ -6,6 +6,7 @@ namespace Tests\Fixtures\Support\Conferences;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\SoftDeletes;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
@@ -22,6 +23,7 @@ class Conference extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
     use HasOrderedRelations;
+    use SoftDeletes;
 
     protected $guarded = [];
 

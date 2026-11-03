@@ -31,6 +31,7 @@ return new class extends Migration
         Schema::create('conferences', function (Blueprint $table): void {
             $table->id();
             $table->timestamps();
+            $table->softDeletes();
         });
 
         Schema::create('conference_speaker', function (Blueprint $table): void {

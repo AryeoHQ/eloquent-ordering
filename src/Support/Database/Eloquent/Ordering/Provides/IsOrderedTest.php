@@ -22,6 +22,8 @@ use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
+use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
+use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Exceptions\UnselectedPosition;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\OrderChange;
@@ -1731,8 +1733,8 @@ class IsOrderedTest extends TestCase
 
         $shape->find($this->key($deleted))->delete();
 
-        $this->assertRejected($shape, StaleConcurrencyRevision::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: $digest), $parent);
-        $this->assertRejected($shape, LogicException::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: null), $parent);
+        $this->assertRejected($shape, NotAMember::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: $digest), $parent);
+        $this->assertRejected($shape, NotAMember::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: null), $parent);
         $this->assertOrder($shape, [$first->getKey()], $parent);
     }
 
@@ -2233,7 +2235,7 @@ class IsOrderedTest extends TestCase
         $parents = $member->parentsToLockFirst();
 
         $this->assertSame([[$source::class, $source->getKey()]], array_map(fn (Model $model): array => [$model::class, $model->getKey()], $parents));
-        $this->assertRejected($shape, LogicException::class, fn (): bool => $member->save(), $source);
+        $this->assertRejected($shape, UnavailableParent::class, fn (): bool => $member->save(), $source);
     }
 
     #[Test]

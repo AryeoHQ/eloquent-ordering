@@ -12,9 +12,14 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
 use Support\Database\Eloquent\Ordering\Placement;
+use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Drawers\Drawer;
 use Tests\Fixtures\Support\Drawers\DrawerRevision;
 use Tests\Fixtures\Support\Notes\Note;
+use Tests\Fixtures\Support\Panels\Panel;
+use Tests\Fixtures\Support\Scenes\Scene;
+use Tests\Fixtures\Support\Speakers\Speaker;
+use Tests\Fixtures\Support\Tours\Tour;
 use Tests\TestCase;
 
 #[CoversClass(UnavailableParent::class)]
@@ -91,6 +96,74 @@ class UnavailableParentTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_create_in_a_parent_whose_row_was_gone_before_the_create_read_it(): void
+    {
+        $drawer = Drawer::create();
+        DB::table('drawers')->where('id', $drawer->id)->delete();
+
+        $this->assertUnavailable($drawer, UnavailableParent::MISSING, fn (): Note => Note::create(['drawer_id' => $drawer->id]));
+
+        $this->assertSame(0, DB::table('notes')->count());
+    }
+
+    #[Test]
+    public function it_refuses_a_save_that_moves_a_member_into_a_parent_whose_row_is_gone(): void
+    {
+        $source = Drawer::create();
+        $note = $this->addNote($source);
+        $gone = Drawer::create();
+        DB::table('drawers')->where('id', $gone->id)->delete();
+        $before = $this->stored($source);
+
+        $note->drawer_id = $gone->id;
+
+        $this->assertUnavailable($gone, UnavailableParent::MISSING, fn (): bool => $note->save());
+
+        $this->assertSame($before, $this->stored($source));
+    }
+
+    #[Test]
+    public function it_refuses_a_move_into_a_held_parent_whose_row_is_gone(): void
+    {
+        $source = Drawer::create();
+        $note = $this->addNote($source);
+        $gone = Drawer::create();
+        DB::table('drawers')->where('id', $gone->id)->delete();
+        $before = $this->stored($source);
+
+        $this->assertUnavailable($gone, UnavailableParent::MISSING, fn (): mixed => $note->move(Placement::first()->in($gone), expected: null));
+
+        $this->assertSame($before, $this->stored($source));
+    }
+
+    #[Test]
+    public function it_refuses_a_restore_into_a_parent_whose_row_is_gone(): void
+    {
+        $tour = Tour::create();
+        $scene = $tour->scenes()->create();
+        $scene->delete();
+        DB::table('tours')->where('id', $tour->id)->delete();
+
+        $this->assertUnavailable($tour, UnavailableParent::MISSING, fn (): mixed => self::restore(Scene::withTrashed()->findOrFail($scene->id)));
+
+        $this->assertNotNull(DB::table('scenes')->where('id', $scene->id)->value('deleted_at'));
+    }
+
+    #[Test]
+    public function it_refuses_an_attach_to_a_trashed_pivot_parent(): void
+    {
+        $conference = Conference::create();
+        $speaker = Speaker::query()->create(['panel_id' => Panel::create()->id]);
+        $conference->delete();
+
+        $this->assertUnavailable($conference, UnavailableParent::TRASHED, function () use ($conference, $speaker): void {
+            $conference->speakers()->attach($speaker->id);
+        });
+
+        $this->assertSame(0, DB::table('conference_speaker')->count());
+    }
+
+    #[Test]
     public function it_refuses_a_create_that_waited_on_the_lock_of_a_parent_that_a_concurrent_delete_trashed(): void
     {
         $racer = $this->racer();
@@ -154,7 +227,7 @@ class UnavailableParentTest extends TestCase
         ];
     }
 
-    private function assertUnavailable(Drawer $drawer, string $reason, Closure $write): void
+    private function assertUnavailable(Model $parent, string $reason, Closure $write): void
     {
         try {
             $write();
@@ -162,8 +235,8 @@ class UnavailableParentTest extends TestCase
         } catch (UnavailableParent $exception) {
             $this->assertInstanceOf(RuntimeException::class, $exception);
             $this->assertSame($reason, $exception->reason);
-            $this->assertSame($drawer->id, $exception->parent->getKey());
-            $this->assertSame(sprintf('[%s:%s] is %s, so no write can place a member in its order.', $drawer->getMorphClass(), $drawer->id, $reason), $exception->getMessage());
+            $this->assertSame($parent->getKey(), $exception->parent->getKey());
+            $this->assertSame(sprintf('[%s:%s] is %s, so no write can place a member in its order.', $parent->getMorphClass(), $parent->getKey(), $reason), $exception->getMessage());
         }
     }
 

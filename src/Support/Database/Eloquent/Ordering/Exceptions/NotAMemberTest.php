@@ -16,6 +16,8 @@ use Tests\Fixtures\Support\Drawers\DrawerRevision;
 use Tests\Fixtures\Support\Notes\Note;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Playlists\PlaylistRevision;
+use Tests\Fixtures\Support\Scenes\Scene;
+use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tracks\Track;
 use Tests\TestCase;
 
@@ -90,6 +92,64 @@ class NotAMemberTest extends TestCase
         $this->assertSame($before, $this->storedNotes($drawer));
     }
 
+    #[Test]
+    public function it_refuses_a_move_with_an_expected_revision_of_a_member_trashed_since_the_revision_was_read(): void
+    {
+        $drawer = Drawer::create();
+        [$note] = [$this->addNote($drawer), $this->addNote($drawer)];
+        $expected = $drawer->concurrencyRevision(DrawerRevision::NotesOrder);
+        Note::query()->findOrFail($note->id)->delete();
+        $before = $this->storedNotes($drawer);
+
+        $this->assertNotAMember(Note::class, $note->id, fn (): mixed => $note->move(Placement::last(), expected: $expected));
+
+        $this->assertSame($before, $this->storedNotes($drawer));
+    }
+
+    #[Test]
+    public function it_refuses_a_move_with_an_expected_revision_of_a_member_hard_deleted_since_the_revision_was_read(): void
+    {
+        $playlist = Playlist::create(['kind' => 'song']);
+        $track = Track::create(['playlist_id' => $playlist->id, 'kind' => 'song']);
+        Track::create(['playlist_id' => $playlist->id, 'kind' => 'song']);
+        $expected = $playlist->concurrencyRevision(PlaylistRevision::TracksOrder);
+        Track::query()->findOrFail($track->id)->delete();
+        $before = $this->storedTracks($playlist);
+
+        $this->assertNotAMember(Track::class, $track->id, fn (): mixed => $track->move(Placement::last(), expected: $expected));
+
+        $this->assertSame($before, $this->storedTracks($playlist));
+    }
+
+    #[Test]
+    public function it_refuses_a_move_of_a_member_whose_parent_row_is_gone(): void
+    {
+        $tour = Tour::create();
+        $scene = $tour->scenes()->create();
+        $tour->scenes()->create();
+        DB::table('tours')->where('id', $tour->id)->delete();
+        $before = $this->storedScenes($tour);
+
+        $this->assertNotAMember(Scene::class, $scene->id, fn (): mixed => Scene::query()->findOrFail($scene->id)->move(Placement::last(), expected: null));
+
+        $this->assertSame($before, $this->storedScenes($tour));
+    }
+
+    #[Test]
+    public function it_refuses_a_move_of_a_member_of_a_held_parent_whose_row_is_gone(): void
+    {
+        $tour = Tour::create();
+        $tour->scenes()->create();
+        $scene = $tour->scenes()->create();
+        $scene->setRelation('sceneable', $tour);
+        DB::table('tours')->where('id', $tour->id)->delete();
+        $before = $this->storedScenes($tour);
+
+        $this->assertNotAMember(Scene::class, $scene->id, fn (): mixed => $scene->move(Placement::first(), expected: null));
+
+        $this->assertSame($before, $this->storedScenes($tour));
+    }
+
     private function addNote(Drawer $drawer): Note
     {
         $note = (new Note)->setConnection($drawer->getConnectionName());
@@ -130,15 +190,23 @@ class NotAMemberTest extends TestCase
     private function storedTracks(Playlist $playlist): array
     {
         return [
-            DB::connection('racer')->table('tracks')->where('playlist_id', $playlist->id)->orderBy('id')->get()->map(fn (object $row): array => (array) $row)->all(),
-            Playlist::on('racer')->findOrFail($playlist->id)->concurrencyRevision(PlaylistRevision::TracksOrder),
+            DB::connection($playlist->getConnectionName())->table('tracks')->where('playlist_id', $playlist->id)->orderBy('id')->get()->map(fn (object $row): array => (array) $row)->all(),
+            Playlist::on($playlist->getConnectionName())->findOrFail($playlist->id)->concurrencyRevision(PlaylistRevision::TracksOrder),
         ];
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function storedScenes(Tour $tour): array
+    {
+        return DB::table('scenes')->where('sceneable_id', $tour->id)->orderBy('id')->get()->map(fn (object $row): array => (array) $row)->all();
     }
 
     /**
      * @param  class-string<Model>  $class
      */
-    private function assertNotAMember(string $class, int $id, callable $move): void
+    private function assertNotAMember(string $class, int|string $id, callable $move): void
     {
         try {
             $move();
