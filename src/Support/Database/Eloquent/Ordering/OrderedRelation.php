@@ -1680,7 +1680,17 @@ final class OrderedRelation
             && $keys->ownerKey === $expected->ownerKey
             && $keys->morphType === $expected->morphType
             && $keys->morphClass === $expected->morphClass
-            && $keys->relatedKey === $expected->relatedKey;
+            && $keys->relatedKey === $expected->relatedKey
+            && self::relatedRows($relation) === self::relatedRows($declared);
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     * @return null|array{string, string}
+     */
+    private static function relatedRows(HasMany|MorphMany|BelongsToMany $relation): null|array
+    {
+        return $relation instanceof BelongsToMany ? [$relation->getRelated()->getTable(), $relation->getRelatedKeyName()] : null;
     }
 
     /**

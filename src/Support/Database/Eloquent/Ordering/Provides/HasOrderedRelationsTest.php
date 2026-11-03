@@ -42,6 +42,7 @@ use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\Customerable;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Listings\KeyedListing;
+use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Playlists\Playlist;
@@ -432,6 +433,16 @@ class HasOrderedRelationsTest extends TestCase
         yield 'a has many of the declared item by another owner key' => [
             static fn (): Relation => Section::create()->hasMany(Asset::class, 'section_id', 'concurrency_revision'),
             sprintf('The [%s] relation of [%s] to [%s] orders nothing.', HasMany::class, Section::class, Asset::class),
+        ];
+
+        yield 'a belongs to many of the declared pivot by another related key' => [
+            static fn (): Relation => Listing::create()->belongsToMany(Customer::class, 'listing_customer', 'listing_id', 'customer_id', 'id', 'name')->using(ListingCustomer::class),
+            sprintf('The [%s] relation of [%s] to [%s] orders nothing.', BelongsToMany::class, Listing::class, ListingCustomer::class),
+        ];
+
+        yield 'a belongs to many of the declared pivot to another related table' => [
+            static fn (): Relation => Listing::create()->belongsToMany(Asset::class, 'listing_customer', 'listing_id', 'customer_id')->using(ListingCustomer::class),
+            sprintf('The [%s] relation of [%s] to [%s] orders nothing.', BelongsToMany::class, Listing::class, ListingCustomer::class),
         ];
     }
 
