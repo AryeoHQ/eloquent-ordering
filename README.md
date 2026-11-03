@@ -581,7 +581,7 @@ Asset::factory()->for($section)->placedAt(Placement::before($anchorId))->create(
 
 A placement that names a parent throws `LogicException`, as `placeAt()` does.
 
-**Forge a concurrent write with `ChangesRowsOnFirstRead`.** Use the trait in a test case. Each method changes one row through `toBase()` after the first `select` on that row's table and connection, and then ignores every later query. A subquery or a join that reads the table counts as a read of it.
+**Forge a concurrent write with `ChangesRowsOnFirstRead`.** Use the trait in a test case. Each method changes one row through `toBase()` after the first `select` on that row's table and connection, and then ignores every later query. A subquery or a join that reads the table counts as a read of it, and so does a statement that starts with `with`. The match ignores keyword case and whitespace, and it accepts the table quoted or unquoted. It does not parse SQL, so a string literal or a comment that names the table also counts as a read. One forged write runs at a time. A read inside a forged write triggers nothing, so a second forge waits for the next read.
 
 ```php
 use Support\Database\Eloquent\Ordering\Testing\ChangesRowsOnFirstRead;
