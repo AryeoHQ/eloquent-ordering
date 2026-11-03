@@ -734,19 +734,27 @@ final class OrderedRelation
                 $this->pendingKeys = [];
             }
 
-            $order = $this->memberIds();
-            $members = array_flip($order);
-            $change = $this->change(array_fill_keys(array_values(array_filter($this->created, static fn (int|string $id): bool => array_key_exists($id, $members))), null), order: $order);
-            $this->created = [];
-
-            if ($change->changed === []) {
-                $this->announceRebalance($change->digest);
-            } else {
-                $this->announce($change);
-            }
+            $this->announceCreated($this->created);
 
             return new Collection($models);
         });
+    }
+
+    /**
+     * @param  list<int|string>  $created
+     */
+    private function announceCreated(array $created): void
+    {
+        $order = $this->memberIds();
+        $members = array_flip($order);
+        $change = $this->change(array_fill_keys(array_values(array_filter($created, static fn (int|string $id): bool => array_key_exists($id, $members))), null), order: $order);
+        $this->created = [];
+
+        if ($change->changed === []) {
+            $this->announceRebalance($change->digest);
+        } else {
+            $this->announce($change);
+        }
     }
 
     /**
@@ -2294,11 +2302,9 @@ final class OrderedRelation
     private function besideInFlight(array $bounds, bool $upper): array
     {
         foreach (self::$inFlight ?? [] as $item => [$relation, $key]) {
-            if ($item->exists || ! $relation->sameOrderAs($this) || ! self::between($key, ...$bounds)) {
-                continue;
+            if ($item->exists === false && $relation->sameOrderAs($this) && self::between($key, ...$bounds)) {
+                $bounds[$upper ? 1 : 0] = $key;
             }
-
-            $bounds[$upper ? 1 : 0] = $key;
         }
 
         return $bounds;
@@ -2375,7 +2381,7 @@ final class OrderedRelation
         $ids = array_keys($changed);
         $copies = OrderWrite::copies($this->keys->item, $ids, $this->keys->item->usesTimestamps());
 
-        $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $ids)->update([self::RANK_KEY => null]);
+        $this->clearRankKeys($ids);
 
         foreach ($changed as $id => $key) {
             if (array_key_exists($id, $copies)) {
@@ -2866,50 +2872,62 @@ final class OrderedRelation
             return $this->change([]);
         }
 
-        if ($entering === []) {
-            $current = $this->rankKeys($this->rows($ids));
-
-            if ($this->holdsPlaces($ids, $current, $placement)) {
-                foreach ($items as $index => $item) {
-                    $stored = [...($rows[(string) $ids[$index]] ?? []), self::RANK_KEY => $current[$ids[$index]] ?? null];
-                    $item->forceFill($stored)->syncOriginalAttributes(array_keys($stored));
-                    $this->settle($item, $previous[$index] ?? null, [$original[$index], $stored]);
-                }
-
-                return $this->change([]);
-            }
+        if ($entering === [] && $this->keptInPlace($items, $ids, $placement, $rows, $previous, $original)) {
+            return $this->change([]);
         }
 
         if ($entering !== []) {
             $this->refuseUnavailable();
         }
 
-        $keys = $this->keysAt($placement, $ids, count($ids));
-        $copies = OrderWrite::copies($this->keys->item, $ids, $this->keys->item->usesTimestamps());
-        $rekeyed = array_values(array_filter(
-            $ids,
-            fn (int|string $id, int $index): bool => $from[$index] === $this && ($copies[$id] ?? null)?->getAttribute(self::RANK_KEY) !== $keys[$index],
-            ARRAY_FILTER_USE_BOTH,
-        ));
+        $this->writeKeys($items, $ids, $from, $placement, $rows);
 
-        if ($rekeyed !== []) {
-            $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $rekeyed)->update([self::RANK_KEY => null]);
+        return $this->changeDestination($items, $ids, $from, $rows, $previous, $original, $this->announceSources($entering, $from, $ids, $previous));
+    }
+
+    /**
+     * @param  list<Model&Ordered>  $items
+     * @param  list<int|string>  $ids
+     * @param  array<string, array<string, mixed>>  $rows
+     * @param  array<int, int>  $previous
+     * @param  list<array<string, mixed>>  $original
+     */
+    private function keptInPlace(array $items, array $ids, Placement $placement, array $rows, array $previous, array $original): bool
+    {
+        $current = $this->rankKeys($this->rows($ids));
+
+        if (! $this->holdsPlaces($ids, $current, $placement)) {
+            return false;
         }
 
         foreach ($items as $index => $item) {
-            $remaining = array_slice($ids, $index);
+            $stored = [...($rows[(string) $ids[$index]] ?? []), self::RANK_KEY => $current[$ids[$index]] ?? null];
+            $item->forceFill($stored)->syncOriginalAttributes(array_keys($stored));
+            $this->settle($item, $previous[$index] ?? null, [$original[$index], $stored]);
+        }
 
-            if ($index > 0 && ! self::between($keys[$index], ...$this->boundsAfter($placement, $remaining, $ids[$index - 1]))) {
-                $keys = [...array_slice($keys, 0, $index), ...$this->keysAt($placement, $remaining, count($remaining), $ids[$index - 1])];
-                $resident = array_values(array_filter($remaining, fn (int|string $id, int $offset): bool => $from[$index + $offset] === $this, ARRAY_FILTER_USE_BOTH));
+        return true;
+    }
 
-                if ($resident !== []) {
-                    $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $resident)->update([self::RANK_KEY => null]);
+    /**
+     * @param  list<Model&Ordered>  $items
+     * @param  list<int|string>  $ids
+     * @param  array<int, self>  $from
+     * @param  array<string, array<string, mixed>>  $rows
+     */
+    private function writeKeys(array $items, array $ids, array $from, Placement $placement, array $rows): void
+    {
+        $keys = $this->keysAt($placement, $ids, count($ids));
+        $copies = OrderWrite::copies($this->keys->item, $ids, $this->keys->item->usesTimestamps());
+        $this->clearRankKeys(array_values(array_filter(
+            $ids,
+            fn (int|string $id, int $index): bool => $from[$index] === $this && ($copies[$id] ?? null)?->getAttribute(self::RANK_KEY) !== $keys[$index],
+            ARRAY_FILTER_USE_BOTH,
+        )));
 
-                    foreach (array_intersect_key($copies, array_flip($resident)) as $copy) {
-                        $copy->forceFill([self::RANK_KEY => null])->syncOriginalAttribute(self::RANK_KEY);
-                    }
-                }
+        foreach ($items as $index => $item) {
+            if ($index > 0 && ! self::between($keys[$index], ...$this->boundsAfter($placement, array_slice($ids, $index), $ids[$index - 1]))) {
+                $keys = $this->rekeyFrom($index, $keys, $ids, $from, $copies, $placement);
             }
 
             $stored = $rows[(string) $ids[$index]] ?? [];
@@ -2924,9 +2942,49 @@ final class OrderedRelation
                 ? [self::RANK_KEY => $keys[$index]]
                 : [...$from[$index]->keys->detached(), ...$this->keys->pointingAt($this->parent), self::RANK_KEY => $keys[$index]]);
         }
+    }
 
+    /**
+     * @param  list<string>  $keys
+     * @param  list<int|string>  $ids
+     * @param  array<int, self>  $from
+     * @param  array<int|string, Model>  $copies
+     * @return list<string>
+     */
+    private function rekeyFrom(int $index, array $keys, array $ids, array $from, array $copies, Placement $placement): array
+    {
+        $remaining = array_slice($ids, $index);
+        $keys = [...array_slice($keys, 0, $index), ...$this->keysAt($placement, $remaining, count($remaining), $ids[$index - 1])];
+        $resident = array_values(array_filter($remaining, fn (int|string $id, int $offset): bool => $from[$index + $offset] === $this, ARRAY_FILTER_USE_BOTH));
+        $this->clearRankKeys($resident);
+
+        foreach (array_intersect_key($copies, array_flip($resident)) as $copy) {
+            $copy->forceFill([self::RANK_KEY => null])->syncOriginalAttribute(self::RANK_KEY);
+        }
+
+        return $keys;
+    }
+
+    /**
+     * @param  list<int|string>  $ids
+     */
+    private function clearRankKeys(array $ids): void
+    {
+        if ($ids !== []) {
+            $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $ids)->update([self::RANK_KEY => null]);
+        }
+    }
+
+    /**
+     * @param  array<int, self>  $entering
+     * @param  array<int, self>  $from
+     * @param  list<int|string>  $ids
+     * @param  array<int, int>  $previous
+     * @return list<OrderChange>
+     */
+    private function announceSources(array $entering, array $from, array $ids, array $previous): array
+    {
         $left = [];
-
         $leaving = [];
 
         foreach ($entering as $source) {
@@ -2945,6 +3003,20 @@ final class OrderedRelation
             $left[] = $source->announce($source->change($moved));
         }
 
+        return $left;
+    }
+
+    /**
+     * @param  list<Model&Ordered>  $items
+     * @param  list<int|string>  $ids
+     * @param  array<int, self>  $from
+     * @param  array<string, array<string, mixed>>  $rows
+     * @param  array<int, int>  $previous
+     * @param  list<array<string, mixed>>  $original
+     * @param  list<OrderChange>  $left
+     */
+    private function changeDestination(array $items, array $ids, array $from, array $rows, array $previous, array $original, array $left): OrderChange
+    {
         $order = $this->memberIds();
         $positions = array_flip($order);
         $moved = [];
