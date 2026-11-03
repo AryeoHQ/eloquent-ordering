@@ -384,7 +384,7 @@ Both outcomes leave the data unchanged. A move that keeps the order writes nothi
 | `digest` | The order digest after the write, read inside the write's transaction. |
 | `source` | For a move between parents, the `OrderChange` of the parent the item left. Otherwise `null`. |
 
-After a move between parents, the item's loaded parent relation holds the destination.
+After a move between two parents of one class, the item's loaded parent relation holds the destination. A morph move to a parent of another class unloads that relation instead, so read the destination from `OrderChange::$parent`.
 
 A save through Eloquent that changes the parent, such as `$asset->update(['section_id' => $other->id])`, moves the item to the end of the new parent without an `expected` check, so use `move()` when the caller needs one. Such a save is no substitute for ORD-08, which requires an API to return 422 for an update that would move an item to another ordered collection. A save that leaves every parent, such as one that sets a nullable foreign key to `null`, clears the item's rank key.
 
