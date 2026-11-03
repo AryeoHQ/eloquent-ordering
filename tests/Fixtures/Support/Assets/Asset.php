@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Assets;
 
+use Illuminate\Database\Eloquent\Attributes\UseFactory;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\SoftDeletes;
@@ -23,8 +25,12 @@ use Tests\Fixtures\Support\Sections\Section;
  * @property-read int|null $position
  */
 #[OrderedIn(Section::class)]
+#[UseFactory(AssetFactory::class)]
 class Asset extends Model implements Ordered
 {
+    /** @use HasFactory<AssetFactory> */
+    use HasFactory;
+
     use IsOrdered;
     use SoftDeletes;
 

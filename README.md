@@ -564,6 +564,34 @@ Asset::query()->whereKey($id)->delete();                              // changes
 
 **A cascade is a bypass too.** An `ON DELETE CASCADE` from a third table onto an ordered item table deletes items without a lock or a report. Delete the items through Eloquent before the row that they cascade from.
 
+## Testing support
+
+**Place a factory-made item with `PlacesOrderedItems`.** Use the trait in the item's factory. `placedAt(Placement $placement)` calls `placeAt()` on each item that the factory makes, so the save puts the item there.
+
+```php
+use Support\Database\Eloquent\Ordering\Testing\PlacesOrderedItems;
+
+class AssetFactory extends Factory
+{
+    use PlacesOrderedItems;
+}
+
+Asset::factory()->for($section)->placedAt(Placement::before($anchorId))->create();
+```
+
+A placement that names a parent throws `LogicException`, as `placeAt()` does.
+
+**Forge a concurrent write with `ChangesRowsOnFirstRead`.** Use the trait in a test case. Each method changes one row through `toBase()` after the first `select` on that row's table and connection, and then stops listening.
+
+```php
+use Support\Database\Eloquent\Ordering\Testing\ChangesRowsOnFirstRead;
+
+$this->deleteOnFirstRead($asset);                     // trashes the row and clears its rank key
+$this->moveOnFirstRead($asset->section(), $other);    // points the foreign key at $other
+```
+
+`deleteOnFirstRead()` deletes the row of a model that does not soft delete. The forged write runs on the model's connection, inside the test's transaction. Nothing refuses it, because a write that bypasses Eloquent is unsupported.
+
 ## Limits
 
 - **`restore()` places the item last.** It assigns a new rank key under the parent lock, as a create does, and dispatches one `Reordered`. It discards a key that a bulk soft delete kept, because another member can hold that key now. A restore of a row that another request already restored, or force deleted, changes nothing and dispatches nothing, unless it also changes the parent of a restored row.
