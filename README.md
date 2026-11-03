@@ -481,7 +481,7 @@ $asset->save();                                                  // after the an
 
 An anchor must be a current member of the same parent. Otherwise `InvalidAnchor` (`InvalidArgumentException`) is thrown. `placeAt()` throws `LogicException` for a saved item, and for a placement that names a parent. A create takes no `expected`, because it leaves no parent.
 
-**Create several items at once with `createInOrder()`.** It creates each record through the relation, as the relation's `create()` does, in the order given, after every member. It runs in one transaction and dispatches one `Reordered` for the parent, which lists every new member. The keys come from one `FractionalIndex::keysBetween()` call. When another write in the same transaction takes a key at the end of the parent, the remaining keys come from one more call. It returns the created models, as `createMany()` does. For a pivot relation each record holds the related model's attributes, and the relation attaches it. A trashed or missing parent throws `UnavailableParent`, and nothing is created. An empty list returns an empty collection, and locks and checks nothing.
+**Create several items at once with `createInOrder()`.** It creates each record through the relation, as the relation's `create()` does, in the order given, after every member. It runs in one transaction and dispatches one `Reordered` for the collection, which lists every new member. The api-standards treat a bulk create as one create per instance (ACT-12), so an API that serves a bulk-create action with `createInOrder()` emits one `reordered` event per created item itself. The keys come from one `FractionalIndex::keysBetween()` call. When another write in the same transaction takes a key at the end of the parent, the remaining keys come from one more call. It returns the created models, as `createMany()` does. For a pivot relation each record holds the related model's attributes, and the relation attaches it. A trashed or missing parent throws `UnavailableParent`, and nothing is created. An empty list returns an empty collection, and locks and checks nothing.
 
 A create that a listener makes during `createInOrder()` joins no batch. It takes the key for its own placement and dispatches its own `Reordered`. A nested `createInOrder()` on the same parent also dispatches its own `Reordered`, which lists only its own records.
 
@@ -729,7 +729,7 @@ $this->deleteOnFirstRead($asset);                     // trashes the row and cle
 $this->moveOnFirstRead($asset->section(), $other);    // points the foreign key at $other, after its last member
 ```
 
-`deleteOnFirstRead()` deletes the row of a model that does not soft delete. The forged write runs on the model's connection, inside the test's transaction, when the test opens one. Nothing refuses it, because a write that bypasses Eloquent is unsupported.
+`deleteOnFirstRead()` deletes the row of a model that does not soft delete. `moveOnFirstRead()` clears every other declared membership of an ordered row, so the row sits in one order only. The forged write runs on the model's connection, inside the test's transaction, when the test opens one. Nothing refuses it, because a write that bypasses Eloquent is unsupported.
 
 ## Limits
 

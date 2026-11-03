@@ -1309,6 +1309,40 @@ class OrderedRelationTest extends TestCase
     }
 
     #[Test]
+    public function it_creates_nothing_in_order_from_no_records_without_a_query_even_in_an_unsaved_parent(): void
+    {
+        $this->recordReorders();
+        $statements = 0;
+        DB::listen(function () use (&$statements): void {
+            $statements++;
+        });
+        Event::listen(TransactionBeginning::class, function () use (&$statements): void {
+            $statements++;
+        });
+
+        $created = (new Section)->assets()->createInOrder([]);
+
+        $this->assertCount(0, $created);
+        $this->assertSame(0, $statements);
+        $this->assertSame([], $this->reorders);
+    }
+
+    #[Test]
+    public function it_gives_a_create_the_key_of_a_finished_create_that_was_then_force_deleted(): void
+    {
+        $drawer = Drawer::create();
+        $finished = $this->addNote($drawer, 'pgsql');
+        $key = $finished->rank_key;
+        $finished->forceDelete();
+
+        $next = $this->addNote($drawer, 'pgsql');
+
+        $this->assertFalse($finished->exists);
+        $this->assertSame($key, $next->rank_key);
+        $this->assertSame([$next->id], $this->noteIds($drawer));
+    }
+
+    #[Test]
     public function it_places_a_create_that_a_listener_makes_during_a_create_in_order_at_its_own_placement(): void
     {
         $drawer = Drawer::create();

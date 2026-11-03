@@ -23,7 +23,7 @@ class AssetFactory extends Factory
     public function definition(): array
     {
         return [
-            'section_id' => static fn (): int => Section::query()->create()->id,
+            'section_id' => Section::factory(),
         ];
     }
 }

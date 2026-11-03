@@ -16,12 +16,15 @@ use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
 use Support\Database\Eloquent\Ordering\Exceptions\ParentUnavailability;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
+use Tests\Fixtures\Support\Albums\Album;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Boards\Board;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\Customerable;
 use Tests\Fixtures\Support\Drawers\Drawer;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Notes\Note;
+use Tests\Fixtures\Support\Photos\Photo;
 use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Tours\Tour;
@@ -191,6 +194,19 @@ class ChangesRowsOnFirstReadTest extends TestCase
     }
 
     #[Test]
+    public function it_clears_the_other_membership_of_a_row_it_moves(): void
+    {
+        [$board, $album] = [Board::query()->create(), Album::query()->create()];
+        $photo = Photo::query()->create(['board_id' => $board->id]);
+
+        $this->moveOnFirstRead($photo->album(), $album);
+        Photo::query()->find($photo->id);
+
+        $stored = $this->stored($photo);
+        $this->assertSame([null, $album->id], [$stored->board_id, $stored->album_id]);
+    }
+
+    #[Test]
     public function it_moves_two_rows_into_one_target_one_after_the_other(): void
     {
         [$source, $target] = [Section::query()->create(), Section::query()->create()];
@@ -244,6 +260,21 @@ class ChangesRowsOnFirstReadTest extends TestCase
 
         $this->deleteOnFirstRead($asset);
         DB::select('select * from assets_archive');
+
+        $this->assertFalse(Asset::query()->findOrFail($asset->id)->trashed());
+    }
+
+    #[Test]
+    public function it_ignores_a_read_of_an_unquoted_table_whose_name_extends_the_rows_table_with_a_dollar(): void
+    {
+        Schema::create('assets$archive', static function (Blueprint $table): void {
+            $table->id();
+        });
+        $section = Section::query()->create();
+        $asset = Asset::query()->create(['section_id' => $section->id]);
+
+        $this->deleteOnFirstRead($asset);
+        DB::select('select * from assets$archive');
 
         $this->assertFalse(Asset::query()->findOrFail($asset->id)->trashed());
     }
