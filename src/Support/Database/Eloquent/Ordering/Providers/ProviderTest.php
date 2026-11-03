@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Ordering\Providers;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -41,6 +42,14 @@ class ProviderTest extends TestCase
         $this->assertContains(SelectsPosition::class, Customer::query()->withoutPositions()->removedScopes());
         $this->assertContains(SelectsPosition::class, ListingCustomer::query()->withoutPositions()->removedScopes());
         $this->assertSame([], Customer::query()->withoutPositions()->get()->all());
+    }
+
+    #[Test]
+    public function it_registers_the_order_write_macros_on_every_relation(): void
+    {
+        foreach (['arrange', 'moveIn', 'createInOrder', 'lockedMembers'] as $macro) {
+            $this->assertTrue(Relation::hasMacro($macro), $macro);
+        }
     }
 
     #[Test]

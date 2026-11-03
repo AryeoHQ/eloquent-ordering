@@ -35,7 +35,10 @@ use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Events\Rebalanced;
 use Support\Database\Eloquent\Ordering\Events\Reordered;
+use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
+use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
+use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
@@ -70,13 +73,16 @@ use Tests\Fixtures\Support\Notes\Note;
 use Tests\Fixtures\Support\Pages\Page;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Playlists\PlaylistRevision;
+use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Shelves\Shelf;
+use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tracks\Track;
+use Tests\Fixtures\Support\Videos\Video;
 use Tests\TestCase;
 use Throwable;
 
@@ -634,6 +640,367 @@ class OrderedRelationTest extends TestCase
             $racer->table('notes')->whereIn('drawer_id', [$emptied->id, $other->id])->delete();
             $racer->table('drawers')->whereIn('id', [$emptied->id, $other->id])->delete();
         }
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_moves_members_of_several_parents_into_one_placement_in_the_order_given(Shape $shape): void
+    {
+        [$first, [$a0, $a1, $a2]] = $shape->with(3);
+        [$second, [$b0, $b1]] = $shape->with(2);
+        [$destination, [$d0, $d1]] = $shape->with(2);
+
+        $change = $shape->relation($destination)->moveIn([$a2, $b1, $a0], expected: null, placement: Placement::after($this->key($d0)));
+
+        $order = [$d0->getKey(), $a2->getKey(), $b1->getKey(), $a0->getKey(), $d1->getKey()];
+        $this->assertSame($destination, $change->parent);
+        $this->assertSame($shape->revision(), $change->revision);
+        $this->assertSame($order, $change->order);
+        $this->assertSame(
+            [['id' => $a2->getKey(), 'position' => 2, 'previousPosition' => null], ['id' => $b1->getKey(), 'position' => 3, 'previousPosition' => null], ['id' => $a0->getKey(), 'position' => 4, 'previousPosition' => null]],
+            array_map(get_object_vars(...), $change->changed),
+        );
+        $this->assertNull($change->source);
+        $this->assertSame($shape->digest($destination), $change->digest);
+        $this->assertSame($order, $shape->members($destination));
+        $this->assertSame([$a1->getKey()], $shape->members($first));
+        $this->assertSame([$b0->getKey()], $shape->members($second));
+        $this->assertSame([2, 3, 4], [$a2->getAttribute('position'), $b1->getAttribute('position'), $a0->getAttribute('position')]);
+        $this->assertEquals([$destination->getKey(), $destination->getKey()], [$a2->getAttribute($shape->foreignKey()), $b1->getAttribute($shape->foreignKey())]);
+        $this->assertFalse($a2->isDirty());
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_moves_members_already_in_the_destination_beside_one_that_enters(Shape $shape): void
+    {
+        [$source, [$entering]] = $shape->with(1);
+        [$destination, [$d0, $d1, $d2]] = $shape->with(3);
+
+        $change = $shape->relation($destination)->moveIn([$d2, $entering, $d0], expected: null, placement: Placement::first());
+
+        $this->assertSame([$d2->getKey(), $entering->getKey(), $d0->getKey(), $d1->getKey()], $change->order);
+        $this->assertSame($change->order, $shape->members($destination));
+        $this->assertSame(
+            [['id' => $d2->getKey(), 'position' => 1, 'previousPosition' => 3], ['id' => $entering->getKey(), 'position' => 2, 'previousPosition' => null], ['id' => $d0->getKey(), 'position' => 3, 'previousPosition' => 1]],
+            array_map(get_object_vars(...), $change->changed),
+        );
+        $this->assertNotNull($change->source);
+        $this->assertSame($source, $change->source->parent);
+        $this->assertSame([['id' => $entering->getKey(), 'position' => null, 'previousPosition' => 1]], array_map(get_object_vars(...), $change->source->changed));
+        $this->assertSame([], $shape->members($source));
+    }
+
+    #[Test]
+    public function it_moves_a_member_into_the_destination_and_follows_its_loaded_parent(): void
+    {
+        [$source, $destination] = [Section::create(), Section::create()];
+        $asset = Asset::create(['section_id' => $source->id]);
+        $asset->setRelation('section', $source);
+
+        $destination->assets()->moveIn([$asset], expected: $destination->concurrencyRevision(SectionRevision::AssetsOrder));
+
+        $this->assertSame($destination, $asset->getRelation('section'));
+        $this->assertSame($destination->id, $asset->section_id);
+        $this->assertSame(1, $asset->position);
+    }
+
+    #[Test]
+    public function it_refuses_a_move_in_that_names_members_its_order_no_longer_holds_and_changes_nothing(): void
+    {
+        $destination = Tour::create();
+        $destination->scenes()->create();
+        $gone = Tour::create();
+        $orphan = $gone->scenes()->create();
+        $source = Tour::create();
+        [$live, $trashed] = [$source->scenes()->create(), $source->scenes()->create()];
+        Scene::query()->findOrFail($trashed->id)->delete();
+        DB::table('tours')->where('id', $gone->id)->delete();
+        $before = DB::table('scenes')->orderBy('id')->get()->all();
+
+        try {
+            $destination->scenes()->moveIn([$orphan, $live, $trashed], expected: null);
+            $this->fail('A move in of members that their order no longer holds succeeded.');
+        } catch (NotAMember $exception) {
+            $this->assertSame(Scene::class, $exception->class);
+            $this->assertSame([$orphan->id, $trashed->id], $exception->ids);
+        }
+
+        $this->assertEquals($before, DB::table('scenes')->orderBy('id')->get()->all());
+    }
+
+    #[Test]
+    public function it_refuses_a_move_in_to_a_trashed_or_missing_parent_but_moves_members_inside_a_trashed_one(): void
+    {
+        [$trashed, $other, $missing] = [Drawer::create(), Drawer::create(), Drawer::create()];
+        [$first, $second] = [$this->addNote($trashed, 'pgsql'), $this->addNote($trashed, 'pgsql')];
+        $outside = $this->addNote($other, 'pgsql');
+        $trashed->delete();
+        DB::table('drawers')->where('id', $missing->id)->delete();
+        $before = DB::table('notes')->orderBy('id')->get()->all();
+
+        foreach ([UnavailableParent::TRASHED => $trashed, UnavailableParent::MISSING => $missing] as $reason => $parent) {
+            try {
+                $parent->notes()->moveIn([$outside], expected: null);
+                $this->fail('A move in placed a member in a parent that takes none.');
+            } catch (UnavailableParent $exception) {
+                $this->assertSame($parent, $exception->parent);
+                $this->assertSame($reason, $exception->reason);
+            }
+        }
+
+        $this->assertEquals($before, DB::table('notes')->orderBy('id')->get()->all());
+        $this->assertSame([$second->id, $first->id], $trashed->notes()->moveIn([$second], expected: null, placement: Placement::first())->order);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_refuses_a_stale_move_in_and_changes_nothing(Shape $shape): void
+    {
+        [$source, [$moved]] = $shape->with(1);
+        [$destination] = $shape->with(1);
+        $stale = $shape->digest($destination);
+        $shape->add($destination);
+        $before = $shape->rankKeys($source);
+
+        $this->assertRejected($shape, StaleConcurrencyRevision::class, $destination, fn (): mixed => $shape->relation($destination)->moveIn([$moved], expected: $stale));
+        $this->assertSame($before, $shape->rankKeys($source));
+
+        $change = $shape->relation($destination)->moveIn([$moved], expected: $shape->digest($destination));
+
+        $this->assertSame($moved->getKey(), $change->order[2]);
+    }
+
+    #[Test]
+    public function it_refuses_a_move_in_with_an_expected_revision_of_a_member_read_from_a_parent_it_has_since_left(): void
+    {
+        [$read, $stored, $destination] = [Section::create(), Section::create(), Section::create()];
+        $asset = Asset::create(['section_id' => $read->id]);
+        DB::table('assets')->where('id', $asset->id)->update(['section_id' => $stored->id]);
+        $expected = $destination->concurrencyRevision(SectionRevision::AssetsOrder);
+
+        try {
+            $destination->assets()->moveIn([$asset], expected: $expected);
+            $this->fail('A move in of a member read from a parent it has since left passed its expected revision.');
+        } catch (StaleConcurrencyRevision) {
+        }
+
+        $this->assertSame([$asset->id], $stored->assets()->pluck('id')->all());
+
+        $change = $destination->assets()->moveIn([$asset], expected: null);
+
+        $this->assertSame($stored->id, $change->source?->parent->getKey());
+        $this->assertSame([$asset->id], $destination->assets()->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_refuses_a_move_in_of_an_unsaved_or_repeated_member_or_a_placement_it_cannot_take_before_it_writes(): void
+    {
+        [$source, $destination] = [Section::create(), Section::create()];
+        $asset = Asset::create(['section_id' => $source->id]);
+        $video = (new Video)->section()->associate($source);
+        $video->save();
+        $before = DB::table('assets')->orderBy('id')->get()->all();
+
+        foreach ([
+            sprintf('[%s] must be saved before it moves.', Asset::class) => fn (): mixed => $destination->assets()->moveIn([new Asset], expected: null),
+            sprintf('[%s] is not ordered in [%s].', Video::class, Section::class) => fn (): mixed => $destination->assets()->moveIn([$video], expected: null),
+            sprintf('[%s:%s] is named more than once.', Asset::class, $asset->id) => fn (): mixed => $destination->assets()->moveIn([$asset, Asset::query()->findOrFail($asset->id)], expected: null),
+            'Name the destination of a move in by its relation, not in the placement.' => fn (): mixed => $destination->assets()->moveIn([$asset], expected: null, placement: Placement::last()->in($source)),
+            sprintf('[%s] must be saved before it orders a member.', Section::class) => fn (): mixed => (new Section)->assets()->moveIn([$asset], expected: null),
+        ] as $message => $move) {
+            try {
+                $move();
+                $this->fail('A move in that it cannot take succeeded.');
+            } catch (LogicException $exception) {
+                $this->assertSame($message, $exception->getMessage());
+            }
+        }
+
+        try {
+            $destination->assets()->moveIn([$asset], expected: null, placement: Placement::after($asset->id));
+            $this->fail('A move in placed a member beside itself.');
+        } catch (InvalidAnchor) {
+        }
+
+        $this->assertEquals($before, DB::table('assets')->orderBy('id')->get()->all());
+    }
+
+    #[Test]
+    public function it_locks_the_ordering_parents_of_every_source_and_of_the_destination_before_the_parents(): void
+    {
+        [$first, $second, $third] = [Shelf::create(), Shelf::create(), Shelf::create()];
+        [$left, $right, $destination] = array_map(fn (Shelf $shelf): Binder => Binder::create(['shelf_id' => $shelf->id, 'kind' => 'audio']), [$first, $second, $third]);
+        $pages = array_map(fn (Binder $binder): Page => Page::create(['binder_id' => $binder->id, 'kind' => 'audio']), [$left, $left, $right]);
+        DB::enableQueryLog();
+
+        $change = $destination->pages()->moveIn([$pages[2], $pages[0]], expected: null);
+
+        $this->assertSame([$pages[2]->id, $pages[0]->id], $change->order);
+        $this->assertSame(
+            [['shelves', $first->id], ['shelves', $second->id], ['shelves', $third->id], ['binders', $left->id], ['binders', $right->id], ['binders', $destination->id]],
+            array_slice($this->parentLocks(DB::getQueryLog()), 0, 6),
+        );
+    }
+
+    #[Test]
+    public function it_locks_again_when_a_member_moves_to_another_parent_between_the_read_and_the_lock(): void
+    {
+        $racer = $this->racer();
+        config()->set('database.connections.mover', config('database.connections.pgsql'));
+        [$read, $stored, $destination] = [Section::on('racer')->create(), Section::on('racer')->create(), Section::on('racer')->create()];
+        $asset = Asset::on('racer')->create(['section_id' => $read->id]);
+        $moving = Asset::on('racer')->findOrFail($asset->id);
+        $moved = false;
+
+        try {
+            DB::listen(function (QueryExecuted $query) use (&$moved, $asset, $stored): void {
+                if ($moved || $query->connectionName !== 'racer' || ! str_contains($query->sql, 'from "sections"') || ! str_ends_with($query->sql, 'for no key update')) {
+                    return;
+                }
+
+                $moved = true;
+                DB::connection('mover')->statement("set lock_timeout = '2s'");
+                DB::connection('mover')->table('assets')->where('id', $asset->id)->update(['section_id' => $stored->id]);
+            });
+            $racer->enableQueryLog();
+
+            $change = Section::on('racer')->findOrFail($destination->id)->assets()->moveIn([$moving], expected: null);
+
+            $locked = array_values(array_filter(array_map(
+                fn (array $statement): mixed => preg_match('/ from "sections" .*for no key update$/', $statement['query']) === 1 ? $statement['bindings'][0] : null,
+                $racer->getQueryLog(),
+            ), fn (mixed $id): bool => $id !== null));
+
+            $this->assertTrue($moved, 'The member never moved while the move in locked its parents.');
+            $this->assertSame($stored->id, $change->source?->parent->getKey());
+            $this->assertSame([$asset->id], $racer->table('assets')->where('section_id', $destination->id)->pluck('id')->all());
+            $this->assertSame([$read->id, $destination->id], array_slice($locked, 0, 2));
+            $this->assertContains($stored->id, $locked);
+        } finally {
+            $racer->table('assets')->where('id', $asset->id)->delete();
+            $racer->table('sections')->whereIn('id', [$read->id, $stored->id, $destination->id])->delete();
+        }
+    }
+
+    #[Test]
+    public function it_finishes_two_opposite_move_ins_between_two_parents_without_a_deadlock(): void
+    {
+        $racer = $this->racer();
+        [$left, $right] = [Drawer::on('racer')->create(), Drawer::on('racer')->create()];
+        $lefts = [$this->addNote($left, 'racer'), $this->addNote($left, 'racer')];
+        $rights = [$this->addNote($right, 'racer')];
+        $ids = fn (array $notes): array => array_map(fn (Note $note): int => $note->id, $notes);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('drawers')->where('id', $left->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('move-in.php', (string) $left->id, implode(',', $ids($rights)));
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('move-in.php', (string) $right->id, implode(',', $ids($lefts)));
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
+
+            $this->assertSame([['moved', $ids($rights)], ['moved', $ids($lefts)]], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertSame($ids($rights), $racer->table('notes')->where('drawer_id', $left->id)->orderBy('rank_key')->pluck('id')->all());
+            $this->assertSame($ids($lefts), $racer->table('notes')->where('drawer_id', $right->id)->orderBy('rank_key')->pluck('id')->all());
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            foreach ($rivals as $rival) {
+                $rival->wait();
+            }
+
+            $racer->table('notes')->whereIn('drawer_id', [$left->id, $right->id])->delete();
+            $racer->table('drawers')->whereIn('id', [$left->id, $right->id])->delete();
+        }
+    }
+
+    #[Test]
+    public function it_finishes_a_locked_move_in_out_of_a_parent_and_its_delete_beside_an_opposite_move_in_without_a_deadlock(): void
+    {
+        $racer = $this->racer();
+        [$emptied, $other] = [Drawer::on('racer')->create(), Drawer::on('racer')->create()];
+        $leaving = [$this->addNote($emptied, 'racer'), $this->addNote($emptied, 'racer')];
+        $staying = [$this->addNote($other, 'racer')];
+        $ids = fn (array $notes): array => array_map(fn (Note $note): int => $note->id, $notes);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('drawers')->where('id', $emptied->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('move-in.php', (string) $other->id, 'empty', (string) $emptied->id);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('move-in.php', (string) $emptied->id, implode(',', $ids($staying)));
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
+
+            $this->assertSame([['moved', $ids($leaving)], ['unavailable', 'trashed']], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertNotNull($racer->table('drawers')->where('id', $emptied->id)->value('deleted_at'));
+            $this->assertSame([...$ids($staying), ...$ids($leaving)], $racer->table('notes')->where('drawer_id', $other->id)->orderBy('rank_key')->pluck('id')->all());
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            foreach ($rivals as $rival) {
+                $rival->wait();
+            }
+
+            $racer->table('notes')->whereIn('drawer_id', [$emptied->id, $other->id])->delete();
+            $racer->table('drawers')->whereIn('id', [$emptied->id, $other->id])->delete();
+        }
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_creates_the_records_in_order_after_every_member(Shape $shape): void
+    {
+        [$parent, [$first]] = $shape->with(1);
+
+        $created = $shape->relation($parent)->createInOrder([['visible' => true], ['visible' => false], ['visible' => true]]);
+
+        $members = $shape->members($parent);
+        $this->assertCount(3, $created);
+        $this->assertCount(4, $members);
+        $this->assertSame($first->getKey(), $members[0]);
+        $this->assertSame(array_slice($members, 1), $this->createdMembers($shape, $parent, $created->all()));
+        $this->assertSame(array_combine($members, [1, 2, 3, 4]), $shape->positions($parent));
+    }
+
+    #[Test]
+    public function it_refuses_to_create_in_order_in_a_trashed_or_missing_parent_and_creates_nothing(): void
+    {
+        [$trashed, $missing] = [Drawer::create(), Drawer::create()];
+        $this->addNote($trashed, 'pgsql');
+        $trashed->delete();
+        DB::table('drawers')->where('id', $missing->id)->delete();
+        $before = DB::table('notes')->orderBy('id')->get()->all();
+
+        foreach ([UnavailableParent::TRASHED => $trashed, UnavailableParent::MISSING => $missing] as $reason => $parent) {
+            try {
+                $parent->notes()->createInOrder([[], []]);
+                $this->fail('A create in order placed members in a parent that takes none.');
+            } catch (UnavailableParent $exception) {
+                $this->assertSame($parent, $exception->parent);
+                $this->assertSame($reason, $exception->reason);
+            }
+        }
+
+        $this->assertEquals($before, DB::table('notes')->orderBy('id')->get()->all());
     }
 
     #[DataProvider('shapes')]
@@ -1765,6 +2132,15 @@ class OrderedRelationTest extends TestCase
         }
 
         return $locks;
+    }
+
+    /**
+     * @param  list<Model>  $created
+     * @return list<int|string>
+     */
+    private function createdMembers(Shape $shape, Model $parent, array $created): array
+    {
+        return array_map(fn (Model $model): int|string => $this->key($shape instanceof PivotShape && $model instanceof Customer ? $shape->pivotOf($parent, $model) : $model), $created);
     }
 
     private function addNote(Drawer $drawer, string $connection): Note

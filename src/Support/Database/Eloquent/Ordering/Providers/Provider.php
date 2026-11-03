@@ -19,6 +19,7 @@ use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
+use Support\Database\Eloquent\Ordering\Placement;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Support\Database\Eloquent\Ordering\Schema\Macros;
 use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
@@ -43,6 +44,17 @@ class Provider extends ServiceProvider
 
         Relation::macro('arrange', /** @param list<int|string> $ids */ function (array $ids, null|string $expected): OrderChange {
             return OrderedRelation::ordering($this)->arrange($ids, $expected);
+        });
+
+        Relation::macro('moveIn', /** @param iterable<Model> $items */ function (iterable $items, null|string $expected, null|Placement $placement = null): OrderChange {
+            return OrderedRelation::ordering($this)->moveIn($items, $expected, $placement ?? Placement::last());
+        });
+
+        Relation::macro('createInOrder', /**
+         * @param  list<array<string, mixed>>  $records
+         * @return Collection<int, Model>
+         */ function (array $records): Collection {
+            return OrderedRelation::ordering($this)->createInOrder($records);
         });
 
         Relation::macro('lockedMembers', /** @return Collection<int, Model> */ function (Model ...$alsoLock): Collection {

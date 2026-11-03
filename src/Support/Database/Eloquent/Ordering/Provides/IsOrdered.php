@@ -8,7 +8,6 @@ use Closure;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use LogicException;
 use RuntimeException;
@@ -78,7 +77,7 @@ trait IsOrdered
             $relation = $item->currentOrderedRelation();
             $relation = array_find($item->lockedOrderedRelations, static fn (OrderedRelation $locked): bool => $locked->is($relation)) ?? $relation;
 
-            $item->assignRankKey($relation->keyAt($item->placement ?? Placement::last()));
+            $item->assignRankKey($relation->keyForCreate($item->placement ?? Placement::last()));
             OrderedRelation::prepared($item);
         });
 
@@ -219,7 +218,7 @@ trait IsOrdered
                 $this->forceFill($stored)->syncOriginalAttributes(array_keys($stored));
             }
 
-            $this->followMovedParent([$original, $stored], $target->parent);
+            OrderedRelation::followParent($this, [$original, $stored], $target->parent);
             $this->resolvedOrderedRelation = $target;
             $this->selectStoredPosition();
 
@@ -453,32 +452,6 @@ trait IsOrdered
     {
         $this->setAttribute(OrderedRelation::RANK_KEY, $key);
         $this->assignedRankKey = [$key];
-    }
-
-    /**
-     * @param  list<array<string, mixed>>  $left
-     */
-    private function followMovedParent(array $left, Model $parent): void
-    {
-        $follows = fn (mixed $model): bool => $model instanceof Model
-            && ! $model->is($parent)
-            && array_any($left, fn (array $attributes): bool => OrderedRelation::names($this, $attributes, $model));
-
-        foreach ($this->getRelations() as $name => $related) {
-            if (! $follows($related)) {
-                continue;
-            }
-
-            if ($related::class === $parent::class) {
-                $this->setRelation($name, $parent);
-            } else {
-                $this->unsetRelation($name);
-            }
-        }
-
-        if ($this instanceof Pivot && $follows($this->pivotParent)) {
-            $this->pivotParent = $parent;
-        }
     }
 
     /**

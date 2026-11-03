@@ -113,6 +113,23 @@ class ReorderedTest extends TestCase
                 },
                 2,
             ],
+            'a move in' => [
+                function (Shape $shape): Closure {
+                    [, $members] = $shape->with(3);
+                    [$destination] = $shape->with(1);
+
+                    return fn (): mixed => $shape->relation($destination)->moveIn([$members[2], $members[0]], expected: null);
+                },
+                2,
+            ],
+            'a create in order' => [
+                function (Shape $shape): Closure {
+                    [$parent] = $shape->with(1);
+
+                    return fn (): mixed => $shape->relation($parent)->createInOrder([['visible' => true], ['visible' => true]]);
+                },
+                1,
+            ],
             'a reorder' => [
                 function (Shape $shape): Closure {
                     [$parent, $members] = $shape->with(3);
@@ -183,6 +200,20 @@ class ReorderedTest extends TestCase
             'a move into the parent it is in' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $members[1]->move(Placement::after($members[0]->getKey())->in($parent), null)],
             'a reorder to the current order' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $shape->arrange($parent, array_map(fn (Model $member): mixed => $member->getKey(), $members), null)],
             'a save that changes nothing' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $members[1]->save()],
+            'a move in of members where they are' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $shape->relation($parent)->moveIn([$members[1], $members[2]], expected: null, placement: Placement::after($members[0]->getKey()))],
+            'a move in of nothing' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $shape->relation($parent)->moveIn([], expected: null)],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function counts(): iterable
+    {
+        return Shape::crossed([
+            'one member' => [1],
+            'five members' => [5],
+            'twenty members' => [20],
         ]);
     }
 
@@ -455,6 +486,112 @@ class ReorderedTest extends TestCase
         $this->assertSame($shape->digest($destination), $entered->digest);
         $this->assertSame($left, $entered->source);
         $this->assertSame([$this->baseline, $this->baseline], $this->levels);
+    }
+
+    #[DataProvider('counts')]
+    #[Test]
+    public function it_dispatches_one_event_for_each_collection_a_move_in_changes(Shape $shape, int $count): void
+    {
+        $sources = [];
+        $moved = [];
+
+        foreach ([intdiv($count + 1, 2), intdiv($count, 2)] as $leaving) {
+            if ($leaving > 0) {
+                [$source, $members] = $shape->with($leaving + 1);
+                $sources[] = [$source, array_slice($members, 0, $leaving)];
+                array_push($moved, ...array_slice($members, 0, $leaving));
+            }
+        }
+
+        [$destination, [$kept]] = $shape->with(1);
+        $this->forget();
+
+        $change = $shape->relation($destination)->moveIn($moved, expected: null);
+
+        $this->assertCount(count($sources) + 1, $this->dispatched);
+        $this->assertSame($change, $this->dispatched[count($sources)]->change);
+        $this->assertSame([$kept->getKey(), ...array_map(fn (Model $member): mixed => $member->getKey(), $moved)], $change->order);
+        $this->assertSame(
+            array_map(fn (Model $member, int $index): array => ['id' => $this->key($member), 'position' => $index + 2, 'previousPosition' => null], $moved, array_keys($moved)),
+            array_map(get_object_vars(...), $change->changed),
+        );
+        $this->assertSame(count($sources) === 1 ? $this->dispatched[0]->change : null, $change->source);
+
+        foreach ($sources as [$source, $left]) {
+            $event = array_find(array_slice($this->dispatched, 0, count($sources)), fn (Reordered $event): bool => $event->change->parent === $source);
+
+            $this->assertNotNull($event);
+            $this->assertCount(1, $event->change->order);
+            $this->assertSame(
+                array_map(fn (Model $member, int $index): array => ['id' => $this->key($member), 'position' => null, 'previousPosition' => $index + 1], $left, array_keys($left)),
+                array_map(get_object_vars(...), $event->change->changed),
+            );
+        }
+
+        $this->assertSame(array_fill(0, count($sources) + 1, $this->baseline), $this->levels);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_dispatches_one_event_for_a_move_in_inside_one_parent(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $this->forget();
+
+        $change = $shape->relation($parent)->moveIn([$third, $second], expected: null, placement: Placement::first());
+
+        $this->assertCount(1, $this->dispatched);
+        $this->assertSame($change, $this->dispatched[0]->change);
+        $this->assertSame([$third->getKey(), $second->getKey(), $first->getKey()], $change->order);
+        $this->assertSame(
+            [['id' => $this->key($third), 'position' => 1, 'previousPosition' => 3]],
+            array_map(get_object_vars(...), $change->changed),
+        );
+    }
+
+    #[DataProvider('counts')]
+    #[Test]
+    public function it_dispatches_one_event_for_a_create_in_order(Shape $shape, int $count): void
+    {
+        [$parent, [$first]] = $shape->with(1);
+        $this->forget();
+
+        $shape->relation($parent)->createInOrder(array_fill(0, $count, ['visible' => true]));
+
+        $this->assertCount(1, $this->dispatched);
+
+        $change = $this->dispatched[0]->change;
+
+        $this->assertSame($parent, $change->parent);
+        $this->assertCount($count + 1, $change->order);
+        $this->assertSame($first->getKey(), $change->order[0]);
+        $this->assertSame(
+            array_map(fn (int|string $id, int $index): array => ['id' => $id, 'position' => $index + 2, 'previousPosition' => null], array_slice($change->order, 1), range(0, $count - 1)),
+            array_map(get_object_vars(...), $change->changed),
+        );
+        $this->assertSame($shape->digest($parent), $change->digest);
+        $this->assertNull($change->source);
+        $this->assertSame([$this->baseline], $this->levels);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_reports_only_the_moved_members_for_a_move_in_that_rebalances(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third, $fourth]] = $shape->with(4);
+        $shape->crowd($first, $second);
+        $this->forget();
+
+        $change = $shape->relation($parent)->moveIn([$fourth, $third], expected: null, placement: Placement::after($this->key($first)));
+
+        $this->assertLessThan(OrderedRelation::MAX_KEY_LENGTH, $shape->longestRankKey($parent));
+        $this->assertCount(1, $this->dispatched);
+        $this->assertSame($change, $this->dispatched[0]->change);
+        $this->assertSame([$first->getKey(), $fourth->getKey(), $third->getKey(), $second->getKey()], $change->order);
+        $this->assertSame(
+            [['id' => $this->key($fourth), 'position' => 2, 'previousPosition' => 4]],
+            array_map(get_object_vars(...), $change->changed),
+        );
     }
 
     #[DataProvider('shapes')]
