@@ -551,6 +551,25 @@ class OrderedRelationTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_to_lock_an_unsaved_model_that_shares_the_key_of_the_parent_with_the_members(): void
+    {
+        $section = Section::create();
+        $twin = (new Section)->setConnection($section->getConnectionName())->forceFill(['id' => $section->id]);
+        DB::enableQueryLog();
+
+        DB::transaction(function () use ($section, $twin): void {
+            try {
+                $section->assets()->lockedMembers($twin);
+                $this->fail('The members were locked with an unsaved model.');
+            } catch (LogicException $exception) {
+                $this->assertSame(sprintf('[%s] must be saved before it is locked with the members of [%s:%s].', Section::class, $section->getMorphClass(), $section->id), $exception->getMessage());
+            }
+        });
+
+        $this->assertSame([], array_filter(DB::getQueryLog(), fn (array $statement): bool => str_ends_with($statement['query'], 'for no key update')));
+    }
+
+    #[Test]
     public function it_finishes_locking_the_members_of_a_parent_beside_a_move_of_that_parent_in_its_own_order_without_a_deadlock(): void
     {
         $racer = $this->racer();
@@ -976,6 +995,56 @@ class OrderedRelationTest extends TestCase
 
         $this->assertEquals($before, DB::table('notes')->orderBy('id')->get()->all());
         $this->assertSame([$second->id, $first->id], $trashed->notes()->moveIn([$second], expected: null, placement: Placement::first())->order);
+    }
+
+    #[Test]
+    public function it_leaves_no_position_on_members_moved_in_inside_a_trashed_parent(): void
+    {
+        $drawer = Drawer::create();
+        [$first, $second, $third] = [$this->addNote($drawer, 'pgsql'), $this->addNote($drawer, 'pgsql'), $this->addNote($drawer, 'pgsql')];
+        $drawer->delete();
+
+        $drawer->notes()->moveIn([$third], expected: null, placement: Placement::first());
+        $first->move(Placement::last(), expected: null);
+        $drawer->notes()->moveIn([$second], expected: null, placement: Placement::after($third->id));
+
+        $this->assertSame([$third->id, $second->id, $first->id], DB::table('notes')->where('drawer_id', $drawer->id)->orderBy('rank_key')->pluck('id')->all());
+        $this->assertSame([null, null, null], [$third->position, $first->position, $second->position]);
+        $this->assertSame([null, null, null], Note::query()->whereKey([$first->id, $second->id, $third->id])->get()->pluck('position')->all());
+
+        $placed = Note::query()->findOrFail($third->id);
+        $drawer->notes()->moveIn([$placed], expected: null, placement: Placement::first());
+
+        $this->assertNull($placed->position);
+    }
+
+    #[Test]
+    public function it_brings_a_stale_member_up_to_date_when_a_move_in_finds_it_already_in_place(): void
+    {
+        [$source, $destination] = [Section::create(), Section::create()];
+        $resident = Asset::create(['section_id' => $destination->id]);
+        $stale = Asset::create(['section_id' => $source->id]);
+        $stale->setRelation('section', $source);
+        $destination->assets()->moveIn([Asset::query()->findOrFail($stale->id)], expected: null);
+        $stored = DB::table('assets')->where('id', $stale->id)->first();
+        $stale->title = 'unsaved';
+        $events = [];
+        Event::listen(Reordered::class, function (Reordered $event) use (&$events): void {
+            $events[] = $event;
+        });
+        DB::enableQueryLog();
+
+        $change = $destination->assets()->moveIn([$stale], expected: null);
+
+        $this->assertSame([], $change->changed);
+        $this->assertSame([$resident->id, $stale->id], $change->order);
+        $this->assertSame([], $events);
+        $this->assertSame([], array_filter(DB::getQueryLog(), fn (array $statement): bool => str_starts_with(strtolower($statement['query']), 'update')));
+        $this->assertSame($destination->id, $stale->section_id);
+        $this->assertSame($stored->rank_key, $stale->rank_key);
+        $this->assertSame(2, $stale->position);
+        $this->assertSame($destination, $stale->getRelation('section'));
+        $this->assertSame(['title' => 'unsaved'], $stale->getDirty());
     }
 
     #[DataProvider('shapes')]

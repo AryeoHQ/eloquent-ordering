@@ -635,6 +635,8 @@ final class OrderedRelation
             $this->parent->getKey(),
         ));
 
+        $this->requireLockable($alsoLock);
+
         return $this->lockWith(
             static fn (): null => null,
             static fn (): array => $alsoLock,
@@ -2759,8 +2761,22 @@ final class OrderedRelation
         $from = array_map(static fn (null|self $source): self => $source ?? throw new LogicException('Each member has a source.'), $sources);
         $entering = array_filter($from, fn (self $source): bool => $source !== $this);
 
-        if ($items === [] || ($entering === [] && $this->holdsPlaces($ids, $placement))) {
+        if ($items === []) {
             return $this->change([]);
+        }
+
+        if ($entering === []) {
+            $current = $this->rankKeys($this->rows($ids));
+
+            if ($this->holdsPlaces($ids, $current, $placement)) {
+                foreach ($items as $index => $item) {
+                    $stored = [...($rows[(string) $ids[$index]] ?? []), self::RANK_KEY => $current[$ids[$index]] ?? null];
+                    $item->forceFill($stored)->syncOriginalAttributes(array_keys($stored));
+                    $this->settle($item, $previous[$index] ?? null, [$original[$index], $stored]);
+                }
+
+                return $this->change([]);
+            }
         }
 
         if ($entering !== []) {
@@ -2820,8 +2836,7 @@ final class OrderedRelation
                 $moved[$ids[$index]] = $before;
             }
 
-            $item->forceFill([self::POSITION => $position])->syncOriginalAttributes([self::POSITION]);
-            self::followParent($item, [$original[$index], $rows[(string) $ids[$index]] ?? []], $this->parent);
+            $this->settle($item, $position, [$original[$index], $rows[(string) $ids[$index]] ?? []]);
         }
 
         $change = $this->change($moved, count($left) === 1 ? $left[0] : null, $order);
@@ -2836,11 +2851,20 @@ final class OrderedRelation
     }
 
     /**
-     * @param  list<int|string>  $ids
+     * @param  list<array<string, mixed>>  $left
      */
-    private function holdsPlaces(array $ids, Placement $placement): bool
+    private function settle(Model&Ordered $item, null|int $position, array $left): void
     {
-        $keys = $this->rankKeys($this->rows($ids));
+        $item->forceFill([self::POSITION => $this->unavailable === null ? $position : null])->syncOriginalAttributes([self::POSITION]);
+        self::followParent($item, $left, $this->parent);
+    }
+
+    /**
+     * @param  list<int|string>  $ids
+     * @param  array<int|string, string>  $keys
+     */
+    private function holdsPlaces(array $ids, array $keys, Placement $placement): bool
+    {
         [$previous, $upper] = $this->bounds($placement, $ids, $this->members(...));
 
         foreach ($ids as $id) {
