@@ -949,6 +949,42 @@ class OrderedRelationTest extends TestCase
             }
         }, SectionRevision::AssetsOrder, '::assets()] filters its members by an expression'];
 
+        yield 'an expression value' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.title'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('assets.title', new Expression('"assets"."visible"'));
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] compares its members by [assets.title] to an expression, which a position query cannot re-alias. Compare two columns with whereColumn().'];
+
+        yield 'a nested expression value' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.title'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where(static function (EloquentBuilder $query): void {
+                    $query->where('assets.title', '!=', new Expression('"assets"."visible"'));
+                });
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] compares its members by [assets.title] to an expression'];
+
         yield 'a top-level or' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;

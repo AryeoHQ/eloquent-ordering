@@ -663,6 +663,62 @@ class SelectsPositionTest extends TestCase
         }
     }
 
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function locksThatBlockEveryUpdate(): iterable
+    {
+        yield 'for update' => ['for update'];
+        yield 'for no key update' => ['for no key update'];
+        yield 'for share' => ['for share'];
+        yield 'for update nowait' => ['for update nowait'];
+        yield 'for share skip locked, in capitals' => ['FOR SHARE SKIP LOCKED'];
+    }
+
+    #[DataProvider('locksThatBlockEveryUpdate')]
+    #[Test]
+    public function it_reads_the_position_of_a_locking_read_whose_lock_blocks_every_update_of_the_row(string $lock): void
+    {
+        $section = Section::create();
+        $assets = [$this->asset($section), $this->asset($section)];
+
+        $read = DB::transaction(fn (): Asset => Asset::query()->lock($lock)->findOrFail($assets[1]->id));
+
+        $this->assertSame(2, $read->position);
+    }
+
+    /**
+     * @return iterable<string, array{Closure(Asset): Asset}>
+     */
+    public static function locksThatLetAnUpdateThrough(): iterable
+    {
+        yield 'for key share' => [fn (Asset $asset): Asset => Asset::query()->lock('for key share')->findOrFail($asset->id)];
+        yield 'for key share nowait' => [fn (Asset $asset): Asset => Asset::query()->lock('for key share nowait')->findOrFail($asset->id)];
+        yield 'a lock on another table' => [fn (Asset $asset): Asset => Asset::query()
+            ->join('sections', 'sections.id', '=', 'assets.section_id')
+            ->where('assets.id', $asset->id)
+            ->lock('for update of sections')
+            ->firstOrFail()];
+    }
+
+    /**
+     * @param  Closure(Asset): Asset  $read
+     */
+    #[DataProvider('locksThatLetAnUpdateThrough')]
+    #[Test]
+    public function it_selects_no_position_for_a_locking_read_whose_lock_lets_another_transaction_update_the_row(Closure $read): void
+    {
+        $section = Section::create();
+        $assets = [$this->asset($section), $this->asset($section)];
+
+        try {
+            DB::transaction(fn (): mixed => $read($assets[1])->getAttribute('position'));
+            $this->fail('A locking read whose lock lets an update through read a position.');
+        } catch (UnselectedPosition $exception) {
+            $this->assertStringContainsString('whose lock lets another transaction update the row', $exception->getMessage());
+        }
+    }
+
     #[Test]
     public function it_reads_the_own_columns_and_the_position_of_a_locking_read_that_joins_another_table(): void
     {

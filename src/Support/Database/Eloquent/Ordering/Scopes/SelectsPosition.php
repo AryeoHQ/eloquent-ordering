@@ -26,6 +26,8 @@ final class SelectsPosition implements Scope
 {
     public const string PIVOT_ATTRIBUTE = 'pivot_'.OrderedRelation::POSITION;
 
+    private const string UPDATE_BLOCKING_LOCK = '/^for\s+(update|no\s+key\s+update|share)(\s+(nowait|skip\s+locked))?$/i';
+
     /** @var null|WeakMap<Closure, true> */
     private static null|WeakMap $callbacks = null;
 
@@ -84,7 +86,7 @@ final class SelectsPosition implements Scope
                 if ($position !== null) {
                     $positions[] = new Expression(sprintf('%s as %s', $position, $grammar->wrap(OrderedRelation::POSITION)));
                 }
-            } elseif ($own !== null && $connection->transactionLevel() > 0) {
+            } elseif ($own !== null && $connection->transactionLevel() > 0 && self::locksEveryUpdate($query->lock)) {
                 self::selectPositionsAfter($query, $own);
             }
 
@@ -123,6 +125,11 @@ final class SelectsPosition implements Scope
     {
         return array_any($columns, static fn (mixed $column): bool => is_string($column)
             && preg_match('/^'.preg_quote($pivot, '/').'\.\S+\s+as\s+pivot_\S+$/i', $column) === 1);
+    }
+
+    private static function locksEveryUpdate(bool|string $lock): bool
+    {
+        return is_bool($lock) || preg_match(self::UPDATE_BLOCKING_LOCK, trim($lock)) === 1;
     }
 
     private static function selectPositionsAfter(QueryBuilder $query, Model&Ordered $item): void
