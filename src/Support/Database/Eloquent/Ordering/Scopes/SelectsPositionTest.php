@@ -107,36 +107,11 @@ class SelectsPositionTest extends TestCase
 
             return Video::query()->create(['section_id' => Video::query()->firstOrFail()->section_id]);
         }];
-        yield 'clip' => [function (): Model {
-            $video = Video::query()->create(['section_id' => Section::create()->id]);
-            Clip::query()->create(['video_id' => $video->id]);
-
-            return Clip::query()->create(['video_id' => $video->id]);
-        }];
-        yield 'photo' => [function (): Model {
-            $board = Board::create();
-            Photo::query()->create(['board_id' => $board->id]);
-
-            return Photo::query()->create(['board_id' => $board->id]);
-        }];
-        yield 'track' => [function (): Model {
-            $playlist = Playlist::create(['kind' => 'audio']);
-            Track::query()->create(['playlist_id' => $playlist->id, 'kind' => 'audio']);
-
-            return Track::query()->create(['playlist_id' => $playlist->id, 'kind' => 'audio']);
-        }];
-        yield 'page' => [function (): Model {
-            $binder = Binder::query()->create(['shelf_id' => Shelf::create()->id, 'kind' => 'notes']);
-            Page::query()->create(['binder_id' => $binder->id, 'kind' => 'notes']);
-
-            return Page::query()->create(['binder_id' => $binder->id, 'kind' => 'notes']);
-        }];
-        yield 'binder' => [function (): Model {
-            $shelf = Shelf::create();
-            Binder::query()->create(['shelf_id' => $shelf->id]);
-
-            return Binder::query()->create(['shelf_id' => $shelf->id]);
-        }];
+        yield 'clip' => [fn (): Model => self::secondOf(Clip::class, ['video_id' => Video::query()->create(['section_id' => Section::create()->id])->id])];
+        yield 'photo' => [fn (): Model => self::secondOf(Photo::class, ['board_id' => Board::create()->id])];
+        yield 'track' => [fn (): Model => self::secondOf(Track::class, ['playlist_id' => Playlist::create(['kind' => 'audio'])->id, 'kind' => 'audio'])];
+        yield 'page' => [fn (): Model => self::secondOf(Page::class, ['binder_id' => Binder::query()->create(['shelf_id' => Shelf::create()->id, 'kind' => 'notes'])->id, 'kind' => 'notes'])];
+        yield 'binder' => [fn (): Model => self::secondOf(Binder::class, ['shelf_id' => Shelf::create()->id])];
     }
 
     /**
@@ -201,6 +176,7 @@ class SelectsPositionTest extends TestCase
             $sections[] = $section->id;
         }
 
+        Asset::query()->whereKey(0)->get();
         DB::enableQueryLog();
 
         $assets = Asset::query()->whereIn('section_id', $sections)->orderBy('section_id')->orderBy('rank_key')->get();
@@ -888,6 +864,17 @@ class SelectsPositionTest extends TestCase
         $child->save();
 
         return $child;
+    }
+
+    /**
+     * @param  class-string<Model>  $class
+     * @param  array<string, mixed>  $attributes
+     */
+    private static function secondOf(string $class, array $attributes): Model
+    {
+        $class::query()->create($attributes);
+
+        return $class::query()->create($attributes);
     }
 
     /**

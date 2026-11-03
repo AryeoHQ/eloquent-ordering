@@ -14,7 +14,7 @@ return new class extends Migration
             $table->id();
             $table->string('name')->nullable();
             $table->string('kind')->nullable();
-            $table->timestamps();
+            $table->timestampsTz();
         });
 
         Schema::create('documents', function (Blueprint $table): void {
@@ -23,9 +23,9 @@ return new class extends Migration
             $table->unsignedBigInteger('home_folder_id')->nullable();
             $table->string('kind')->nullable();
             $table->string('locale')->nullable();
-            $table->timestamp('published_at')->nullable();
+            $table->timestampTz('published_at')->nullable();
             $table->rankKey();
-            $table->timestamps();
+            $table->timestampsTz();
 
             $table->unique(['folder_id', 'rank_key']);
         });

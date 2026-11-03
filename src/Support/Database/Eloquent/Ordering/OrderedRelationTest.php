@@ -41,12 +41,21 @@ use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Agencies\AgencyCustomer;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Documents\DatedDocument;
 use Tests\Fixtures\Support\Documents\Document;
 use Tests\Fixtures\Support\Documents\DocumentKind;
+use Tests\Fixtures\Support\Documents\FiledDocument;
 use Tests\Fixtures\Support\Documents\KindedDocument;
+use Tests\Fixtures\Support\Documents\LocalizedDocument;
 use Tests\Fixtures\Support\Events\ModelEvents;
+use Tests\Fixtures\Support\Folders\DatedFolder;
+use Tests\Fixtures\Support\Folders\FiledFolder;
+use Tests\Fixtures\Support\Folders\Folder;
 use Tests\Fixtures\Support\Folders\FolderRevision;
+use Tests\Fixtures\Support\Folders\KindedFolder;
+use Tests\Fixtures\Support\Folders\LocalizedFolder;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
@@ -54,6 +63,7 @@ use Tests\Fixtures\Support\Listings\NamedListing;
 use Tests\Fixtures\Support\Listings\PivotedListing;
 use Tests\Fixtures\Support\Listings\TitledListing;
 use Tests\Fixtures\Support\Listings\TwoPivotListing;
+use Tests\Fixtures\Support\Pages\Page;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Sections\Section;
@@ -61,6 +71,7 @@ use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
+use Tests\Fixtures\Support\Shelves\Shelf;
 use Tests\Fixtures\Support\Tracks\Track;
 use Tests\TestCase;
 use Throwable;
@@ -180,6 +191,28 @@ class OrderedRelationTest extends TestCase
         ];
     }
 
+    /**
+     * @return iterable<string, array{Closure(): array{Model&OrdersRelations, string, list<Model&Ordered>}}>
+     */
+    public static function declaredFilters(): iterable
+    {
+        yield 'a parent column' => [static fn (): array => self::filtered(Playlist::create(['kind' => 'audio']), 'tracks', Track::class, 'playlist_id', 'kind', ['audio', 'video', 'audio', 'audio'])];
+        yield 'a parent column of an ordered parent' => [static fn (): array => self::filtered(Binder::query()->create(['shelf_id' => Shelf::create()->id, 'kind' => 'notes']), 'pages', Page::class, 'binder_id', 'kind', ['notes', 'drafts', 'notes', 'notes'])];
+        yield 'a runtime value' => [static fn (): array => self::filtered(LocalizedFolder::query()->create(), 'documents', LocalizedDocument::class, 'folder_id', 'locale', ['en', 'fr', 'en', 'en'])];
+        yield 'a parent key' => [static function (): array {
+            [$folder, $other] = [Folder::query()->create(), Folder::query()->create()];
+
+            return self::filtered($folder, 'documents', Document::class, 'folder_id', 'home_folder_id', [$folder->id, $other->id, $folder->id, $folder->id]);
+        }];
+        yield 'a date constant' => [static fn (): array => self::filtered(DatedFolder::query()->create(), 'documents', DatedDocument::class, 'folder_id', 'published_at', ['2025-06-01 00:00:00', '2026-06-01 00:00:00', '2025-12-01 00:00:00', DatedFolder::PUBLISHED_BY])];
+        yield 'a bound subquery' => [static function (): array {
+            [$archive, $other] = [FiledFolder::query()->create(['name' => FiledFolder::ARCHIVE]), FiledFolder::query()->create(['name' => 'Other'])];
+
+            return self::filtered(FiledFolder::query()->create(), 'documents', FiledDocument::class, 'folder_id', 'home_folder_id', [$archive->id, $other->id, $archive->id, $archive->id]);
+        }];
+        yield 'an enum cast' => [static fn (): array => self::filtered(KindedFolder::query()->create(['kind' => DocumentKind::Notes]), 'documents', KindedDocument::class, 'folder_id', 'kind', ['notes', 'drafts', 'notes', 'notes'])];
+    }
+
     #[DataProvider('shapes')]
     #[Test]
     public function it_selects_the_position_of_every_member_in_the_query_that_reads_it_as_the_order_change_numbers_it(Shape $shape): void
@@ -195,6 +228,28 @@ class OrderedRelationTest extends TestCase
         $this->assertCount(1, DB::getQueryLog());
         $this->assertSame(array_combine($change->order, range(1, count($change->order))), $positions);
         $this->assertSame($positions, array_map(fn (int|string $id): mixed => $shape->find($id)->getAttribute('position'), array_combine(array_keys($positions), array_keys($positions))));
+    }
+
+    /**
+     * @param  Closure(): array{Model&OrdersRelations, string, list<Model&Ordered>}  $create
+     */
+    #[DataProvider('declaredFilters')]
+    #[Test]
+    public function it_selects_the_position_of_every_member_that_a_declared_filter_keeps_as_the_order_change_numbers_it(Closure $create): void
+    {
+        [$parent, $relation, $created] = $create();
+        $change = $created[3]->move(Placement::first(), expected: null);
+        $expected = array_combine($change->order, range(1, count($change->order)));
+        $position = fn (Model $member): array => [$member->getKey() => $member->getAttribute('position')];
+
+        $related = $parent->{$relation}()->reorder($created[0]->qualifyColumn('rank_key'))->orderBy($created[0]->getQualifiedKeyName())->get()->mapWithKeys($position)->all();
+        $read = $created[0]->newQuery()->whereKey(array_map(fn (Model $member): mixed => $member->getKey(), $created))->get()->mapWithKeys($position)->sortKeys()->all();
+        $unfiltered = $expected + [$created[1]->getKey() => null];
+        ksort($unfiltered);
+
+        $this->assertCount(3, $change->order);
+        $this->assertSame($expected, $related);
+        $this->assertSame($unfiltered, $read);
     }
 
     #[DataProvider('positionedQueries')]
@@ -791,6 +846,7 @@ class OrderedRelationTest extends TestCase
      * @param  Closure(): (Model&OrdersRelations&Revisioned)  $parent
      */
     #[DataProvider('uninspectableMemberships')]
+    #[DataProvider('uncompilableMemberships')]
     #[Test]
     public function it_refuses_a_relation_whose_membership_filter_it_cannot_verify(Closure $parent, NamesConcurrencyRevision $revision, string $message): void
     {
@@ -1015,42 +1071,6 @@ class OrderedRelationTest extends TestCase
             }
         }, SectionRevision::AssetsOrder, '::assets()] filters its members by an expression'];
 
-        yield 'an expression value' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'sections';
-
-            /**
-             * @return HasMany<Asset, $this>
-             */
-            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.title'])]
-            public function assets(): HasMany
-            {
-                return $this->hasMany(Asset::class, 'section_id')->where('assets.title', new Expression('"assets"."visible"'));
-            }
-        }, SectionRevision::AssetsOrder, '::assets()] compares its members by [assets.title] to an expression, which a position query cannot re-alias. Compare two columns with whereColumn().'];
-
-        yield 'a nested expression value' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'sections';
-
-            /**
-             * @return HasMany<Asset, $this>
-             */
-            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.title'])]
-            public function assets(): HasMany
-            {
-                return $this->hasMany(Asset::class, 'section_id')->where(static function (EloquentBuilder $query): void {
-                    $query->where('assets.title', '!=', new Expression('"assets"."visible"'));
-                });
-            }
-        }, SectionRevision::AssetsOrder, '::assets()] compares its members by [assets.title] to an expression'];
-
         yield 'a top-level or' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
             use HasConcurrencyRevisions;
@@ -1101,6 +1121,150 @@ class OrderedRelationTest extends TestCase
                 return $this->hasMany(Asset::class, 'section_id')->where('assets.title', $this->getAttribute('name'));
             }
         }, SectionRevision::AssetsOrder, '::assets()] filters its members by [sections.name], which its membership does not declare.'];
+
+        yield 'an unqualified pivot column' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            #[OrdersRelation(ListingRevision::CustomersOrder)]
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')->using(ListingCustomer::class)->where('title', 'Shown');
+            }
+        }, ListingRevision::CustomersOrder, '::customers()] filters its members by the unqualified column [title]'];
+
+        yield 'an unqualified declaration' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['title'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('assets.title', 'Shown');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [title], which names no table of the relation.'];
+
+        yield 'a declaration on another table' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['videos.title'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [videos.title], which names no table of the relation.'];
+
+        yield 'an automatic item timestamp' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.updated_at'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [assets.updated_at], which Eloquent sets on a save of [Tests\Fixtures\Support\Assets\Asset].'];
+
+        yield 'an automatic parent timestamp' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['sections.created_at'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id');
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [sections.created_at], which Eloquent sets on a save of [Illuminate\Database\Eloquent\Model@anonymous'];
+
+        yield 'an automatic related timestamp' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'listings';
+
+            /**
+             * @return BelongsToMany<Customer, $this, ListingCustomer>
+             */
+            #[OrdersRelation(ListingRevision::CustomersOrder, membership: ['customers.updated_at'])]
+            public function customers(): BelongsToMany
+            {
+                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')->using(ListingCustomer::class);
+            }
+        }, ListingRevision::CustomersOrder, '::customers()] declares the membership column [customers.updated_at], which Eloquent sets on a save of [Tests\Fixtures\Support\Customers\Customer].'];
+    }
+
+    /**
+     * @return iterable<string, array{Closure(): (Model&OrdersRelations&Revisioned), NamesConcurrencyRevision, string}>
+     */
+    public static function uncompilableMemberships(): iterable
+    {
+        yield 'an expression value' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.title'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where('assets.title', new Expression('"assets"."visible"'));
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] compares its members by [assets.title] to an expression, which a position query cannot re-alias. Compare two columns with whereColumn().'];
+
+        yield 'a nested expression value' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'sections';
+
+            /**
+             * @return HasMany<Asset, $this>
+             */
+            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.title'])]
+            public function assets(): HasMany
+            {
+                return $this->hasMany(Asset::class, 'section_id')->where(static function (EloquentBuilder $query): void {
+                    $query->where('assets.title', '!=', new Expression('"assets"."visible"'));
+                });
+            }
+        }, SectionRevision::AssetsOrder, '::assets()] compares its members by [assets.title] to an expression'];
 
         yield 'a parent column compared by another operator' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
         {
@@ -1240,108 +1404,6 @@ class OrderedRelationTest extends TestCase
                     ->join('customers as kept', 'kept.id', '=', 'customers.id');
             }
         }, ListingRevision::CustomersOrder, '::customers()] joins [customers as kept] to its members, so a position query cannot reproduce the join for each row.'];
-
-        yield 'an unqualified pivot column' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'listings';
-
-            /**
-             * @return BelongsToMany<Customer, $this, ListingCustomer>
-             */
-            #[OrdersRelation(ListingRevision::CustomersOrder)]
-            public function customers(): BelongsToMany
-            {
-                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')->using(ListingCustomer::class)->where('title', 'Shown');
-            }
-        }, ListingRevision::CustomersOrder, '::customers()] filters its members by the unqualified column [title]'];
-
-        yield 'an unqualified declaration' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'sections';
-
-            /**
-             * @return HasMany<Asset, $this>
-             */
-            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['title'])]
-            public function assets(): HasMany
-            {
-                return $this->hasMany(Asset::class, 'section_id')->where('assets.title', 'Shown');
-            }
-        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [title], which names no table of the relation.'];
-
-        yield 'a declaration on another table' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'sections';
-
-            /**
-             * @return HasMany<Asset, $this>
-             */
-            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['videos.title'])]
-            public function assets(): HasMany
-            {
-                return $this->hasMany(Asset::class, 'section_id');
-            }
-        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [videos.title], which names no table of the relation.'];
-
-        yield 'an automatic item timestamp' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'sections';
-
-            /**
-             * @return HasMany<Asset, $this>
-             */
-            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['assets.updated_at'])]
-            public function assets(): HasMany
-            {
-                return $this->hasMany(Asset::class, 'section_id');
-            }
-        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [assets.updated_at], which Eloquent sets on a save of [Tests\Fixtures\Support\Assets\Asset].'];
-
-        yield 'an automatic parent timestamp' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'sections';
-
-            /**
-             * @return HasMany<Asset, $this>
-             */
-            #[OrdersRelation(SectionRevision::AssetsOrder, membership: ['sections.created_at'])]
-            public function assets(): HasMany
-            {
-                return $this->hasMany(Asset::class, 'section_id');
-            }
-        }, SectionRevision::AssetsOrder, '::assets()] declares the membership column [sections.created_at], which Eloquent sets on a save of [Illuminate\Database\Eloquent\Model@anonymous'];
-
-        yield 'an automatic related timestamp' => [static fn (): Model&OrdersRelations&Revisioned => new class extends Model implements OrdersRelations, Revisioned
-        {
-            use HasConcurrencyRevisions;
-            use HasOrderedRelations;
-
-            protected $table = 'listings';
-
-            /**
-             * @return BelongsToMany<Customer, $this, ListingCustomer>
-             */
-            #[OrdersRelation(ListingRevision::CustomersOrder, membership: ['customers.updated_at'])]
-            public function customers(): BelongsToMany
-            {
-                return $this->belongsToMany(Customer::class, 'listing_customer', 'listing_id')->using(ListingCustomer::class);
-            }
-        }, ListingRevision::CustomersOrder, '::customers()] declares the membership column [customers.updated_at], which Eloquent sets on a save of [Tests\Fixtures\Support\Customers\Customer].'];
     }
 
     /**
@@ -1594,6 +1656,21 @@ class OrderedRelationTest extends TestCase
         $this->assertInstanceOf($exception, $thrown);
         $this->assertSame($revision, $shape->digest($parent));
         $this->assertSame($keys, $shape->rankKeys($parent));
+    }
+
+    /**
+     * @param  class-string<Model&Ordered>  $class
+     * @param  list<mixed>  $values
+     * @return array{Model&OrdersRelations, string, list<Model&Ordered>}
+     */
+    private static function filtered(Model&OrdersRelations $parent, string $relation, string $class, string $foreignKey, string $column, array $values): array
+    {
+        return [$parent, $relation, array_map(static function (mixed $value) use ($parent, $class, $foreignKey, $column): Model&Ordered {
+            $member = $class::query()->create([$foreignKey => $parent->getKey(), $column => $value]);
+            assert($member instanceof Ordered);
+
+            return $member;
+        }, $values)];
     }
 
     /**

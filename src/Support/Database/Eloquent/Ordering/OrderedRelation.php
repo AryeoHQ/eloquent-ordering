@@ -778,8 +778,35 @@ final class OrderedRelation
      */
     private static function memberCount(Model $parent, string $method, HasMany|MorphMany|BelongsToMany $relation, RelationKeys $keys, string $qualifier, Connection $connection): string
     {
+        $key = $keys->item->getKeyName();
+        $inner = self::innerAliases($qualifier)[0];
+        $member = static fn (string $column): string => $inner.'.'.$column;
+        $outer = static fn (string $column): string => $qualifier.'.'.$column;
+        $members = self::liveMembers($parent, $method, $relation, $keys, $qualifier, $connection);
+        $grammar = $members->getGrammar();
+
+        $members
+            ->whereColumn($member(self::RANK_KEY), '<=', $outer(self::RANK_KEY))
+            ->whereRaw(sprintf(
+                '(%s, %s) <= (%s, %s)',
+                $grammar->wrap($member(self::RANK_KEY)),
+                $grammar->wrap($member($key)),
+                $grammar->wrap($outer(self::RANK_KEY)),
+                $grammar->wrap($outer($key)),
+            ))
+            ->selectRaw(sprintf('case when bool_or(%s = %s) then count(*) end', $grammar->wrap($member($key)), $grammar->wrap($outer($key))));
+
+        $bindings = $members->getBindings();
+
+        return $grammar->substituteBindingsIntoRawSql($members->toSql(), array_replace($connection->prepareBindings($bindings), array_filter($bindings, is_bool(...))));
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     */
+    private static function liveMembers(Model $parent, string $method, HasMany|MorphMany|BelongsToMany $relation, RelationKeys $keys, string $qualifier, Connection $connection): Builder
+    {
         $item = $keys->item;
-        $key = $item->getKeyName();
         [$inner, $owner, $relatedAlias] = self::innerAliases($qualifier);
         $member = static fn (string $column): string => $inner.'.'.$column;
         $outer = static fn (string $column): string => $qualifier.'.'.$column;
@@ -812,22 +839,7 @@ final class OrderedRelation
             $members->addNestedWhereQuery($filters);
         }
 
-        $grammar = $members->getGrammar();
-
-        $members
-            ->whereColumn($member(self::RANK_KEY), '<=', $outer(self::RANK_KEY))
-            ->whereRaw(sprintf(
-                '(%s, %s) <= (%s, %s)',
-                $grammar->wrap($member(self::RANK_KEY)),
-                $grammar->wrap($member($key)),
-                $grammar->wrap($outer(self::RANK_KEY)),
-                $grammar->wrap($outer($key)),
-            ))
-            ->selectRaw(sprintf('case when bool_or(%s = %s) then count(*) end', $grammar->wrap($member($key)), $grammar->wrap($outer($key))));
-
-        $bindings = $members->getBindings();
-
-        return $grammar->substituteBindingsIntoRawSql($members->toSql(), array_replace($connection->prepareBindings($bindings), array_filter($bindings, is_bool(...))));
+        return $members;
     }
 
     /**
@@ -874,43 +886,70 @@ final class OrderedRelation
      */
     private static function copyFilters(array $wheres, Builder $into, array $pairs, array $aliases, string $member, string $owner): void
     {
-        $grammar = $into->getGrammar();
         $probes = array_combine(array_map(self::probe(...), array_keys($pairs)), array_keys($pairs));
-        $alias = static function (mixed $column) use ($aliases, $member): string {
-            throw_unless(is_string($column), LogicException::class, 'A membership filter names a column by an expression.');
+        $stack = [[array_values($wheres), $into, null]];
 
-            $segments = explode('.', $column);
-            $name = array_pop($segments);
-            $table = array_pop($segments);
+        while ($stack !== []) {
+            [$remaining, $target, $group] = array_pop($stack);
 
-            return ($table === null ? $member : ($aliases[$table] ?? $table)).'.'.$name;
+            if ($remaining === [] && $group !== null) {
+                $group[0]->addNestedWhereQuery($target, $group[1]);
+            } elseif ($remaining !== []) {
+                $where = array_shift($remaining);
+                assert(is_array($where));
+                $boolean = is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and';
+                $stack[] = [$remaining, $target, $group];
+                $nested = self::copyFilter($where, $boolean, $target, $probes, $aliases, $member, $owner);
+
+                if ($nested !== null) {
+                    $stack[] = [array_values($nested->wheres), $target->forNestedWhere(), [$target, $boolean]];
+                }
+            }
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $where
+     * @param  array<string, string>  $probes
+     * @param  array<string, string>  $aliases
+     */
+    private static function copyFilter(array $where, string $boolean, Builder $into, array $probes, array $aliases, string $member, string $owner): null|Builder
+    {
+        $value = $where['value'] ?? null;
+        $paired = is_string($value) ? $probes[$value] ?? null : null;
+        $alias = static fn (mixed $column): string => self::aliasedColumn($column, $aliases, $member);
+
+        if (($where['type'] ?? null) === 'Nested') {
+            return ($where['query'] ?? null) instanceof Builder ? $where['query'] : throw new LogicException('A nested membership filter holds no query.');
+        }
+
+        match ($where['type'] ?? null) {
+            'Basic' => $paired === null
+                ? $into->where($alias($where['column'] ?? null), is_string($where['operator'] ?? null) ? $where['operator'] : '=', $value, $boolean)
+                : $into->whereRaw(sprintf('%s is not distinct from %s', $into->getGrammar()->wrap($alias($where['column'] ?? null)), $into->getGrammar()->wrap($owner.'.'.$paired)), [], $boolean),
+            'Null' => $into->whereNull($alias($where['column'] ?? null), $boolean),
+            'NotNull' => $into->whereNotNull($alias($where['column'] ?? null), $boolean),
+            'In' => $into->whereIn($alias($where['column'] ?? null), is_array($where['values'] ?? null) ? $where['values'] : [], $boolean),
+            'NotIn' => $into->whereNotIn($alias($where['column'] ?? null), is_array($where['values'] ?? null) ? $where['values'] : [], $boolean),
+            'Column' => $into->whereColumn($alias($where['first'] ?? null), is_string($where['operator'] ?? null) ? $where['operator'] : '=', $alias($where['second'] ?? null), $boolean),
+            default => throw new LogicException(sprintf('A membership filter of type [%s] cannot be reproduced for each row.', get_debug_type($where['type'] ?? null))),
         };
 
-        foreach ($wheres as $where) {
-            assert(is_array($where));
+        return null;
+    }
 
-            $boolean = is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and';
-            $value = $where['value'] ?? null;
-            $paired = is_string($value) ? $probes[$value] ?? null : null;
-            $nested = $where['query'] ?? null;
+    /**
+     * @param  array<string, string>  $aliases
+     */
+    private static function aliasedColumn(mixed $column, array $aliases, string $member): string
+    {
+        throw_unless(is_string($column), LogicException::class, 'A membership filter names a column by an expression.');
 
-            match ($where['type'] ?? null) {
-                'Basic' => $paired === null
-                    ? $into->where($alias($where['column'] ?? null), is_string($where['operator'] ?? null) ? $where['operator'] : '=', $value, $boolean)
-                    : $into->whereRaw(sprintf('%s is not distinct from %s', $grammar->wrap($alias($where['column'] ?? null)), $grammar->wrap($owner.'.'.$paired)), [], $boolean),
-                'Null' => $into->whereNull($alias($where['column'] ?? null), $boolean),
-                'NotNull' => $into->whereNotNull($alias($where['column'] ?? null), $boolean),
-                'In' => $into->whereIn($alias($where['column'] ?? null), is_array($where['values'] ?? null) ? $where['values'] : [], $boolean),
-                'NotIn' => $into->whereNotIn($alias($where['column'] ?? null), is_array($where['values'] ?? null) ? $where['values'] : [], $boolean),
-                'Column' => $into->whereColumn($alias($where['first'] ?? null), is_string($where['operator'] ?? null) ? $where['operator'] : '=', $alias($where['second'] ?? null), $boolean),
-                'Nested' => $into->whereNested(static function (Builder $query) use ($nested, $pairs, $aliases, $member, $owner): void {
-                    throw_unless($nested instanceof Builder, LogicException::class, 'A nested membership filter holds no query.');
+        $segments = explode('.', $column);
+        $name = array_pop($segments);
+        $table = array_pop($segments);
 
-                    self::copyFilters($nested->wheres, $query, $pairs, $aliases, $member, $owner);
-                }, $boolean),
-                default => throw new LogicException(sprintf('A membership filter of type [%s] cannot be reproduced for each row.', get_debug_type($where['type'] ?? null))),
-            };
-        }
+        return ($table === null ? $member : ($aliases[$table] ?? $table)).'.'.$name;
     }
 
     /**
@@ -979,12 +1018,7 @@ final class OrderedRelation
 
         foreach ($columns as $index => $column) {
             $probe = self::probe($column);
-            $paired = array_filter($base->wheres, static fn (mixed $where): bool => is_array($where)
-                && ($where['type'] ?? null) === 'Basic'
-                && ($where['operator'] ?? null) === '='
-                && ($where['value'] ?? null) === $probe
-                && is_string($where['column'] ?? null)
-                && strtolower(is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and') === 'and');
+            $paired = self::wheresEqualTo($base->wheres, $probe);
             $where = array_key_first($paired);
             $itemColumn = $where === null ? null : $paired[$where]['column'];
 
@@ -1007,6 +1041,20 @@ final class OrderedRelation
         }
 
         return $pairs;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $wheres
+     * @return array<array-key, mixed>
+     */
+    private static function wheresEqualTo(array $wheres, string $probe): array
+    {
+        return array_filter($wheres, static fn (mixed $where): bool => is_array($where)
+            && ($where['type'] ?? null) === 'Basic'
+            && ($where['operator'] ?? null) === '='
+            && ($where['value'] ?? null) === $probe
+            && is_string($where['column'] ?? null)
+            && strtolower(is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and') === 'and');
     }
 
     private static function probe(string $column): string
@@ -1278,8 +1326,6 @@ final class OrderedRelation
             return;
         }
 
-        self::requireOwnJoins($name, $relation);
-
         $keys = self::describe($relation);
         $item = $keys->item;
         $related = $relation instanceof BelongsToMany ? $relation->getRelated() : null;
@@ -1316,11 +1362,9 @@ final class OrderedRelation
             ...$related !== null && method_exists($related, 'getQualifiedDeletedAtColumn') ? [$related->getQualifiedDeletedAtColumn()] : [],
             $parent->qualifyColumn($keys->ownerKey),
         ];
-        $wheres = $relation->getBaseQuery()->wheres;
-
         $read = self::parentColumnsRead($parent, $method);
 
-        foreach ([...self::filteredColumns($name, $wheres, $item->getTable(), $related !== null), ...$read] as $column) {
+        foreach ([...self::filteredColumns($name, $relation->getBaseQuery()->wheres, $item->getTable(), $related !== null), ...$read] as $column) {
             throw_unless(in_array($column, [...$implicit, ...$declaration->membership], true), LogicException::class, sprintf(
                 '[%s] filters its members by [%s], which its membership does not declare.',
                 $name,
@@ -1328,14 +1372,23 @@ final class OrderedRelation
             ));
         }
 
+        self::requireReproducibleMembership($name, $parent, $method, $relation, $keys, $read);
+        self::$verifiedMemberships[$name] = true;
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     * @param  list<string>  $read
+     */
+    private static function requireReproducibleMembership(string $name, Model $parent, string $method, HasMany|MorphMany|BelongsToMany $relation, RelationKeys $keys, array $read): void
+    {
+        self::requireOwnJoins($name, $relation);
         self::$membershipPairs[$name] = self::membershipPairs($name, $parent, $method, $read);
         self::requireUncorrelatedSubqueries($name, $parent, $method, $relation, $keys);
 
         if ($relation instanceof BelongsToMany) {
             self::requireOrderedThrough($parent, $method, $relation);
         }
-
-        self::$verifiedMemberships[$name] = true;
     }
 
     /**
@@ -1392,11 +1445,24 @@ final class OrderedRelation
      */
     private static function filtersBySubquery(array $wheres): bool
     {
-        return array_any($wheres, static fn (mixed $where): bool => is_array($where) && match ($where['type'] ?? null) {
-            'In', 'NotIn' => array_any(is_array($where['values'] ?? null) ? $where['values'] : [], static fn (mixed $value): bool => $value instanceof ExpressionContract),
-            'Nested' => ($where['query'] ?? null) instanceof Builder && self::filtersBySubquery($where['query']->wheres),
-            default => false,
-        });
+        $pending = [$wheres];
+
+        while ($pending !== []) {
+            $level = array_filter(array_pop($pending), is_array(...));
+
+            if (array_any($level, static fn (array $where): bool => in_array($where['type'] ?? null, ['In', 'NotIn'], true)
+                && array_any(is_array($where['values'] ?? null) ? $where['values'] : [], static fn (mixed $value): bool => $value instanceof ExpressionContract))) {
+                return true;
+            }
+
+            foreach ($level as $where) {
+                if (($where['type'] ?? null) === 'Nested' && ($where['query'] ?? null) instanceof Builder) {
+                    $pending[] = $where['query']->wheres;
+                }
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1409,12 +1475,7 @@ final class OrderedRelation
 
         foreach ($wheres as $where) {
             assert(is_array($where));
-
-            throw_if(! $nested && str_starts_with(strtolower(is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and'), 'or'), LogicException::class, sprintf(
-                '[%s] joins a filter to its members with [or], so the filter reaches the rows of other parents.',
-                $name,
-            ));
-
+            self::requireVerifiableClause($name, $where, $nested);
             $type = $where['type'] ?? null;
 
             if ($type === 'Nested' && ($where['query'] ?? null) instanceof Builder) {
@@ -1432,12 +1493,6 @@ final class OrderedRelation
                     is_string($type) ? $type : get_debug_type($type),
                 )),
             };
-
-            throw_if($type === 'Basic' && ($where['value'] ?? null) instanceof ExpressionContract, LogicException::class, sprintf(
-                '[%s] compares its members by [%s] to an expression, which a position query cannot re-alias. Compare two columns with whereColumn().',
-                $name,
-                is_string($where['column'] ?? null) ? $where['column'] : 'an expression',
-            ));
 
             foreach ($named as $column) {
                 throw_unless(is_string($column), LogicException::class, sprintf('[%s] filters its members by an expression, which a membership declaration cannot verify.', $name));
@@ -1459,6 +1514,23 @@ final class OrderedRelation
         }
 
         return $columns;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $where
+     */
+    private static function requireVerifiableClause(string $name, array $where, bool $nested): void
+    {
+        throw_if(! $nested && str_starts_with(strtolower(is_string($where['boolean'] ?? null) ? $where['boolean'] : 'and'), 'or'), LogicException::class, sprintf(
+            '[%s] joins a filter to its members with [or], so the filter reaches the rows of other parents.',
+            $name,
+        ));
+
+        throw_if(($where['type'] ?? null) === 'Basic' && ($where['value'] ?? null) instanceof ExpressionContract, LogicException::class, sprintf(
+            '[%s] compares its members by [%s] to an expression, which a position query cannot re-alias. Compare two columns with whereColumn().',
+            $name,
+            is_string($where['column'] ?? null) ? $where['column'] : 'an expression',
+        ));
     }
 
     /**

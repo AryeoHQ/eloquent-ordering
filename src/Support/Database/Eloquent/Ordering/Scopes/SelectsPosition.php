@@ -58,7 +58,17 @@ final class SelectsPosition implements Scope
             return;
         }
 
-        $callback = static function (QueryBuilder $query) use ($item, $pivots): void {
+        $callback = self::selectPositions($item, $pivots);
+        self::callbacks()[$callback] = true;
+        $query->beforeQuery($callback);
+    }
+
+    /**
+     * @param  array<string, Model&Ordered>  $pivots
+     */
+    private static function selectPositions(null|(Model&Ordered) $item, array $pivots): Closure
+    {
+        return static function (QueryBuilder $query) use ($item, $pivots): void {
             if ($query->unions !== null) {
                 self::withoutPositionsIn($query);
 
@@ -72,37 +82,55 @@ final class SelectsPosition implements Scope
                 return;
             }
 
-            $grammar = $query->getGrammar();
             $qualifier = self::qualifier($from);
             $row = $qualifier.'.*';
             $columns = $query->columns === null || $query->columns === ['*'] ? [$row] : $query->columns;
-            $positions = [];
-
             $own = $item !== null && in_array($row, $columns, true) ? $item : null;
-
-            if ($own !== null && $query->lock === null) {
-                $position = OrderedRelation::positionColumn($own, $qualifier, $connection);
-
-                if ($position !== null) {
-                    $positions[] = new Expression(sprintf('%s as %s', $position, $grammar->wrap(OrderedRelation::POSITION)));
-                }
-            } elseif ($own !== null && $connection->transactionLevel() > 0 && self::locksEveryUpdate($query->lock)) {
-                self::selectPositionsAfter($query, $own);
-            }
-
-            foreach (self::pivotPositions($pivots, $query, $connection) as $pivot => $position) {
-                if (self::selectsThePivot($columns, $pivot)) {
-                    $positions[] = new Expression(sprintf('%s as %s', $position, $grammar->wrap(self::PIVOT_ATTRIBUTE)));
-                }
-            }
+            $positions = [
+                ...$own === null ? [] : self::ownPosition($query, $own, $qualifier, $connection),
+                ...self::selectedPivotPositions($query, $pivots, $columns, $connection),
+            ];
 
             if ($own !== null || $positions !== []) {
                 $query->columns = [...$columns, ...$positions];
             }
         };
+    }
 
-        self::callbacks()[$callback] = true;
-        $query->beforeQuery($callback);
+    /**
+     * @return list<ExpressionContract>
+     */
+    private static function ownPosition(QueryBuilder $query, Model&Ordered $own, string $qualifier, Connection $connection): array
+    {
+        if ($query->lock === null) {
+            $position = OrderedRelation::positionColumn($own, $qualifier, $connection);
+
+            return $position === null ? [] : [new Expression(sprintf('%s as %s', $position, $query->getGrammar()->wrap(OrderedRelation::POSITION)))];
+        }
+
+        if ($connection->transactionLevel() > 0 && self::locksEveryUpdate($query->lock)) {
+            self::selectPositionsAfter($query, $own);
+        }
+
+        return [];
+    }
+
+    /**
+     * @param  array<string, Model&Ordered>  $pivots
+     * @param  array<array-key, string|ExpressionContract>  $columns
+     * @return list<ExpressionContract>
+     */
+    private static function selectedPivotPositions(QueryBuilder $query, array $pivots, array $columns, Connection $connection): array
+    {
+        $positions = [];
+
+        foreach (self::pivotPositions($pivots, $query, $connection) as $pivot => $position) {
+            if (self::selectsThePivot($columns, $pivot)) {
+                $positions[] = new Expression(sprintf('%s as %s', $position, $query->getGrammar()->wrap(self::PIVOT_ATTRIBUTE)));
+            }
+        }
+
+        return $positions;
     }
 
     private static function table(QueryBuilder $query): null|string
@@ -167,15 +195,12 @@ final class SelectsPosition implements Scope
     private static function pivotPositions(array $ordered, QueryBuilder $query, Connection $connection): array
     {
         $positions = [];
+        $joined = array_filter(array_map(static fn (mixed $join): mixed => $join instanceof JoinClause ? $join->table : null, $query->joins ?? []), is_string(...));
 
-        foreach ($query->joins ?? [] as $join) {
-            if (! $join instanceof JoinClause || ! is_string($join->table)) {
-                continue;
-            }
-
-            $table = preg_replace('/\s+as\s+\S+$/i', '', $join->table) ?? $join->table;
+        foreach ($joined as $join) {
+            $table = preg_replace('/\s+as\s+\S+$/i', '', $join) ?? $join;
             $pivot = $ordered[$table] ?? null;
-            $qualifier = self::qualifier($join->table);
+            $qualifier = self::qualifier($join);
             $position = $pivot === null ? null : OrderedRelation::positionColumn($pivot, $qualifier, $connection);
 
             if ($position !== null) {
@@ -193,32 +218,33 @@ final class SelectsPosition implements Scope
 
     private static function withoutPositionsIn(QueryBuilder $query): void
     {
-        $pending = [$query];
+        $pending = $query->unions === null ? [] : [$query];
 
         while ($pending !== []) {
             $parent = array_pop($pending);
 
-            if ($parent->unions === null) {
-                continue;
-            }
-
             $parent->unions = array_map(static function (array $union) use (&$pending): array {
                 $side = $union['query'];
+                $nested = null;
 
                 if ($side instanceof Builder) {
                     $side = (clone $side)->withoutGlobalScope(self::class);
-                    $pending[] = $side->getQuery();
+                    $nested = $side->getQuery();
                 } elseif ($side instanceof QueryBuilder) {
                     $side = clone $side;
                     $side->beforeQueryCallbacks = array_values(array_filter(
                         $side->beforeQueryCallbacks,
                         static fn (mixed $callback): bool => ! ($callback instanceof Closure && self::callbacks()->offsetExists($callback)),
                     ));
-                    $pending[] = $side;
+                    $nested = $side;
+                }
+
+                if ($nested?->unions !== null) {
+                    $pending[] = $nested;
                 }
 
                 return [...$union, 'query' => $side];
-            }, $parent->unions);
+            }, $parent->unions ?? []);
         }
     }
 

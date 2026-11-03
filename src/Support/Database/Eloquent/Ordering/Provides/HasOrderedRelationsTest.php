@@ -343,6 +343,14 @@ class HasOrderedRelationsTest extends TestCase
     }
 
     /**
+     * @return iterable<string, array{PivotShape}>
+     */
+    public static function pivots(): iterable
+    {
+        return PivotShape::pivots();
+    }
+
+    /**
      * @param  Closure(Shape): array{list<Model>, Closure(): mixed, list<string>}  $prepare
      */
     #[DataProvider('eloquentWrites')]
@@ -391,6 +399,20 @@ class HasOrderedRelationsTest extends TestCase
 
         $this->assertSame($section, $change->parent);
         $this->assertSame(SectionRevision::AssetsOrder, $change->revision);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_selects_the_pivot_position_in_a_parent_query_that_runs_before_the_related_model_boots(PivotShape $shape): void
+    {
+        [$parent, [$member]] = $shape->with(1);
+        $customer = Customer::query()->findOrFail($member->getAttribute('customer_id'));
+        $inverse = $parent instanceof Listing ? 'listings' : 'tours';
+        Model::clearBootedModels();
+
+        $pivots = $customer->{$inverse}()->get()->map(fn (Model $parent): mixed => $parent->getRelation('pivot')->getAttribute('position'));
+
+        $this->assertSame([1], $pivots->all());
     }
 
     #[Test]
