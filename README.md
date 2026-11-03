@@ -566,7 +566,7 @@ Asset::query()->whereKey($id)->delete();                              // changes
 
 ## Testing support
 
-**Place a factory-made item with `PlacesOrderedItems`.** Use the trait in the item's factory. `placedAt(Placement $placement)` calls `placeAt()` on each item that the factory makes, so the save puts the item there.
+**Place a factory-made item with `PlacesOrderedItems`.** Use the trait in the item's factory. `placedAt(Placement $placement)` calls `placeAt()` on each item that the factory makes, so the save puts the item there. The factory places each item of `count(n)` in turn, so `first()` and `after()` give the items in reverse creation order.
 
 ```php
 use Support\Database\Eloquent\Ordering\Testing\PlacesOrderedItems;
@@ -581,16 +581,16 @@ Asset::factory()->for($section)->placedAt(Placement::before($anchorId))->create(
 
 A placement that names a parent throws `LogicException`, as `placeAt()` does.
 
-**Forge a concurrent write with `ChangesRowsOnFirstRead`.** Use the trait in a test case. Each method changes one row through `toBase()` after the first `select` on that row's table and connection, and then stops listening.
+**Forge a concurrent write with `ChangesRowsOnFirstRead`.** Use the trait in a test case. Each method changes one row through `toBase()` after the first `select` on that row's table and connection, and then ignores every later query. A subquery or a join that reads the table counts as a read of it.
 
 ```php
 use Support\Database\Eloquent\Ordering\Testing\ChangesRowsOnFirstRead;
 
 $this->deleteOnFirstRead($asset);                     // trashes the row and clears its rank key
-$this->moveOnFirstRead($asset->section(), $other);    // points the foreign key at $other
+$this->moveOnFirstRead($asset->section(), $other);    // points the foreign key at $other, after its last member
 ```
 
-`deleteOnFirstRead()` deletes the row of a model that does not soft delete. The forged write runs on the model's connection, inside the test's transaction. Nothing refuses it, because a write that bypasses Eloquent is unsupported.
+`deleteOnFirstRead()` deletes the row of a model that does not soft delete. The forged write runs on the model's connection, inside the test's transaction, when the test opens one. Nothing refuses it, because a write that bypasses Eloquent is unsupported.
 
 ## Limits
 

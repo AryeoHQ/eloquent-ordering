@@ -6,8 +6,13 @@ namespace Support\Database\Eloquent\Ordering\Testing;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\MorphTo;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use LogicException;
+use Support\Database\Eloquent\Ordering\Contracts\Ordered;
+use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 
 trait ChangesRowsOnFirstRead
@@ -15,14 +20,18 @@ trait ChangesRowsOnFirstRead
     protected function deleteOnFirstRead(Model $model): void
     {
         if (! method_exists($model, 'getDeletedAtColumn')) {
-            $this->changeOnFirstRead($model, static fn (Model $model): mixed => $model->newQueryWithoutScopes()->whereKey($model->getKey())->toBase()->delete());
+            $this->changeOnFirstRead($model, static fn (Builder $row): mixed => $row->delete());
 
             return;
         }
 
-        $attributes = [$model->getDeletedAtColumn() => $model->freshTimestampString(), OrderedRelation::RANK_KEY => null];
+        $attributes = [$model->getDeletedAtColumn() => $model->freshTimestampString()];
 
-        $this->changeOnFirstRead($model, static fn (Model $model): mixed => $model->newQueryWithoutScopes()->whereKey($model->getKey())->toBase()->update($attributes));
+        if ($model instanceof Ordered) {
+            $attributes[OrderedRelation::RANK_KEY] = null;
+        }
+
+        $this->changeOnFirstRead($model, static fn (Builder $row): mixed => $row->update($attributes));
     }
 
     /**
@@ -33,27 +42,58 @@ trait ChangesRowsOnFirstRead
      */
     protected function moveOnFirstRead(BelongsTo $parent, Model $target): void
     {
-        $attributes = [$parent->getForeignKeyName() => $target->getAttribute($parent->getOwnerKeyName())];
+        $child = $parent->getChild();
+        $owner = $target->getAttribute($parent->getOwnerKeyName() ?? $target->getKeyName());
 
-        $this->changeOnFirstRead($parent->getChild(), static fn (Model $model): mixed => $model->newQueryWithoutScopes()->whereKey($model->getKey())->toBase()->update($attributes));
+        if ($owner === null) {
+            throw new LogicException(sprintf('[%s] has no owner key, so a forged move cannot point a row at it.', $target::class));
+        }
+
+        $membership = [$parent->getForeignKeyName() => $owner];
+
+        if ($parent instanceof MorphTo) {
+            $membership[$parent->getMorphType()] = $target->getMorphClass();
+        }
+
+        $this->changeOnFirstRead($child, static function (Builder $row) use ($child, $membership): mixed {
+            if (! $child instanceof Ordered) {
+                return $row->update($membership);
+            }
+
+            $members = $child->newQueryWithoutScopes()->where($membership);
+
+            if (method_exists($child, 'getDeletedAtColumn')) {
+                $members->whereNull($child->getDeletedAtColumn());
+            }
+
+            $last = $members->max(OrderedRelation::RANK_KEY);
+
+            return $row->update([...$membership, OrderedRelation::RANK_KEY => FractionalIndex::keyBetween(is_string($last) ? $last : null, null)]);
+        });
     }
 
     /**
-     * @param  callable(Model): mixed  $change
+     * @param  callable(Builder): mixed  $change
      */
     private function changeOnFirstRead(Model $model, callable $change): void
     {
+        $key = $model->getKey();
+
+        if ($key === null) {
+            throw new LogicException(sprintf('[%s] has no key, so a forged write cannot find its row.', $model::class));
+        }
+
         $connection = $model->getConnection();
-        $from = 'from '.$connection->getQueryGrammar()->wrapTable($model->getTable());
+        $source = '/\b(?:from|join) '.preg_quote($connection->getQueryGrammar()->wrapTable($model->getTable()), '/').'/';
         $changed = false;
 
-        DB::listen(static function (QueryExecuted $query) use ($model, $change, $connection, $from, &$changed): void {
-            if ($changed || $query->connectionName !== $connection->getName() || ! str_starts_with($query->sql, 'select ') || ! str_contains($query->sql, $from)) {
+        DB::listen(static function (QueryExecuted $query) use ($model, $key, $change, $connection, $source, &$changed): void {
+            if ($changed || $query->connectionName !== $connection->getName() || ! str_starts_with($query->sql, 'select ') || preg_match($source, $query->sql) !== 1) {
                 return;
             }
 
             $changed = true;
-            $change($model);
+            $change($model->newQueryWithoutScopes()->whereKey($key)->toBase());
         });
     }
 }

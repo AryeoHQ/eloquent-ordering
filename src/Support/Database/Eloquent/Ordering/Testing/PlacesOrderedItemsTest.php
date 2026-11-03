@@ -45,6 +45,17 @@ class PlacesOrderedItemsTest extends TestCase
     }
 
     #[Test]
+    public function it_places_each_item_of_a_count_in_turn(): void
+    {
+        $section = Section::query()->create();
+        $anchor = Asset::factory()->for($section)->create();
+
+        $made = Asset::factory()->count(2)->for($section)->placedAt(Placement::after($anchor->id))->create();
+
+        $this->assertSame([$anchor->id, $made[1]->id, $made[0]->id], $this->order($section));
+    }
+
+    #[Test]
     public function it_refuses_a_placement_that_names_a_parent(): void
     {
         $section = Section::query()->create();

@@ -4,12 +4,25 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Ordering\Testing;
 
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use LogicException;
 use PHPUnit\Framework\Attributes\CoversTrait;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
+use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
+use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Customers\Customerable;
+use Tests\Fixtures\Support\Drawers\Drawer;
+use Tests\Fixtures\Support\Listings\Listing;
+use Tests\Fixtures\Support\Notes\Note;
+use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
+use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Videos\Video;
 use Tests\TestCase;
 
@@ -23,14 +36,12 @@ class ChangesRowsOnFirstReadTest extends TestCase
     {
         $section = Section::query()->create();
         $asset = Asset::query()->create(['section_id' => $section->id]);
-        $other = Asset::query()->create(['section_id' => $section->id]);
 
         $this->deleteOnFirstRead($asset);
 
         Section::query()->findOrFail($section->id);
-        $this->assertNull($this->stored($asset)->deleted_at);
+        $this->assertFalse(Asset::query()->findOrFail($asset->id)->trashed());
 
-        Asset::query()->findOrFail($other->id);
         $stored = $this->stored($asset);
         $this->assertNotNull($stored->deleted_at);
         $this->assertNull($stored->rank_key);
@@ -49,6 +60,24 @@ class ChangesRowsOnFirstReadTest extends TestCase
     }
 
     #[Test]
+    public function it_trashes_an_unordered_parent_so_that_a_create_into_it_is_refused(): void
+    {
+        $created = Drawer::query()->create();
+
+        $this->deleteOnFirstRead($created);
+        $drawer = Drawer::query()->findOrFail($created->id);
+
+        try {
+            $note = new Note;
+            $note->drawer()->associate($drawer);
+            $note->save();
+            $this->fail('The create placed a member in a trashed parent.');
+        } catch (UnavailableParent $refused) {
+            $this->assertSame(UnavailableParent::TRASHED, $refused->reason);
+        }
+    }
+
+    #[Test]
     public function it_changes_the_row_only_once(): void
     {
         $section = Section::query()->create();
@@ -64,6 +93,60 @@ class ChangesRowsOnFirstReadTest extends TestCase
     }
 
     #[Test]
+    public function it_changes_the_row_on_a_read_that_joins_its_table(): void
+    {
+        $tour = Tour::query()->create();
+        $tour->customers()->attach(Customer::query()->create()->id);
+        $pivot = Customerable::query()->sole();
+
+        $this->deleteOnFirstRead($pivot);
+        DB::table('customers')->join('customerables', 'customerables.customer_id', '=', 'customers.id')->get();
+
+        $this->assertNotNull($this->stored($pivot)->deleted_at);
+    }
+
+    #[Test]
+    public function it_changes_the_row_on_a_read_that_nests_its_table_in_a_subquery(): void
+    {
+        $section = Section::query()->create();
+        $asset = Asset::query()->create(['section_id' => $section->id]);
+
+        $this->deleteOnFirstRead($asset);
+        DB::query()->fromSub(DB::table('assets')->select('id'), 'nested')->get();
+
+        $this->assertNotNull($this->stored($asset)->deleted_at);
+    }
+
+    #[Test]
+    public function it_ignores_a_read_of_a_table_whose_name_extends_the_rows_table(): void
+    {
+        Schema::create('assets_archive', static function (Blueprint $table): void {
+            $table->id();
+        });
+        $section = Section::query()->create();
+        $asset = Asset::query()->create(['section_id' => $section->id]);
+
+        $this->deleteOnFirstRead($asset);
+        DB::table('assets_archive')->get();
+
+        $this->assertFalse(Asset::query()->findOrFail($asset->id)->trashed());
+        $this->assertNotNull($this->stored($asset)->deleted_at);
+    }
+
+    #[Test]
+    public function it_refuses_a_model_that_has_no_key(): void
+    {
+        $tour = Tour::query()->create();
+        $tour->customers()->attach(Customer::query()->create()->id);
+        $pivot = $tour->customers()->firstOrFail()->getRelation('pivot');
+        $this->assertInstanceOf(Model::class, $pivot);
+
+        $this->expectException(LogicException::class);
+
+        $this->deleteOnFirstRead($pivot);
+    }
+
+    #[Test]
     public function it_moves_the_row_to_the_target_on_the_first_read_of_its_table(): void
     {
         [$source, $target] = [Section::query()->create(), Section::query()->create()];
@@ -73,6 +156,47 @@ class ChangesRowsOnFirstReadTest extends TestCase
         Asset::query()->find($asset->id);
 
         $this->assertSame($target->id, $this->stored($asset)->section_id);
+    }
+
+    #[Test]
+    public function it_moves_the_row_after_the_last_member_of_the_target(): void
+    {
+        [$source, $target] = [Section::query()->create(), Section::query()->create()];
+        $asset = Asset::query()->create(['section_id' => $source->id]);
+        $member = Asset::query()->create(['section_id' => $target->id]);
+
+        $this->moveOnFirstRead($asset->section(), $target);
+        Asset::query()->find($asset->id);
+
+        $stored = $this->stored($asset);
+        $this->assertSame($target->id, $stored->section_id);
+        $this->assertSame(FractionalIndex::keyBetween($this->stored($member)->rank_key, null), $stored->rank_key);
+    }
+
+    #[Test]
+    public function it_moves_a_morph_child_to_a_parent_of_another_type(): void
+    {
+        [$tour, $listing] = [Tour::query()->create(), Listing::query()->create()];
+        $scene = $tour->scenes()->create();
+        $listing->scenes()->create();
+
+        $this->moveOnFirstRead($scene->sceneable(), $listing);
+        Scene::query()->find($scene->id);
+
+        $stored = $this->stored($scene);
+        $this->assertSame($listing->getMorphClass(), $stored->sceneable_type);
+        $this->assertSame($listing->id, $stored->sceneable_id);
+    }
+
+    #[Test]
+    public function it_refuses_a_target_that_has_no_key(): void
+    {
+        $section = Section::query()->create();
+        $asset = Asset::query()->create(['section_id' => $section->id]);
+
+        $this->expectException(LogicException::class);
+
+        $this->moveOnFirstRead($asset->section(), new Section);
     }
 
     #[Test]
@@ -106,9 +230,9 @@ class ChangesRowsOnFirstReadTest extends TestCase
         }
     }
 
-    private function stored(Asset $asset): object
+    private function stored(Model $model): object
     {
-        $row = DB::table('assets')->where('id', $asset->id)->first();
+        $row = DB::table($model->getTable())->where($model->getKeyName(), $model->getKey())->first();
         $this->assertNotNull($row);
 
         return $row;
