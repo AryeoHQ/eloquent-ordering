@@ -113,23 +113,6 @@ class ReorderedTest extends TestCase
                 },
                 2,
             ],
-            'a move in' => [
-                function (Shape $shape): Closure {
-                    [, $members] = $shape->with(3);
-                    [$destination] = $shape->with(1);
-
-                    return fn (): mixed => $shape->relation($destination)->moveIn([$members[2], $members[0]], expected: null);
-                },
-                2,
-            ],
-            'a create in order' => [
-                function (Shape $shape): Closure {
-                    [$parent] = $shape->with(1);
-
-                    return fn (): mixed => $shape->relation($parent)->createInOrder([['visible' => true], ['visible' => true]]);
-                },
-                1,
-            ],
             'a reorder' => [
                 function (Shape $shape): Closure {
                     [$parent, $members] = $shape->with(3);
@@ -162,6 +145,32 @@ class ReorderedTest extends TestCase
                     assert(method_exists($members[1], 'restore'));
 
                     return fn (): mixed => $members[1]->restore();
+                },
+                1,
+            ],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
+    public static function batchWrites(): iterable
+    {
+        return Shape::crossed([
+            'a move in' => [
+                function (Shape $shape): Closure {
+                    [, $members] = $shape->with(3);
+                    [$destination] = $shape->with(1);
+
+                    return fn (): mixed => $shape->relation($destination)->moveIn([$members[2], $members[0]], expected: null);
+                },
+                2,
+            ],
+            'a create in order' => [
+                function (Shape $shape): Closure {
+                    [$parent] = $shape->with(1);
+
+                    return fn (): mixed => $shape->relation($parent)->createInOrder([['visible' => true], ['visible' => true]]);
                 },
                 1,
             ],
@@ -492,17 +501,7 @@ class ReorderedTest extends TestCase
     #[Test]
     public function it_dispatches_one_event_for_each_collection_a_move_in_changes(Shape $shape, int $count): void
     {
-        $sources = [];
-        $moved = [];
-
-        foreach ([intdiv($count + 1, 2), intdiv($count, 2)] as $leaving) {
-            if ($leaving > 0) {
-                [$source, $members] = $shape->with($leaving + 1);
-                $sources[] = [$source, array_slice($members, 0, $leaving)];
-                array_push($moved, ...array_slice($members, 0, $leaving));
-            }
-        }
-
+        [$sources, $moved] = $this->sourcesOf($shape, $count);
         [$destination, [$kept]] = $shape->with(1);
         $this->forget();
 
@@ -840,6 +839,7 @@ class ReorderedTest extends TestCase
      * @param  Closure(Shape): (Closure(): mixed)  $prepare
      */
     #[DataProvider('writes')]
+    #[DataProvider('batchWrites')]
     #[Test]
     public function it_dispatches_after_the_outer_transaction_commits(Shape $shape, Closure $prepare, int $count): void
     {
@@ -860,6 +860,7 @@ class ReorderedTest extends TestCase
      * @param  Closure(Shape): (Closure(): mixed)  $prepare
      */
     #[DataProvider('writes')]
+    #[DataProvider('batchWrites')]
     #[Test]
     public function it_dispatches_no_event_for_a_write_that_rolls_back(Shape $shape, Closure $prepare, int $count): void
     {
@@ -914,6 +915,25 @@ class ReorderedTest extends TestCase
         $this->assertSame($change, $this->dispatched[0]->change);
         $this->assertSame([['id' => $this->key($third), 'position' => 2, 'previousPosition' => 3]], array_map(get_object_vars(...), $change->changed));
         $this->assertSame(3, $this->updated);
+    }
+
+    /**
+     * @return array{list<array{Model, list<Model&Ordered>}>, list<Model&Ordered>}
+     */
+    private function sourcesOf(Shape $shape, int $count): array
+    {
+        $sources = [];
+        $moved = [];
+
+        foreach ([intdiv($count + 1, 2), intdiv($count, 2)] as $leaving) {
+            if ($leaving > 0) {
+                [$source, $members] = $shape->with($leaving + 1);
+                $sources[] = [$source, array_slice($members, 0, $leaving)];
+                array_push($moved, ...array_slice($members, 0, $leaving));
+            }
+        }
+
+        return [$sources, $moved];
     }
 
     private function forget(): void
