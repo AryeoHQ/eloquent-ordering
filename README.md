@@ -366,7 +366,9 @@ $asset->save();                                                  // after the an
 
 An anchor must be a current member of the same parent. Otherwise `InvalidAnchor` (`InvalidArgumentException`) is thrown. `placeAt()` throws `LogicException` for a saved item, and for a placement that names a parent. A create takes no `expected`, because it leaves no parent.
 
-**Create several items at once with `createInOrder()`.** It creates each record through the relation's `create()`, in the order given, after every member. It runs in one transaction and dispatches one `Reordered` for the parent, which lists every new member. The keys come from one `FractionalIndex::keysBetween()` call. It returns the created models, as `createMany()` does. For a pivot relation each record holds the related model's attributes, and the relation attaches it. A trashed or missing parent throws `UnavailableParent`, and nothing is created.
+**Create several items at once with `createInOrder()`.** It creates each record through the relation, as the relation's `create()` does, in the order given, after every member. It runs in one transaction and dispatches one `Reordered` for the parent, which lists every new member. The keys come from one `FractionalIndex::keysBetween()` call. When another write in the same transaction takes a key at the end of the parent, the remaining keys come from one more call. It returns the created models, as `createMany()` does. For a pivot relation each record holds the related model's attributes, and the relation attaches it. A trashed or missing parent throws `UnavailableParent`, and nothing is created. An empty list returns an empty collection, and locks and checks nothing.
+
+A create that a listener makes during `createInOrder()` joins no batch. It takes the key for its own placement and dispatches its own `Reordered`. A nested `createInOrder()` on the same parent also dispatches its own `Reordered`, which lists only its own records.
 
 ## Moving an item
 
@@ -408,11 +410,11 @@ $change = $destination->assets()->moveIn([$third, $first], expected: $digest, pl
 
 `moveIn(iterable $items, ?string $expected, ?Placement $placement = null)` moves every item to one placement in the relation's parent, in the order given. The items can come from any parents, including this one. `null` places them last. The placement names no parent, because the relation names the destination. Pass the item class: the pivot for a pivot relation.
 
-`expected` is required, and holds the order revision of the destination. It works as `move()`'s does, so it also throws `StaleConcurrencyRevision` for an item read from a parent it has since left. `null` skips both checks.
+`expected` is required, and holds the order revision of the destination. It works as `move()`'s does. An item whose instance names a parent that the item no longer has throws `StaleConcurrencyRevision`, as `move()` does. `expected: null` skips both checks and moves each item from its stored parent.
 
 `moveIn()` reads each item's stored parent. It then locks the destination, each source parent, and every ordering parent above them, in the order that `lockedMembers()` uses. Under the locks it re-reads the stored rows of the items and of every ordered model that it locked. It starts again when one of them moved meanwhile. After 5 attempts it throws `ContendedOrder`, which names the destination. Before it writes, it throws `NotAMember` with the id of every item that its order no longer holds. A trashed or missing destination throws `UnavailableParent`, unless every item is already in it. An anchor among the moved items throws `InvalidAnchor`. An unsaved item, an item of another class or connection, and an item named twice throw `LogicException`.
 
-It returns the destination's `OrderChange`. `changed` lists each moved item whose position in the destination changed, and an item that enters has a `null` `previousPosition`. `source` holds the source's change when the items came from exactly one other parent, and `null` otherwise. Each item instance gets its new `position`, its new foreign key, and the destination as its loaded parent relation. A call that keeps the order writes nothing and dispatches nothing.
+It returns the destination's `OrderChange`. `changed` lists each moved item whose position in the destination changed, and an item that enters has a `null` `previousPosition`. A named item whose position stays the same is not in `changed`, as in `arrange()`. `source` holds the source's change only when exactly one other parent gave items. With several, `source` is `null`, and each source's change reaches its own `Reordered`. Each item instance gets its new `position`, its new foreign key, and the destination as its loaded parent relation. A call that keeps the order writes nothing and dispatches nothing.
 
 ## Reordering a parent
 

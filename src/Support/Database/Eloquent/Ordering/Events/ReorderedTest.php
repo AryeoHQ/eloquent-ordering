@@ -596,6 +596,35 @@ class ReorderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
+    public function it_dispatches_one_event_for_each_collection_of_a_move_in_that_rebalances_with_an_entering_member(Shape $shape): void
+    {
+        [$source, [$entering]] = $shape->with(1);
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $shape->crowd($first, $second);
+        $this->forget();
+
+        $change = $shape->relation($parent)->moveIn([$entering, $third], expected: null, placement: Placement::after($this->key($first)));
+
+        $this->assertLessThan(OrderedRelation::MAX_KEY_LENGTH, $shape->longestRankKey($parent));
+        $this->assertCount(2, $this->dispatched);
+        $this->assertSame($source, $this->dispatched[0]->change->parent);
+        $this->assertSame(
+            [['id' => $this->key($entering), 'position' => null, 'previousPosition' => 1]],
+            array_map(get_object_vars(...), $this->dispatched[0]->change->changed),
+        );
+        $this->assertSame($change, $this->dispatched[1]->change);
+        $this->assertSame($this->dispatched[0]->change, $change->source);
+        $this->assertSame([$first->getKey(), $entering->getKey(), $third->getKey(), $second->getKey()], $change->order);
+        $this->assertSame($change->order, $shape->members($parent));
+        $this->assertSame(
+            [['id' => $this->key($entering), 'position' => 2, 'previousPosition' => null]],
+            array_map(get_object_vars(...), $change->changed),
+        );
+        $this->assertSame([], $shape->members($source));
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
     public function it_dispatches_one_event_for_a_reorder(Shape $shape): void
     {
         [$parent, $members] = $shape->with(3);

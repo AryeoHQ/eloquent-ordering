@@ -77,7 +77,7 @@ trait IsOrdered
             $relation = $item->currentOrderedRelation();
             $relation = array_find($item->lockedOrderedRelations, static fn (OrderedRelation $locked): bool => $locked->is($relation)) ?? $relation;
 
-            $item->assignRankKey($relation->keyForCreate($item->placement ?? Placement::last()));
+            $item->assignRankKey($relation->keyForCreate($item, $item->placement ?? Placement::last()));
             OrderedRelation::prepared($item);
         });
 

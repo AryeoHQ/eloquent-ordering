@@ -15,6 +15,7 @@ use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Database\Events\TransactionBeginning;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Query\JoinClause;
@@ -25,6 +26,7 @@ use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use RuntimeException;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
@@ -1129,6 +1131,150 @@ class OrderedRelationTest extends TestCase
         }
 
         $this->assertEquals($before, DB::table('notes')->orderBy('id')->get()->all());
+    }
+
+    #[Test]
+    public function it_creates_nothing_in_order_from_no_records_without_a_query_even_in_a_trashed_parent(): void
+    {
+        $trashed = Drawer::create();
+        $trashed->delete();
+        $this->recordReorders();
+        $statements = 0;
+        DB::listen(function () use (&$statements): void {
+            $statements++;
+        });
+        Event::listen(TransactionBeginning::class, function () use (&$statements): void {
+            $statements++;
+        });
+
+        $created = $trashed->notes()->createInOrder([]);
+
+        $this->assertCount(0, $created);
+        $this->assertSame(0, $statements);
+        $this->assertSame([], $this->reorders);
+    }
+
+    #[Test]
+    public function it_places_a_create_that_a_listener_makes_during_a_create_in_order_at_its_own_placement(): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $listened = [];
+        Note::created(function () use ($drawer, &$listened): void {
+            if ($listened === []) {
+                $listened[] = $note = $drawer->notes()->make()->placeAt(Placement::first());
+                $note->save();
+            }
+        });
+        $this->recordReorders();
+
+        [$one, $two] = $this->createNotesInOrder($drawer, 2);
+
+        $this->assertCount(1, $listened);
+        $this->assertSame([$listened[0]->id, $first->id, $one, $two], $this->noteIds($drawer));
+        $this->assertSame([
+            [$drawer->id, [[$listened[0]->id, 1, null]]],
+            [$drawer->id, [[$one, 3, null], [$two, 4, null]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_reports_a_nested_create_in_order_in_its_own_event(): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $nested = null;
+        Note::created(function () use ($drawer, &$nested): void {
+            if ($nested === null) {
+                $nested = [];
+                $nested = $this->createNotesInOrder($drawer, 2);
+            }
+        });
+        $this->recordReorders();
+
+        [$outerOne, $outerTwo] = $this->createNotesInOrder($drawer, 2);
+
+        $this->assertIsArray($nested);
+        $this->assertCount(2, $nested);
+        [$innerOne, $innerTwo] = $nested;
+        $this->assertSame([$first->id, $outerOne, $innerOne, $innerTwo, $outerTwo], $this->noteIds($drawer));
+        $this->assertSame([
+            [$drawer->id, [[$innerOne, 3, null], [$innerTwo, 4, null]]],
+            [$drawer->id, [[$outerOne, 2, null], [$outerTwo, 5, null]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_creates_in_order_after_a_listener_moves_a_member_to_the_end(): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $moved = false;
+        Note::created(function () use ($first, &$moved): void {
+            if (! $moved) {
+                $moved = true;
+                $first->move(Placement::last(), expected: null);
+            }
+        });
+        $this->recordReorders();
+
+        [$one, $two] = $this->createNotesInOrder($drawer, 2);
+
+        $this->assertSame([$one, $first->id, $two], $this->noteIds($drawer));
+        $this->assertSame([
+            [$drawer->id, [[$first->id, 2, 1]]],
+            [$drawer->id, [[$one, 1, null], [$two, 3, null]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_places_a_single_create_after_a_create_in_order_that_failed_midway(): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $creates = 0;
+        Note::creating(function () use (&$creates): void {
+            throw_if(++$creates === 2, RuntimeException::class, 'The second record fails.');
+        });
+
+        try {
+            $drawer->notes()->createInOrder([[], [], []]);
+            $this->fail('A create in order that failed midway returned.');
+        } catch (RuntimeException $exception) {
+            $this->assertSame('The second record fails.', $exception->getMessage());
+        }
+
+        $this->assertSame([$first->id], $this->noteIds($drawer));
+        $this->recordReorders();
+
+        $single = $drawer->notes()->create();
+
+        $this->assertSame([$first->id, $single->id], $this->noteIds($drawer));
+        $this->assertSame(2, $single->position);
+        $this->assertSame([[$drawer->id, [[$single->id, 2, null]]]], $this->reorders);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_moves_members_of_several_parents_in_against_the_destination_digest(Shape $shape): void
+    {
+        [$first, [$a0]] = $shape->with(1);
+        [$second, [$b0]] = $shape->with(1);
+        [$destination] = $shape->with(1);
+        $stale = $shape->digest($destination);
+        $shape->add($destination);
+        $before = [$shape->rankKeys($first), $shape->rankKeys($second)];
+
+        $this->assertRejected($shape, StaleConcurrencyRevision::class, $destination, fn (): mixed => $shape->relation($destination)->moveIn([$a0, $b0], expected: $stale));
+        $this->assertSame($before, [$shape->rankKeys($first), $shape->rankKeys($second)]);
+
+        $change = $shape->relation($destination)->moveIn([$b0, $a0], expected: $shape->digest($destination));
+
+        $this->assertSame([$b0->getKey(), $a0->getKey()], array_slice($change->order, 2));
+        $this->assertSame($change->order, $shape->members($destination));
+        $this->assertSame([[], []], [$shape->members($first), $shape->members($second)]);
+        $this->assertNull($change->source);
+        $this->assertSame($shape->digest($destination), $change->digest);
     }
 
     #[DataProvider('shapes')]
@@ -2269,6 +2415,22 @@ class OrderedRelationTest extends TestCase
     private function createdMembers(Shape $shape, Model $parent, array $created): array
     {
         return array_map(fn (Model $model): int|string => $this->key($shape instanceof PivotShape && $model instanceof Customer ? $shape->pivotOf($parent, $model) : $model), $created);
+    }
+
+    /**
+     * @return list<int|string>
+     */
+    private function createNotesInOrder(Drawer $drawer, int $count): array
+    {
+        return array_map($this->key(...), $drawer->notes()->createInOrder(array_fill(0, $count, []))->all());
+    }
+
+    /**
+     * @return list<int>
+     */
+    private function noteIds(Drawer $drawer): array
+    {
+        return DB::table('notes')->where('drawer_id', $drawer->id)->whereNull('deleted_at')->orderBy('rank_key')->pluck('id')->map(fn (mixed $id): int => (int) $id)->all();
     }
 
     private function addNote(Drawer $drawer, string $connection): Note

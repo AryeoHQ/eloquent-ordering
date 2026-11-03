@@ -132,6 +132,8 @@ final class OrderedRelation
     /** @var list<string> */
     private array $pendingKeys = [];
 
+    private null|Model|int|string $claimed = null;
+
     /** @var list<int|string> */
     private array $created = [];
 
@@ -692,6 +694,10 @@ final class OrderedRelation
     {
         throw_unless($this->parent->exists, LogicException::class, sprintf('[%s] must be saved before it orders a member.', $this->parent::class));
 
+        if ($records === []) {
+            return new Collection;
+        }
+
         return $this->parent->getConnection()->transaction(function () use ($records): Collection {
             self::lockAll([$this]);
             $this->refuseUnavailable();
@@ -702,7 +708,7 @@ final class OrderedRelation
             self::$creating[] = $this;
 
             try {
-                $models = array_map(static fn (array $record): Model => $relation->create($record), $records);
+                $models = array_map(fn (array $record): Model => $this->createClaimed($relation, $record), $records);
             } finally {
                 self::$creating = array_values(array_filter(self::$creating, fn (self $relation): bool => $relation !== $this));
                 $this->pendingKeys = [];
@@ -762,11 +768,9 @@ final class OrderedRelation
     /**
      * @internal
      */
-    public function keyForCreate(Placement $placement): string
+    public function keyForCreate(Model&Ordered $item, Placement $placement): string
     {
-        $batch = array_find(self::$creating, fn (self $relation): bool => $relation->is($this));
-
-        return $batch === null || $batch->pendingKeys === [] ? $this->keyAt($placement) : array_shift($batch->pendingKeys);
+        return $this->batchOf($item)?->nextPendingKey() ?? $this->keyAt($placement);
     }
 
     /**
@@ -774,7 +778,7 @@ final class OrderedRelation
      */
     public function placed(Model&Ordered $item): void
     {
-        $batch = array_find(self::$creating, fn (self $relation): bool => $relation->is($this));
+        $batch = $this->batchOf($item);
 
         if ($batch !== null) {
             $batch->created[] = self::keyOf($item);
@@ -2823,6 +2827,56 @@ final class OrderedRelation
         }
 
         return $upper === null || ($previous !== null && strcmp($previous, $upper) < 0);
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     * @param  array<string, mixed>  $record
+     */
+    private function createClaimed(HasMany|MorphMany|BelongsToMany $relation, array $record): Model
+    {
+        try {
+            if (! $relation instanceof BelongsToMany) {
+                $model = $this->claimed = $relation->make($record);
+                $model->save();
+
+                return $model;
+            }
+
+            $model = $relation->getRelated()->newInstance(array_merge($relation->getQuery()->pendingAttributes, $record));
+            $model->save(['touch' => false]);
+            $related = $model->getAttribute($relation->getRelatedKeyName());
+            $this->claimed = is_int($related) || is_string($related) ? $related : throw new LogicException(sprintf('[%s] has no key.', $model::class));
+            $relation->attach($model);
+
+            return $model;
+        } finally {
+            $this->claimed = null;
+        }
+    }
+
+    private function batchOf(Model&Ordered $item): null|self
+    {
+        return array_find(self::$creating, fn (self $batch): bool => $batch->is($this) && $batch->claims($item));
+    }
+
+    private function claims(Model&Ordered $item): bool
+    {
+        return $this->claimed instanceof Model
+            ? $this->claimed === $item
+            : $this->claimed !== null && $this->keys->relatedKey !== null && self::sameKey($item->getAttribute($this->keys->relatedKey), $this->claimed);
+    }
+
+    private function nextPendingKey(): string
+    {
+        [$last] = $this->bounds(Placement::last(), [], $this->indexedRows(...));
+        $next = $this->pendingKeys[0] ?? null;
+
+        if ($next === null || ($last !== null && strcmp($next, $last) <= 0)) {
+            $this->pendingKeys = $this->keysAt(Placement::last(), [], max(1, count($this->pendingKeys)));
+        }
+
+        return array_shift($this->pendingKeys) ?? throw new LogicException('A create in order ran out of keys.');
     }
 
     /**
