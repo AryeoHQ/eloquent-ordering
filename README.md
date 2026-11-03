@@ -169,7 +169,12 @@ $section->assets()->arrange([$thirdId, $firstId, $secondId], expected: $digest);
 
 `arrange()` is a macro on every Eloquent relation. It resolves the declaration by the ordered item class: the related class of a HasMany or MorphMany, and the pivot class of a BelongsToMany or MorphToMany. The relation must also match the declared relation's keys: the foreign key, the owner key, and the morph type and class. A pivot relation must also match the pivot table, the related pivot key, the related table, and the related key. A relation that orders nothing throws `LogicException`.
 
-PHPStan reports a macro call such as `arrange()` as a dynamic call to a static method. The package's `tooling/phpstan/rules.neon` already suppresses that error for consumers, so an adopter adds nothing.
+PHPStan reports a macro call such as `arrange()` as a dynamic call to a static method. The package registers `tooling/phpstan/rules.neon` under `extra.tooling.phpstan.rules`, so an adopter on `aryeo/tooling-laravel` gets its suppression with no change. Any other PHPStan setup includes it in `phpstan.neon`:
+
+```neon
+includes:
+    - vendor/aryeo/eloquent-ordering/tooling/phpstan/rules.neon
+```
 
 ## Supported shapes
 
