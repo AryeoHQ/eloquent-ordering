@@ -16,6 +16,7 @@ use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Illuminate\Database\Events\QueryExecuted;
 use Illuminate\Database\Events\TransactionBeginning;
+use Illuminate\Database\Migrations\Migrator;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Query\JoinClause;
@@ -1449,6 +1450,158 @@ class OrderedRelationTest extends TestCase
     }
 
     #[Test]
+    public function it_touches_each_member_of_a_move_in_by_its_own_timestamps_setting(): void
+    {
+        [$source, $destination] = [Drawer::create(), Drawer::create()];
+        $notes = [$this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql')];
+        $notes[1]->timestamps = false;
+        $notes[2]->timestamps = false;
+        $stamps = fn (): array => array_map(fn (Note $note): mixed => DB::table('notes')->where('id', $note->id)->value('updated_at'), $notes);
+        $before = $stamps();
+        $this->travel(1)->days();
+
+        $destination->notes()->moveIn([$notes[0], $notes[1]], expected: null);
+        $destination->notes()->moveIn([$notes[2], $notes[3]], expected: null);
+
+        $after = $stamps();
+        $this->assertSame(array_map(fn (Note $note): int => $note->id, $notes), $this->noteIds($destination));
+        $this->assertSame([false, true, true, false], array_map(fn (mixed $stamp, int $index): bool => $stamp === $before[$index], $after, array_keys($after)));
+    }
+
+    #[Test]
+    public function it_moves_in_after_a_listener_appends_a_member_while_the_first_member_saves(): void
+    {
+        [$source, $destination] = [Drawer::create(), Drawer::create()];
+        $resident = $this->addNote($destination, 'pgsql');
+        [$one, $two] = [$this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql')];
+        $appended = null;
+        Note::updated(function (Note $note) use ($destination, $one, &$appended): void {
+            if ($appended === null && $note->id === $one->id) {
+                $appended = $this->addNote($destination, 'pgsql');
+            }
+        });
+        $this->recordReorders();
+
+        $change = $destination->notes()->moveIn([$one, $two], expected: null);
+
+        $this->assertInstanceOf(Note::class, $appended);
+        $this->assertSame([$resident->id, $one->id, $appended->id, $two->id], $this->noteIds($destination));
+        $this->assertSame($this->noteIds($destination), $change->order);
+        $this->assertSame([2, 4], [$one->position, $two->position]);
+        $this->assertSame([
+            [$destination->id, [[$appended->id, 3, null]]],
+            [$source->id, [[$one->id, null, 1], [$two->id, null, 2]]],
+            [$destination->id, [[$one->id, 2, null], [$two->id, 4, null]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_rearranges_members_after_a_listener_appends_a_member_while_the_first_member_saves(): void
+    {
+        $drawer = Drawer::create();
+        [$one, $two, $resident] = [$this->addNote($drawer, 'pgsql'), $this->addNote($drawer, 'pgsql'), $this->addNote($drawer, 'pgsql')];
+        $appended = null;
+        Note::updated(function (Note $note) use ($drawer, $one, &$appended): void {
+            if ($appended === null && $note->id === $one->id) {
+                $appended = $this->addNote($drawer, 'pgsql');
+            }
+        });
+        $this->recordReorders();
+
+        $change = $drawer->notes()->moveIn([$one, $two], expected: null);
+
+        $this->assertInstanceOf(Note::class, $appended);
+        $this->assertSame([$resident->id, $one->id, $appended->id, $two->id], $this->noteIds($drawer));
+        $this->assertSame($this->noteIds($drawer), $change->order);
+        $this->assertSame([
+            [$drawer->id, [[$appended->id, 3, null]]],
+            [$drawer->id, [[$one->id, 2, 1], [$two->id, 4, 2]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_leaves_a_pivot_attached_on_another_connection_during_a_create_in_order_to_its_own_order(): void
+    {
+        $this->withElsewhere(function (): void {
+            $listing = Listing::create();
+            $elsewhere = Listing::on('elsewhere')->forceCreate(['id' => $listing->id]);
+            new ListingCustomer;
+            $attached = false;
+            ListingCustomer::creating(function (ListingCustomer $pivot) use ($elsewhere, &$attached): void {
+                if (! $attached) {
+                    $attached = true;
+                    Customer::on('elsewhere')->forceCreate(['id' => $pivot->customer_id]);
+                    $elsewhere->customers()->attach($pivot->customer_id);
+                }
+            });
+            $events = [];
+            Event::listen(Reordered::class, function (Reordered $event) use (&$events): void {
+                $events[] = [$event->change->parent->getConnection()->getName(), array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position], $event->change->changed)];
+            });
+
+            $listing->customers()->createInOrder([[], []]);
+
+            $pivots = DB::table('listing_customer')->where('listing_id', $listing->id)->orderBy('rank_key')->pluck('id')->all();
+            $attachedPivot = DB::connection('elsewhere')->table('listing_customer')->value('id');
+            $this->assertCount(2, $pivots);
+            $this->assertSame([
+                ['elsewhere', [[$attachedPivot, 1]]],
+                ['pgsql', [[$pivots[0], 1], [$pivots[1], 2]]],
+            ], $events);
+        });
+    }
+
+    #[Test]
+    public function it_places_a_create_that_a_creating_listener_makes_after_the_create_it_interrupts(): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $inner = null;
+        Note::creating(function () use ($drawer, &$inner): void {
+            if ($inner === null) {
+                $inner = false;
+                $inner = $this->addNote($drawer, 'pgsql');
+            }
+        });
+        $this->recordReorders();
+
+        $outer = $this->addNote($drawer, 'pgsql');
+
+        $this->assertInstanceOf(Note::class, $inner);
+        $this->assertSame([$first->id, $outer->id, $inner->id], $this->noteIds($drawer));
+        $this->assertSame([
+            [$drawer->id, [[$inner->id, 2, null]]],
+            [$drawer->id, [[$outer->id, 2, null]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
+    public function it_reports_a_create_in_order_that_a_creating_listener_nests_in_its_own_event(): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $nested = null;
+        Note::creating(function () use ($drawer, &$nested): void {
+            if ($nested === null) {
+                $nested = [];
+                $nested = $this->createNotesInOrder($drawer, 2);
+            }
+        });
+        $this->recordReorders();
+
+        [$outerOne, $outerTwo] = $this->createNotesInOrder($drawer, 2);
+
+        $this->assertIsArray($nested);
+        $this->assertCount(2, $nested);
+        [$innerOne, $innerTwo] = $nested;
+        $this->assertSame([$first->id, $outerOne, $innerOne, $innerTwo, $outerTwo], $this->noteIds($drawer));
+        $this->assertSame([
+            [$drawer->id, [[$innerOne, 2, null], [$innerTwo, 3, null]]],
+            [$drawer->id, [[$outerOne, 2, null], [$outerTwo, 5, null]]],
+        ], $this->reorders);
+    }
+
+    #[Test]
     public function it_places_a_single_create_after_a_create_in_order_that_failed_midway(): void
     {
         $drawer = Drawer::create();
@@ -2652,6 +2805,35 @@ class OrderedRelationTest extends TestCase
     private function noteIds(Drawer $drawer): array
     {
         return DB::table('notes')->where('drawer_id', $drawer->id)->whereNull('deleted_at')->orderBy('rank_key')->pluck('id')->map(fn (mixed $id): int => (int) $id)->all();
+    }
+
+    /**
+     * @param  Closure(): void  $test
+     */
+    private function withElsewhere(Closure $test): void
+    {
+        config()->set('database.connections.elsewhere', [...config()->array('database.connections.pgsql'), 'search_path' => 'elsewhere,public']);
+        $connection = DB::connection('elsewhere');
+        $connection->statement('drop schema if exists elsewhere cascade');
+        $connection->statement('create schema elsewhere');
+
+        try {
+            $migrator = $this->app?->make('migrator');
+            $this->assertInstanceOf(Migrator::class, $migrator);
+            $migrator->usingConnection('elsewhere', function () use ($migrator): void {
+                $migrator->getRepository()->createRepository();
+                $migrator->run(array_map(fn (string $migration): string => dirname(__DIR__, 5).'/tests/Fixtures/Support/Migrations/'.$migration.'.php', [
+                    '2026_10_24_000013_create_listings_table',
+                    '2026_10_24_000014_create_customers_table',
+                    '2026_10_24_000016_create_listing_customer_table',
+                ]));
+            });
+
+            $test();
+        } finally {
+            $connection->statement('drop schema elsewhere cascade');
+            DB::purge('elsewhere');
+        }
     }
 
     private function addNote(Drawer $drawer, string $connection): Note

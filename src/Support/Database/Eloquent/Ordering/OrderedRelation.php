@@ -117,6 +117,9 @@ final class OrderedRelation
     /** @var list<self> */
     private static array $creating = [];
 
+    /** @var null|WeakMap<Model, array{self, string}> */
+    private static null|WeakMap $inFlight = null;
+
     private readonly string $relationName;
 
     private readonly RelationKeys $keys;
@@ -773,7 +776,11 @@ final class OrderedRelation
      */
     public function keyForCreate(Model&Ordered $item, Placement $placement): string
     {
-        return $this->batchOf($item)?->nextPendingKey() ?? $this->keyAt($placement);
+        $key = $this->batchOf($item)?->nextPendingKey() ?? $this->keyAt($placement);
+        self::$inFlight ??= new WeakMap;
+        self::$inFlight[$item] = [$this, $key];
+
+        return $key;
     }
 
     /**
@@ -2232,22 +2239,66 @@ final class OrderedRelation
         );
 
         if ($placement->first) {
-            return [null, self::keyOrNull($others($rows())->min($rankKey))];
+            return $this->besideInFlight([null, self::keyOrNull($others($rows())->min($rankKey))], upper: true);
         }
 
         if ($placement->before !== null) {
             $anchor = $this->anchor($others($this->members()), $placement->before);
 
-            return [self::keyOrNull($others($rows())->where($rankKey, '<', $anchor)->max($rankKey)), $anchor];
+            return $this->besideInFlight([self::keyOrNull($others($rows())->where($rankKey, '<', $anchor)->max($rankKey)), $anchor], upper: false);
         }
 
         if ($placement->after !== null) {
             $anchor = $this->anchor($others($this->members()), $placement->after);
 
-            return [$anchor, self::keyOrNull($others($rows())->where($rankKey, '>', $anchor)->min($rankKey))];
+            return $this->besideInFlight([$anchor, self::keyOrNull($others($rows())->where($rankKey, '>', $anchor)->min($rankKey))], upper: true);
         }
 
-        return [self::keyOrNull($others($rows())->max($rankKey)), null];
+        return $this->besideInFlight([self::keyOrNull($others($rows())->max($rankKey)), null], upper: false);
+    }
+
+    /**
+     * @param  array{null|string, null|string}  $bounds
+     * @return array{null|string, null|string}
+     */
+    private function besideInFlight(array $bounds, bool $upper): array
+    {
+        foreach (self::$inFlight ?? [] as $item => [$relation, $key]) {
+            if ($item->exists || ! $relation->sameOrderAs($this) || ! self::between($key, ...$bounds)) {
+                continue;
+            }
+
+            $bounds[$upper ? 1 : 0] = $key;
+        }
+
+        return $bounds;
+    }
+
+    private static function between(string $key, null|string $lower, null|string $upper): bool
+    {
+        return ($lower === null || strcmp($key, $lower) > 0) && ($upper === null || strcmp($key, $upper) < 0);
+    }
+
+    /**
+     * @param  list<int|string>  $exclude
+     * @return array{null|string, null|string}
+     */
+    private function boundsAfter(Placement $placement, array $exclude, int|string $previous): array
+    {
+        $rankKey = $this->keys->item->qualifyColumn(self::RANK_KEY);
+        [$lower] = $this->bounds($placement, $exclude, $this->indexedRows(...));
+        $stored = self::keyOrNull($this->indexedRows()->where($this->keys->item->getQualifiedKeyName(), $previous)->value($rankKey));
+
+        if ($stored !== null && ($lower === null || strcmp($stored, $lower) > 0)) {
+            $lower = $stored;
+        }
+
+        $upper = $this->indexedRows()
+            ->whereNotIn($this->keys->item->getQualifiedKeyName(), $exclude)
+            ->when($lower !== null, fn (Builder $query): Builder => $query->where($rankKey, '>', $lower))
+            ->min($rankKey);
+
+        return $this->besideInFlight([$lower, self::keyOrNull($upper)], upper: true);
     }
 
     private function anchor(Builder $members, int|string $anchor): string
@@ -2793,7 +2844,7 @@ final class OrderedRelation
         }
 
         $keys = $this->keysAt($placement, $ids, count($ids));
-        $copies = OrderWrite::copies($this->keys->item, $ids, self::timestamps($items[0], $this->keys->item));
+        $copies = OrderWrite::copies($this->keys->item, $ids, $this->keys->item->usesTimestamps());
         $rekeyed = array_values(array_filter(
             $ids,
             fn (int|string $id, int $index): bool => $from[$index] === $this && ($copies[$id] ?? null)?->getAttribute(self::RANK_KEY) !== $keys[$index],
@@ -2805,10 +2856,30 @@ final class OrderedRelation
         }
 
         foreach ($items as $index => $item) {
+            $remaining = array_slice($ids, $index);
+
+            if ($index > 0 && ! self::between($keys[$index], ...$this->boundsAfter($placement, $remaining, $ids[$index - 1]))) {
+                $keys = [...array_slice($keys, 0, $index), ...$this->keysAt($placement, $remaining, count($remaining), $ids[$index - 1])];
+                $resident = array_values(array_filter($remaining, fn (int|string $id, int $offset): bool => $from[$index + $offset] === $this, ARRAY_FILTER_USE_BOTH));
+
+                if ($resident !== []) {
+                    $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $resident)->update([self::RANK_KEY => null]);
+
+                    foreach (array_intersect_key($copies, array_flip($resident)) as $copy) {
+                        $copy->forceFill([self::RANK_KEY => null])->syncOriginalAttribute(self::RANK_KEY);
+                    }
+                }
+            }
+
             $stored = $rows[(string) $ids[$index]] ?? [];
             $item->forceFill($stored)->syncOriginalAttributes(array_keys($stored));
+            $copy = $copies[$ids[$index]] ?? null;
 
-            self::saveCopy($item, $copies[$ids[$index]] ?? null, $from[$index] === $this
+            if ($copy !== null) {
+                $copy->timestamps = self::timestamps($item, $this->keys->item);
+            }
+
+            self::saveCopy($item, $copy, $from[$index] === $this
                 ? [self::RANK_KEY => $keys[$index]]
                 : [...$from[$index]->keys->detached(), ...$this->keys->pointingAt($this->parent), self::RANK_KEY => $keys[$index]]);
         }
@@ -2917,7 +2988,12 @@ final class OrderedRelation
 
     private function batchOf(Model&Ordered $item): null|self
     {
-        return array_find(self::$creating, fn (self $batch): bool => $batch->is($this) && $batch->claims($item));
+        return array_find(self::$creating, fn (self $batch): bool => $batch->sameOrderAs($this) && $batch->claims($item));
+    }
+
+    private function sameOrderAs(self $other): bool
+    {
+        return $this->is($other) && $this->parent->getConnection()->getName() === $other->parent->getConnection()->getName();
     }
 
     private function claims(Model&Ordered $item): bool
@@ -2943,9 +3019,10 @@ final class OrderedRelation
      * @param  list<int|string>  $exclude
      * @return list<string>
      */
-    private function keysAt(Placement $placement, array $exclude, int $count): array
+    private function keysAt(Placement $placement, array $exclude, int $count, null|int|string $after = null): array
     {
-        [$lower, $upper] = $this->bounds($placement, $exclude, $this->indexedRows(...));
+        $bounds = fn (): array => $after === null ? $this->bounds($placement, $exclude, $this->indexedRows(...)) : $this->boundsAfter($placement, $exclude, $after);
+        [$lower, $upper] = $bounds();
         $keys = FractionalIndex::keysBetween($lower, $upper, $count);
 
         if ($keys === [] || max(array_map(strlen(...), $keys)) <= self::MAX_KEY_LENGTH) {
@@ -2953,7 +3030,7 @@ final class OrderedRelation
         }
 
         $this->rebalance();
-        [$lower, $upper] = $this->bounds($placement, $exclude, $this->indexedRows(...));
+        [$lower, $upper] = $bounds();
 
         return FractionalIndex::keysBetween($lower, $upper, $count);
     }
