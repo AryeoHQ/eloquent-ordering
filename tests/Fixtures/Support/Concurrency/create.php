@@ -18,5 +18,5 @@ try {
 
     echo 'created';
 } catch (UnavailableParent $exception) {
-    echo 'unavailable:'.$exception->reason;
+    echo 'unavailable:'.$exception->reason->value;
 }

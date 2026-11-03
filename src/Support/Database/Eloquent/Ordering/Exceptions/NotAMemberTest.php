@@ -10,6 +10,8 @@ use Illuminate\Support\Facades\DB;
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\Test;
+use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
+use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Placement;
 use Tests\Fixtures\Support\Drawers\Drawer;
 use Tests\Fixtures\Support\Drawers\DrawerRevision;
@@ -101,7 +103,8 @@ class NotAMemberTest extends TestCase
         Note::query()->findOrFail($note->id)->delete();
         $before = $this->storedNotes($drawer);
 
-        $this->assertNotAMember(Note::class, $note->id, fn (): mixed => $note->move(Placement::last(), expected: $expected));
+        $this->assertStale($drawer, DrawerRevision::NotesOrder, $expected, fn (): mixed => $note->move(Placement::last(), expected: $expected));
+        $this->assertNotAMember(Note::class, $note->id, fn (): mixed => $note->move(Placement::last(), expected: $drawer->concurrencyRevision(DrawerRevision::NotesOrder)));
 
         $this->assertSame($before, $this->storedNotes($drawer));
     }
@@ -116,7 +119,8 @@ class NotAMemberTest extends TestCase
         Track::query()->findOrFail($track->id)->delete();
         $before = $this->storedTracks($playlist);
 
-        $this->assertNotAMember(Track::class, $track->id, fn (): mixed => $track->move(Placement::last(), expected: $expected));
+        $this->assertStale($playlist, PlaylistRevision::TracksOrder, $expected, fn (): mixed => $track->move(Placement::last(), expected: $expected));
+        $this->assertNotAMember(Track::class, $track->id, fn (): mixed => $track->move(Placement::last(), expected: $playlist->concurrencyRevision(PlaylistRevision::TracksOrder)));
 
         $this->assertSame($before, $this->storedTracks($playlist));
     }
@@ -201,6 +205,16 @@ class NotAMemberTest extends TestCase
     private function storedScenes(Tour $tour): array
     {
         return DB::table('scenes')->where('sceneable_id', $tour->id)->orderBy('id')->get()->map(fn (object $row): array => (array) $row)->all();
+    }
+
+    private function assertStale(Model $parent, NamesConcurrencyRevision $revision, string $expected, callable $move): void
+    {
+        try {
+            $move();
+            $this->fail('A move with a stale expected revision succeeded.');
+        } catch (StaleConcurrencyRevision $exception) {
+            $this->assertSame(sprintf('The [%s] concurrency revision of [%s:%s] is no longer [%s].', $revision->value, $parent->getMorphClass(), $parent->getKey(), $expected), $exception->getMessage());
+        }
     }
 
     /**
