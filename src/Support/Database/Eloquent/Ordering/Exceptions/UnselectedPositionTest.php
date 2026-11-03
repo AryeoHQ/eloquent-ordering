@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Ordering\Exceptions;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
@@ -96,6 +97,8 @@ class UnselectedPositionTest extends TestCase
 
             return $conference->speakers()->paginate()->getCollection()->firstOrFail()->getAttribute('position');
         }, 'paginate()'];
+
+        yield 'a for key share lock' => [fn (): mixed => DB::transaction(fn (): mixed => Asset::query()->lock('for key share')->findOrFail(self::asset()->id)->position), 'for key share'];
 
         yield 'isset()' => [fn (): bool => isset(Asset::query()->select(['assets.id'])->findOrFail(self::asset()->id)->position), 'isset()']; // @phpstan-ignore ergebnis.noIsset
 

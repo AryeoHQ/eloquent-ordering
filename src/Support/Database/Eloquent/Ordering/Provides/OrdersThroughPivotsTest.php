@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Process\InvokedProcess;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use LogicException;
@@ -78,6 +79,26 @@ class OrdersThroughPivotsTest extends TestCase
         $this->assertCount(3, DB::getQueryLog());
         $this->assertEquals($expected, $lazy);
         $this->assertEquals($expected, $eager);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_arranges_the_pivots_that_the_documented_read_returns(PivotShape $shape): void
+    {
+        [$parent] = $shape->with(3);
+        $read = static fn (): Collection => $shape->customers($parent)->withPivot('id')->reorder($shape->customers($parent)->getTable().'.rank_key')->get();
+        $ids = $read()->map(static function (Model $customer) use ($shape): string {
+            $key = $shape->item($customer)->getKey();
+
+            assert(is_string($key));
+
+            return $key;
+        })->all();
+        $order = array_reverse($ids);
+
+        $shape->customers($parent)->arrange($order);
+
+        $this->assertEquals(array_combine($order, [1, 2, 3]), $shape->selectedPositions($read()));
     }
 
     #[DataProvider('pivots')]
