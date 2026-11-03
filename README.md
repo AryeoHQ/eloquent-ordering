@@ -608,9 +608,9 @@ The package opens these transactions around the application's writes. Laravel's 
 | Write | What the package opens |
 |---|---|
 | `save()` or `delete()` of an item, of a parent that uses `HasOrderedRelations`, or of a related model that uses `OrdersThroughPivots` | One transaction, through eloquent-concurrency's `WritesInTransactions`, whether or not the write changes an order. The events that `save()` and `delete()` fire run inside it. `update()`, `restore()`, and `forceDelete()` reach `save()` or `delete()`, so each opens one too. `restoring`, `restored`, `forceDeleting`, and `forceDeleted` fire outside it. `attach()` and `detach()` save or delete each pivot row, so each opens one transaction per pivot row. A batch of pivots is atomic only inside an application transaction. |
-| `move()`, `arrange()`, `moveIn()`, and `createInOrder()` | One transaction. The copies that the write saves open none, so their events run directly inside it. Each record that `createInOrder()` creates goes through `save()`, which opens one more. |
+| `move()`, `arrange()`, `moveIn()`, and `createInOrder()` | One transaction. The copies that the write saves open none, so their events run directly inside it. Each record that `createInOrder()` creates goes through `save()`, which opens one more. For a pivot relation, a record saves the related model and then the pivot, so it opens two in turn, never two at once. |
 | `lockedMembers()` | No transaction: it requires the caller's. |
-| Each attempt to lock an order, inside any write above or `lockedMembers()` | One savepoint. The package releases it once it holds the locks, or rolls back to it before the next attempt. |
+| Each attempt to lock an order inside `move()`, `moveIn()`, `lockedMembers()`, or a `save()` of an existing item | One savepoint. The package releases it once it holds the locks, or rolls back to it before the next attempt. `arrange()`, `createInOrder()`, and a create lock their parents directly, with no savepoint and no retry. |
 | The first check of a relation that filters through a subquery | One transaction around one `explain`, once per relation and process. Inside the caller's transaction it is a savepoint. |
 
 `Reordered` and `Rebalanced` dispatch after the outermost transaction commits.
