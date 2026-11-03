@@ -384,7 +384,7 @@ Both outcomes leave the data unchanged. A move that keeps the order writes nothi
 | `digest` | The order digest after the write, read inside the write's transaction. |
 | `source` | For a move between parents, the `OrderChange` of the parent the item left. Otherwise `null`. |
 
-After a move between parents, the item's loaded parent relation holds the destination.
+After a move between two parents of one class, the item's loaded parent relation holds the destination. A morph move to a parent of another class unloads that relation instead, so read the destination from `OrderChange::$parent`.
 
 A save through Eloquent that changes the parent, such as `$asset->update(['section_id' => $other->id])`, moves the item to the end of the new parent without an `expected` check, so use `move()` when the caller needs one. Such a save is no substitute for ORD-08, which requires an API to return 422 for an update that would move an item to another ordered collection. A save that leaves every parent, such as one that sets a nullable foreign key to `null`, clears the item's rank key.
 
@@ -563,6 +563,7 @@ Asset::query()->whereKey($id)->delete();                              // changes
 - **A pivot without `SoftDeletes` hard deletes on `detach()`.** Give every ordered pivot `SoftDeletes`, as the fixtures do.
 - **The membership check inspects the relation's own clauses only.** It does not refuse a `limit()`. The check runs once per `Class::relation()`, so a relation that branches on instance properties is checked in one branch only.
 - **The parent-column probe can miss a read.** A relation that maps the probe value to the same query, such as through an `array` cast that decodes it to `null`, hides that read. A binding that each call builds fresh, such as `now()`, makes every parent column count as read.
+- **The parent-column probe lists a parent table's columns once per connection name and process.** Tenants that share a connection name must share one schema. Otherwise the first tenant's columns decide the check for every tenant.
 - **The tests save a declared item or parent column on a `HasMany` relation only.** For a `MorphMany` or a pivot relation, only the resolution check is tested.
 - **A related model reads each parent that `#[OrderedThrough]` names on its first watched write.** It instantiates each parent, reads its method attributes, and builds each declared relation. A name that orders no pivot of the model is skipped without an error.
 - **A concurrent attach can escape a related model's soft delete.** Suppose another transaction attaches the related model to a new parent between the pivot read and the write. The soft delete does not lock that parent, and reports nothing to it. An attach that reaches the related row after the write waits for the related commit, so it reports what the related write left.
