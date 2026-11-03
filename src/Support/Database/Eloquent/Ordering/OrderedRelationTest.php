@@ -581,6 +581,134 @@ class OrderedRelationTest extends TestCase
         }
     }
 
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function mixedDepthLocks(): array
+    {
+        return [
+            'the pages of the binder of the page' => ['binder'],
+            'the binders of the shelf of the page' => ['shelf'],
+        ];
+    }
+
+    #[DataProvider('mixedDepthLocks')]
+    #[Test]
+    public function it_finishes_locking_members_with_a_model_of_another_depth_beside_a_move_of_a_binder_in_its_shelf_without_a_deadlock(string $parent): void
+    {
+        $racer = $this->racer();
+        $shelf = Shelf::on('racer')->create();
+        $staying = Binder::on('racer')->create(['shelf_id' => $shelf->id, 'kind' => 'audio']);
+        $moving = Binder::on('racer')->create(['shelf_id' => $shelf->id, 'kind' => 'audio']);
+        $page = Page::on('racer')->create(['binder_id' => $moving->id, 'kind' => 'audio']);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('shelves')->where('id', $shelf->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('move-binder.php', (string) $moving->id);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('locked-with-page.php', $parent, (string) ($parent === 'shelf' ? $shelf->id : $moving->id), (string) $page->id);
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
+
+            $this->assertSame([['moved'], ['locked', $parent === 'shelf' ? [$moving->id, $staying->id] : [$page->id]]], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertSame([$moving->id, $staying->id], $racer->table('binders')->where('shelf_id', $shelf->id)->orderBy('rank_key')->pluck('id')->all());
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            foreach ($rivals as $rival) {
+                $rival->wait();
+            }
+
+            $racer->table('pages')->where('binder_id', $moving->id)->delete();
+            $racer->table('binders')->where('shelf_id', $shelf->id)->delete();
+            $racer->table('shelves')->where('id', $shelf->id)->delete();
+        }
+    }
+
+    #[Test]
+    public function it_finishes_locking_members_with_a_binder_that_changed_shelf_since_it_was_read_beside_a_move_of_that_binder_without_a_deadlock(): void
+    {
+        $racer = $this->racer();
+        [$read, $stored] = [Shelf::on('racer')->create(), Shelf::on('racer')->create()];
+        $staying = Binder::on('racer')->create(['shelf_id' => $stored->id, 'kind' => 'audio']);
+        $binder = Binder::on('racer')->create(['shelf_id' => $stored->id, 'kind' => 'audio']);
+        $rivals = [];
+
+        try {
+            $racer->beginTransaction();
+            $racer->table('shelves')->where('id', $stored->id)->lockForUpdate()->first();
+
+            $rivals[] = $this->startRival('move-binder.php', (string) $binder->id);
+            $this->awaitLockWait(1, ...$rivals);
+
+            $rivals[] = $this->startRival('locked-stale-binder.php', (string) $read->id, (string) $binder->id);
+            $this->awaitLockWait(2, ...$rivals);
+
+            $racer->rollBack();
+
+            $outputs = array_map(fn (InvokedProcess $rival): mixed => json_decode($rival->wait()->output(), true), $rivals);
+
+            $this->assertSame([['moved'], ['moved']], $outputs, implode(PHP_EOL, array_map(fn (InvokedProcess $rival): string => $rival->errorOutput(), $rivals)));
+            $this->assertSame([$binder->id, $staying->id], $racer->table('binders')->where('shelf_id', $stored->id)->orderBy('rank_key')->pluck('id')->all());
+        } finally {
+            if ($racer->transactionLevel() > 0) {
+                $racer->rollBack();
+            }
+
+            foreach ($rivals as $rival) {
+                $rival->wait();
+            }
+
+            $racer->table('binders')->where('shelf_id', $stored->id)->delete();
+            $racer->table('shelves')->whereIn('id', [$read->id, $stored->id])->delete();
+        }
+    }
+
+    #[Test]
+    public function it_locks_the_members_again_when_a_model_to_also_lock_moves_between_the_read_of_its_ordering_parent_and_the_lock(): void
+    {
+        $racer = $this->racer();
+        config()->set('database.connections.mover', config('database.connections.pgsql'));
+        [$first, $second] = [Shelf::on('racer')->create(), Shelf::on('racer')->create()];
+        $section = Section::on('racer')->create();
+        $binder = Binder::on('racer')->findOrFail(Binder::on('racer')->create(['shelf_id' => $first->id, 'kind' => 'audio'])->id);
+        $moved = false;
+
+        try {
+            DB::listen(function (QueryExecuted $query) use (&$moved, $binder, $second): void {
+                if ($moved || $query->connectionName !== 'racer' || ! str_contains($query->sql, 'from "shelves"') || ! str_ends_with($query->sql, 'for no key update')) {
+                    return;
+                }
+
+                $moved = true;
+                DB::connection('mover')->statement("set lock_timeout = '2s'");
+                DB::connection('mover')->table('binders')->where('id', $binder->id)->update(['shelf_id' => $second->id]);
+            });
+            $racer->enableQueryLog();
+
+            $racer->transaction(fn (): mixed => $section->assets()->lockedMembers($binder));
+
+            $this->assertTrue($moved, 'The model to also lock never moved while the members were locked.');
+            $this->assertSame([
+                ['shelves', $first->id], ['binders', $binder->id],
+                ['shelves', $first->id], ['shelves', $second->id], ['binders', $binder->id],
+            ], $this->parentLocks($racer->getQueryLog()));
+        } finally {
+            $racer->table('binders')->where('id', $binder->id)->delete();
+            $racer->table('shelves')->whereIn('id', [$first->id, $second->id])->delete();
+            $racer->table('sections')->where('id', $section->id)->delete();
+        }
+    }
+
     #[Test]
     public function it_refuses_to_lock_the_members_outside_a_transaction(): void
     {

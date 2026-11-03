@@ -2628,6 +2628,38 @@ class IsOrderedTest extends TestCase
         $this->assertSame([[$drawer->id, [$staying->id], [[$deleted->id, null, 1]]]], array_map(fn (array $reorder): array => array_slice($reorder, 0, 3), $this->reorders));
     }
 
+    #[Test]
+    public function it_deletes_a_member_of_a_held_parent_whose_row_is_gone_and_announces_nothing(): void
+    {
+        $tour = Tour::create();
+        [$deleted, $staying] = [$tour->scenes()->create(), $tour->scenes()->create()];
+        $deleted->setRelation('sceneable', $tour);
+        DB::table('tours')->where('id', $tour->id)->delete();
+        $this->recordReorders();
+
+        $deleted->delete();
+
+        $this->assertSoftDeleted('scenes', ['id' => $deleted->id]);
+        $this->assertNull(DB::table('scenes')->where('id', $deleted->id)->value('rank_key'));
+        $this->assertNotNull(DB::table('scenes')->where('id', $staying->id)->value('rank_key'));
+        $this->assertSame([], $this->reorders);
+    }
+
+    #[Test]
+    public function it_moves_a_member_out_of_a_held_parent_whose_row_is_gone_and_announces_only_its_new_parent(): void
+    {
+        $tour = Tour::create();
+        [$moving] = [$this->addScene($tour), $this->addScene($tour)];
+        $listing = Listing::create();
+        DB::table('tours')->where('id', $tour->id)->delete();
+        $this->recordReorders();
+
+        $moving->sceneable()->associate($listing);
+        $moving->save();
+
+        $this->assertSame([[$listing->id, [$moving->id], [[$moving->id, 1, null]]]], array_map(fn (array $reorder): array => array_slice($reorder, 0, 3), $this->reorders));
+    }
+
     private function addNote(Drawer $drawer): Note
     {
         $note = new Note;

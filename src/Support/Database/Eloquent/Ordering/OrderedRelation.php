@@ -627,20 +627,18 @@ final class OrderedRelation
         $moved = new RuntimeException;
 
         for ($attempt = 1; $attempt <= self::LOCK_ATTEMPTS; $attempt++) {
-            $stored = $this->storedMembership();
-            $first = $this->parentsToLockFirst($alsoLock, $stored);
-            $this->requireLockable($first);
+            [$models, $stored] = self::withOrderingParents([$this->parent, ...$alsoLock]);
+            $this->requireLockable($models);
 
             try {
-                return $this->parent->getConnection()->transaction(function () use ($alsoLock, $first, $stored, $moved): Collection {
-                    self::lockInOrder($first);
-                    self::lockInOrder(array_values(array_filter(
-                        [$this->parent, ...$alsoLock],
-                        static fn (Model $model): bool => ! array_any($first, static fn (Model $locked): bool => $locked->is($model)),
-                    )));
+                return $this->parent->getConnection()->transaction(function () use ($models, $stored, $moved): Collection {
+                    foreach ($models as $model) {
+                        self::lockRow($model);
+                    }
+
                     $this->lock();
 
-                    throw_unless($this->storedMembership() === $stored, $moved);
+                    throw_unless(array_map(self::storedMembershipOf(...), $models) === $stored, $moved);
 
                     return $this->currentMembers();
                 });
@@ -657,8 +655,7 @@ final class OrderedRelation
      */
     public function requireMember(Model&Ordered $item): int
     {
-        return ($this->unavailable === UnavailableParent::MISSING ? null : $this->memberPosition($item))
-            ?? throw new NotAMember($item::class, [self::keyOf($item)]);
+        return $this->memberPosition($item) ?? throw new NotAMember($item::class, [self::keyOf($item)]);
     }
 
     /**
@@ -777,6 +774,10 @@ final class OrderedRelation
      */
     public function memberPosition(Model $item): null|int
     {
+        if ($this->unavailable === UnavailableParent::MISSING) {
+            return null;
+        }
+
         $position = self::positionsOf([$this], [$item])[(string) self::keyOf($item)] ?? null;
 
         return is_int($position) || is_string($position) ? (int) $position : null;
@@ -1959,8 +1960,89 @@ final class OrderedRelation
         usort($parents, self::lockOrder(...));
 
         foreach ($parents as $parent) {
-            $parent->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($parent->getKey())->toBase()->lock('for no key update')->first([$parent->getKeyName()]);
+            self::lockRow($parent);
         }
+    }
+
+    private static function lockRow(Model $model): void
+    {
+        $model->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($model->getKey())->toBase()->lock('for no key update')->first([$model->getKeyName()]);
+    }
+
+    /**
+     * @param  list<Model>  $models
+     * @return array{list<Model>, list<null|array<string, mixed>>}
+     */
+    private static function withOrderingParents(array $models): array
+    {
+        $found = [];
+        $parents = [];
+        $stored = [];
+
+        $indexOf = static function (Model $model) use (&$found): int {
+            $index = array_find_key($found, static fn (Model $kept): bool => $kept->is($model));
+
+            if (is_int($index)) {
+                return $index;
+            }
+
+            $found[] = $model;
+
+            return count($found) - 1;
+        };
+
+        foreach ($models as $model) {
+            $indexOf($model);
+        }
+
+        for ($index = 0; $index < count($found); $index++) {
+            $model = $found[$index];
+            $stored[$index] = self::storedMembershipOf($model);
+            $held = $model instanceof LocksParentsFirst ? $model->parentsToLockFirst() : [];
+            $named = $stored[$index] !== null && $model instanceof Ordered ? self::namedParents($model, $stored[$index], $held) : [];
+            $parents[$index] = array_values(array_unique(array_map($indexOf, [...$held, ...$named])));
+        }
+
+        $depths = [];
+        $depthOf = static function (int $index, array $path) use (&$depthOf, &$depths, $parents): int {
+            if (array_key_exists($index, $depths)) {
+                return $depths[$index];
+            }
+
+            $path[$index] = true;
+            $depth = 0;
+
+            foreach ($parents[$index] as $parent) {
+                if (! array_key_exists($parent, $path)) {
+                    $depth = max($depth, $depthOf($parent, $path) + 1);
+                }
+            }
+
+            return $depths[$index] = $depth;
+        };
+
+        $order = array_keys($found);
+        usort($order, static fn (int $first, int $second): int => [$depthOf($first, []), $found[$first]->getMorphClass(), $found[$first]->getKey()]
+            <=> [$depthOf($second, []), $found[$second]->getMorphClass(), $found[$second]->getKey()]);
+
+        return [
+            array_map(static fn (int $index): Model => $found[$index], $order),
+            array_map(static fn (int $index): null|array => $stored[$index], $order),
+        ];
+    }
+
+    /**
+     * @return null|array<string, mixed>
+     */
+    private static function storedMembershipOf(Model $model): null|array
+    {
+        if (! $model instanceof Ordered) {
+            return null;
+        }
+
+        $row = $model->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($model->getKey())->toBase()->useWritePdo()->first(self::membershipColumns($model));
+
+        return $row === null ? null : (array) $row;
     }
 
     private static function lockOrder(Model $first, Model $second): int
@@ -2314,50 +2396,6 @@ final class OrderedRelation
 
         /** @var Collection<int, Model> */
         return $relation->reorder()->whereNotNull($rankKey)->orderBy($rankKey)->orderBy($this->keys->item->getQualifiedKeyName())->get();
-    }
-
-    /**
-     * @return null|array<string, mixed>
-     */
-    private function storedMembership(): null|array
-    {
-        if (! $this->parent instanceof Ordered) {
-            return null;
-        }
-
-        $row = $this->parentRow()->useWritePdo()->first(self::membershipColumns($this->parent));
-
-        return $row === null ? null : (array) $row;
-    }
-
-    /**
-     * @param  list<Model>  $alsoLock
-     * @param  null|array<string, mixed>  $stored
-     * @return list<Model>
-     */
-    private function parentsToLockFirst(array $alsoLock, null|array $stored): array
-    {
-        $named = [];
-
-        foreach ([$this->parent, ...$alsoLock] as $model) {
-            if ($model instanceof LocksParentsFirst) {
-                array_push($named, ...$model->parentsToLockFirst());
-            }
-        }
-
-        if ($stored !== null && $this->parent instanceof Ordered) {
-            array_push($named, ...self::namedParents($this->parent, $stored, $named));
-        }
-
-        $first = [];
-
-        foreach ($named as $model) {
-            if (! array_any($first, static fn (Model $kept): bool => $kept->is($model))) {
-                $first[] = $model;
-            }
-        }
-
-        return $first;
     }
 
     /**
