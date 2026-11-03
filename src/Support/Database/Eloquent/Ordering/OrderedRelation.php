@@ -712,11 +712,11 @@ final class OrderedRelation
      */
     public function createInOrder(array $records): Collection
     {
-        throw_unless($this->parent->exists, LogicException::class, sprintf('[%s] must be saved before it orders a member.', $this->parent::class));
-
         if ($records === []) {
             return new Collection;
         }
+
+        throw_unless($this->parent->exists, LogicException::class, sprintf('[%s] must be saved before it orders a member.', $this->parent::class));
 
         return $this->parent->getConnection()->transaction(function () use ($records): Collection {
             self::lockAll([$this]);
@@ -802,6 +802,7 @@ final class OrderedRelation
      */
     public function placed(Model&Ordered $item): void
     {
+        unset(self::$inFlight[$item]);
         $batch = $this->batchOf($item);
 
         if ($batch !== null) {
