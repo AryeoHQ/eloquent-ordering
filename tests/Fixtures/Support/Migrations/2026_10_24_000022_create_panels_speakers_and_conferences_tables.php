@@ -10,6 +10,20 @@ return new class extends Migration
 {
     public function up(): void
     {
+        $this->createPanelsAndSpeakers();
+        $this->createConferencesAndConferenceSpeaker();
+    }
+
+    public function down(): void
+    {
+        Schema::dropIfExists('conference_speaker');
+        Schema::dropIfExists('conferences');
+        Schema::dropIfExists('speakers');
+        Schema::dropIfExists('panels');
+    }
+
+    private function createPanelsAndSpeakers(): void
+    {
         Schema::create('panels', function (Blueprint $table): void {
             $table->id();
             $table->timestamps();
@@ -27,11 +41,14 @@ return new class extends Migration
         Schema::getConnection()->statement(
             'create unique index speakers_panel_id_rank_key_unique on speakers (panel_id, rank_key) where deleted_at is null',
         );
+    }
 
+    private function createConferencesAndConferenceSpeaker(): void
+    {
         Schema::create('conferences', function (Blueprint $table): void {
             $table->id();
             $table->timestamps();
-            $table->softDeletes();
+            $table->softDeletesTz();
         });
 
         Schema::create('conference_speaker', function (Blueprint $table): void {
@@ -49,13 +66,5 @@ return new class extends Migration
         Schema::getConnection()->statement(
             'create unique index conference_speaker_conference_id_rank_key_unique on conference_speaker (conference_id, rank_key) where deleted_at is null',
         );
-    }
-
-    public function down(): void
-    {
-        Schema::dropIfExists('conference_speaker');
-        Schema::dropIfExists('conferences');
-        Schema::dropIfExists('speakers');
-        Schema::dropIfExists('panels');
     }
 };

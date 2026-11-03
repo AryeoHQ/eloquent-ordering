@@ -10,8 +10,10 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversTrait;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
+use Support\Database\Eloquent\Ordering\Exceptions\ParentUnavailability;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Tests\Fixtures\Support\Assets\Asset;
@@ -73,7 +75,7 @@ class ChangesRowsOnFirstReadTest extends TestCase
             $note->save();
             $this->fail('The create placed a member in a trashed parent.');
         } catch (UnavailableParent $refused) {
-            $this->assertSame(UnavailableParent::TRASHED, $refused->reason);
+            $this->assertSame(ParentUnavailability::Trashed, $refused->reason);
         }
     }
 
@@ -186,6 +188,76 @@ class ChangesRowsOnFirstReadTest extends TestCase
         $stored = $this->stored($scene);
         $this->assertSame($listing->getMorphClass(), $stored->sceneable_type);
         $this->assertSame($listing->id, $stored->sceneable_id);
+    }
+
+    #[Test]
+    public function it_moves_two_rows_into_one_target_one_after_the_other(): void
+    {
+        [$source, $target] = [Section::query()->create(), Section::query()->create()];
+        $first = Asset::query()->create(['section_id' => $source->id]);
+        $second = Asset::query()->create(['section_id' => $source->id]);
+
+        $this->moveOnFirstRead($first->section(), $target);
+        $this->moveOnFirstRead($second->section(), $target);
+        Asset::query()->find($first->id);
+        Asset::query()->find($second->id);
+
+        [$moved, $waited] = [$this->stored($first), $this->stored($second)];
+        $this->assertSame([$target->id, $target->id], [$moved->section_id, $waited->section_id]);
+        $this->assertSame(FractionalIndex::keyBetween($moved->rank_key, null), $waited->rank_key);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function readsOfTheRowsTable(): iterable
+    {
+        yield 'uppercase keywords' => ['SELECT * FROM "assets"'];
+        yield 'a newline before the table' => ["select *\nfrom\n\"assets\""];
+        yield 'a tab before the table' => ["select * from\t\"assets\""];
+        yield 'an unquoted table' => ['select * from assets'];
+        yield 'an unquoted table in a join' => ['select * from "sections" inner join assets on assets.section_id = sections.id'];
+        yield 'a leading with' => ['with listed as (select id from "assets") select * from listed'];
+    }
+
+    #[DataProvider('readsOfTheRowsTable')]
+    #[Test]
+    public function it_changes_the_row_on_a_read_written_by_hand(string $sql): void
+    {
+        $section = Section::query()->create();
+        $asset = Asset::query()->create(['section_id' => $section->id]);
+
+        $this->deleteOnFirstRead($asset);
+        DB::select($sql);
+
+        $this->assertNotNull($this->stored($asset)->deleted_at);
+    }
+
+    #[Test]
+    public function it_ignores_a_read_of_an_unquoted_table_whose_name_extends_the_rows_table(): void
+    {
+        Schema::create('assets_archive', static function (Blueprint $table): void {
+            $table->id();
+        });
+        $section = Section::query()->create();
+        $asset = Asset::query()->create(['section_id' => $section->id]);
+
+        $this->deleteOnFirstRead($asset);
+        DB::select('select * from assets_archive');
+
+        $this->assertFalse(Asset::query()->findOrFail($asset->id)->trashed());
+    }
+
+    #[Test]
+    public function it_changes_the_row_on_a_string_literal_that_names_its_table(): void
+    {
+        $section = Section::query()->create();
+        $asset = Asset::query()->create(['section_id' => $section->id]);
+
+        $this->deleteOnFirstRead($asset);
+        DB::select('select \'from "assets"\' as text');
+
+        $this->assertNotNull($this->stored($asset)->deleted_at);
     }
 
     #[Test]

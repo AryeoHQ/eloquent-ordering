@@ -43,7 +43,7 @@ if (Schema::hasColumn('sections', 'concurrency_revision')) {
 | `OrderChange::$relation` and the integer `OrderChange::$revision` | `$parent`, `$revision` (the `NamesConcurrencyRevision`), and `$digest` (the order digest after the write). |
 | `Rebalanced::$relation` and the integer `Rebalanced::$revision` | `$parent`, `$revision`, and `$digest`, as on `OrderChange`. |
 | `InvalidAnchor` and `MembershipMismatch` take an `OrderedRelation` | Each takes the parent and the `NamesConcurrencyRevision`. |
-| `LogicException` for a moved item that is no longer a member | `NotAMember`. |
+| `LogicException` for a moved item that is no longer a member | `NotAMember` with `expected: null` or a current digest. With a stale `expected`, `move()` and `moveIn()` throw `StaleConcurrencyRevision` first, so an API answers 412 before 422 (OCC-17). |
 | A write into a trashed parent succeeds | `UnavailableParent`, with `reason` `trashed` or `missing`. |
 | An order write saves the parent, so the parent fires `saving`, `updating`, `updated`, and `saved` | No order write saves the parent, so the parent fires no event for it. |
 | A write that bypasses Eloquent fails at commit | Nothing refuses it. It changes the digest and dispatches no `Reordered`. |

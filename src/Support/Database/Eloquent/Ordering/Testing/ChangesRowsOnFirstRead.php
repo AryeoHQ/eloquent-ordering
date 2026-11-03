@@ -17,6 +17,8 @@ use Support\Database\Eloquent\Ordering\OrderedRelation;
 
 trait ChangesRowsOnFirstRead
 {
+    private bool $forgingOnFirstRead = false;
+
     protected function deleteOnFirstRead(Model $model): void
     {
         if (! method_exists($model, 'getDeletedAtColumn')) {
@@ -84,16 +86,24 @@ trait ChangesRowsOnFirstRead
         }
 
         $connection = $model->getConnection();
-        $source = '/\b(?:from|join) '.preg_quote($connection->getQueryGrammar()->wrapTable($model->getTable()), '/').'/';
+        $quoted = preg_quote($connection->getQueryGrammar()->wrapTable($model->getTable()), '/');
+        $unquoted = preg_quote($connection->getTablePrefix().$model->getTable(), '/');
+        $source = '/\b(?i:from|join)\s+(?:'.$quoted.'|(?i:'.$unquoted.')\b)/';
         $changed = false;
 
-        DB::listen(static function (QueryExecuted $query) use ($model, $key, $change, $connection, $source, &$changed): void {
-            if ($changed || $query->connectionName !== $connection->getName() || ! str_starts_with($query->sql, 'select ') || preg_match($source, $query->sql) !== 1) {
+        DB::listen(function (QueryExecuted $query) use ($model, $key, $change, $connection, $source, &$changed): void {
+            if ($changed || $this->forgingOnFirstRead || $query->connectionName !== $connection->getName() || preg_match('/^\s*(?:select|with)\b/i', $query->sql) !== 1 || preg_match($source, $query->sql) !== 1) {
                 return;
             }
 
             $changed = true;
-            $change($model->newQueryWithoutScopes()->whereKey($key)->toBase());
+            $this->forgingOnFirstRead = true;
+
+            try {
+                $change($model->newQueryWithoutScopes()->whereKey($key)->toBase());
+            } finally {
+                $this->forgingOnFirstRead = false;
+            }
         });
     }
 }

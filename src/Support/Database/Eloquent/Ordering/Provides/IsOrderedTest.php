@@ -1733,7 +1733,8 @@ class IsOrderedTest extends TestCase
 
         $shape->find($this->key($deleted))->delete();
 
-        $this->assertRejected($shape, NotAMember::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: $digest), $parent);
+        $this->assertRejected($shape, StaleConcurrencyRevision::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: $digest), $parent);
+        $this->assertRejected($shape, NotAMember::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: $shape->digest($parent)), $parent);
         $this->assertRejected($shape, NotAMember::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: null), $parent);
         $this->assertOrder($shape, [$first->getKey()], $parent);
     }
