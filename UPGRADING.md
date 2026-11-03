@@ -15,6 +15,7 @@ Read the [README](README.md) for each replacement. [Adopting on an existing tabl
 | `rankKey()`, and the 0.0.1 README's raw `create unique index <table>_<parent columns>_rank_key_unique` statement | Keep the index on an existing database: `rankKeyIndex()` with the parent columns generates the same name and definition. Add no new index. For a fresh install, replace the raw statement in its original migration with `rankKeyIndex()`. An existing `rank_key` column changes with `$table->rankKey()->change()`. |
 | `rankKey()` with no unique index | `rankKey()`, then `rankKeyIndex()` with the parent columns. |
 | A table column named `position` | Not allowed on an ordered table, because the package selects a computed `position`. Rename or drop it. |
+| A pivot order without a partial unique index on `(parent key, related key) where deleted_at is null` | Required now. Add it before the upgrade, as [Supported shapes](README.md#supported-shapes) shows. Soft delete every live duplicate pivot but one first, or the index creation fails. |
 
 **Guard each column drop.** A fresh `migrate` runs the edited migrations, which no longer add the revision columns, so an unguarded `dropColumn()` fails there:
 
@@ -49,8 +50,19 @@ if (Schema::hasColumn('sections', 'concurrency_revision')) {
 | A write that bypasses Eloquent fails at commit | Nothing refuses it. It changes the digest and dispatches no `Reordered`. |
 | No batch writes | `moveIn()` and `createInOrder()`, each with one `Reordered` per parent it changes. |
 | No way to lock a parent and read its members | `lockedMembers()`, inside a transaction. |
+| A relation filter that 0.0.1 accepted | Can throw `LogicException` on its first resolve, for one of the five shapes below. See [Filtering an ordered relation](README.md#filtering-an-ordered-relation). |
 
-**Map `NotAMember` beside `MembershipMismatch`.** `NotAMember`, `MembershipMismatch`, `InvalidAnchor`, and `InvalidKey` extend `InvalidArgumentException`, which extends `LogicException`. A handler that maps `LogicException` to a 500 catches all four. Register their mappings before any general `LogicException` mapping. `UnavailableParent` extends `RuntimeException`. Map it to a 422 or a 404 by its `reason`.
+**Check each relation filter.** The check on a relation's first resolve now also refuses:
+
+- a join of a table other than the pivot table of a pivot relation;
+- a `where()` that compares a column to an expression;
+- a parent-column read in any form other than `where('<item column>', $this->column)`;
+- a `null` parent value that does not compile as `whereNull('<item column>')`, such as `$this->kind ?? 'audio'`;
+- a `whereIn()` or `whereNotIn()` subquery that reads a table outside its own `from`.
+
+Each refusal throws `LogicException`, so every request that resolves the relation fails.
+
+**Map `NotAMember` beside `MembershipMismatch`.** `NotAMember`, `MembershipMismatch`, and `InvalidAnchor` extend `InvalidArgumentException`, which extends `LogicException`. A handler that maps `LogicException` to a 500 catches all three. Register their mappings before any general `LogicException` mapping. `InvalidKey` extends `InvalidArgumentException` too, but it reports invalid stored data, so leave it to the 500 mapping. `UnavailableParent` extends `RuntimeException`. Map it to 422 when the request names the parent in its body. Map it to 404 when the request addresses the parent in its path.
 
 **PHPStan.** The relation macros read as dynamic calls to static methods. See the `rules.neon` paragraph in [Declaring an ordered relation](README.md#declaring-an-ordered-relation).
 
@@ -71,4 +83,4 @@ AryeoHQ/aryeo #12280 and #12282 adopted 0.0.1 with these workarounds. Each one h
 | The hand-written `for no key update` in `Delete` | `lockedMembers()`, which locks the parents in the package's order. |
 | `extends OrderedCollection` on three collections | Removed. The collections keep their own base class. |
 | `loadPositions()` calls | Removed. |
-| `expected: null` | A string digest: pass the digest the API received in `If-Match`. `expected` is required, and `null` skips the check. |
+| `expected: null` | A string digest. When the nested index ETag is the order digest, the API passes the unquoted tag from `If-Match`. For `If-Match: *` it passes `null` (OCC-13). `expected` is required, and `null` skips the check. |
