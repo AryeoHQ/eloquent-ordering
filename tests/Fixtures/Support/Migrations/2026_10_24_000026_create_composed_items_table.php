@@ -17,7 +17,7 @@ return new class extends Migration
             $table->boolean('hidden')->default(false);
             $table->timestampsTz();
             $table->softDeletesTz();
-            $table->rankKeyIndex('parent_id'); // @phpstan-ignore staticMethod.dynamicCall
+            $table->rankKeyIndex('parent_id');
         });
     }
 

@@ -23,7 +23,7 @@ php artisan migrate
 
 `aryeo/eloquent-concurrency` installs with it. Run its migrations too, because they install the `concurrency_digest()` function.
 
-Laravel discovers `Support\Database\Eloquent\Ordering\Providers\Provider`. The provider registers the `rankKey()` and `rankKeyIndex()` Blueprint macros and the `withoutPositions()` builder macro. It also registers the listeners that refuse a late change to an order write. The related model of an ordered pivot registers its own listeners when it boots. The package ships no migration of its own.
+Laravel discovers `Support\Database\Eloquent\Ordering\Providers\Provider`. The provider registers the `rankKey()` and `rankKeyIndex()` Blueprint macros, the `withoutPositions()` builder macro, and the `arrange()`, `moveIn()`, `createInOrder()`, and `lockedMembers()` relation macros. It also registers the listeners that refuse a late change to an order write. The related model of an ordered pivot registers its own listeners when it boots. The package ships no migration of its own.
 
 ## Declaring an ordered relation
 
@@ -150,12 +150,17 @@ Asset::query()->withoutPositions()->get();                    // no count, no po
 ```php
 class Asset extends Model implements Ordered
 {
+    /** @use HasBuilder<Builder<static>> */
     use HasBuilder;
+
     use IsOrdered;
 
+    /**
+     * @return Builder<static>
+     */
     public function newQueryWithoutScopes()
     {
-        return $this->selectPositionOnKeyQuery(parent::newQueryWithoutScopes());
+        return $this->selectPositionOnKeyQuery(parent::newQueryWithoutScopes()); // @phpstan-ignore return.type
     }
 }
 ```
@@ -177,6 +182,114 @@ PHPStan reports a macro call such as `arrange()`, `moveIn()`, `createInOrder()`,
 includes:
     - vendor/aryeo/eloquent-ordering/tooling/phpstan/rules.neon
 ```
+
+The file covers the `rankKey()` and `rankKeyIndex()` Blueprint macros too.
+
+**Types stay the application's own.** Positions come from a global scope, so a query, a relation, and a result keep their classes. `$section->assets()->get()` is a `Collection<int, Asset>`, and `$asset->position` is `int|null`. A collection class that the model names, such as through `#[CollectedBy]`, still applies, and the collection needs no package base class. `arrange()` and `moveIn()` return an `OrderChange`. `createInOrder()` and `lockedMembers()` declare `Illuminate\Database\Eloquent\Collection<int, Model>`, so PHPStan sees `Model` items. Narrow them with `@var` where the item class matters.
+
+## Adopting on an existing table
+
+A table that already holds rows adopts in one migration: the rank key column, the keys of the existing rows, and the index. Then the two models take the attributes and traits. No call site changes: no load step, no builder method, and no collection base class.
+
+**1. Add the column, key the rows, then add the index.**
+
+```php
+Schema::table('assets', function (Blueprint $table): void {
+    $table->rankKey();
+});
+
+DB::statement(<<<'SQL'
+    do $$
+    begin
+        if exists (
+            select 1
+            from assets
+            where deleted_at is null
+              and section_id in (select section_id from assets where rank_key is null and deleted_at is null)
+            group by section_id
+            having count(*) > 3844
+        ) then
+            raise exception 'A section to key holds more than 3844 live assets.';
+        end if;
+    end
+    $$
+    SQL);
+
+DB::statement(<<<'SQL'
+    update assets
+    set rank_key = 'b' || substr(digits.d, ranked.n / 62 + 1, 1) || substr(digits.d, ranked.n % 62 + 1, 1)
+    from (
+        select id, (row_number() over (partition by section_id order by rank_key nulls last, sort_order, id) - 1)::int as n
+        from assets
+        where deleted_at is null
+          and section_id in (select section_id from assets where rank_key is null and deleted_at is null)
+    ) as ranked,
+    (select '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' as d) as digits
+    where assets.id = ranked.id
+    SQL);
+
+Schema::table('assets', function (Blueprint $table): void {
+    $table->rankKeyIndex('section_id');
+});
+```
+
+**The backfill is a deliberate exception to Mutation Exclusivity.** That php-archetype rule sends every write through a model. A model cannot write this backfill, because the package refuses a save that sets `rank_key` itself with `LogicException`. See [Exceptions](#exceptions). So the backfill runs as SQL, once, before any package write, with the legacy writers stopped.
+
+- **A row without a rank key is not a member.** It has no `position`, `arrange()` does not take it, and the order digest leaves it out. A save that keeps its parent assigns it no key, so key every live row in the migration.
+- The `update` keys each parent that holds a live row without a key. It keeps the parent's current key order, puts the rows without a key after them, and orders those by `sort_order`, then by `id`. `sort_order` stands for the column that holds the order today. Leave it out of the `order by` when no such column exists.
+- A parent whose live rows all have keys keeps those keys. Trashed rows keep a `null` key, as the package leaves them.
+- The keys run from `b00` to `bzz`, so the `update` keys at most 3,844 live rows per parent. The `do` block runs first and raises an error for a parent to key with more, so the `update` writes no invalid key.
+- Run the `update` before `rankKeyIndex()`. PostgreSQL checks a unique index on each row, so a rekey can collide with a key that the same statement replaces later.
+- For a table without `deleted_at`, drop every `deleted_at is null` condition. For a morph parent, partition, group, and match by both columns.
+- **A pivot table needs more first.** Give it an `id` primary key (UUID or integer) and `softDeletesTz()`. Soft delete every live duplicate `(parent key, related key)` pivot but one, in the `deleted_at` column that `softDeletesTz()` adds. Then run both statements, partitioned, grouped, and matched by the parent key. Last, add `rankKeyIndex()` with the parent key, and the partial unique index from [Supported shapes](#supported-shapes).
+- **Stop the code that predates the package before the migration runs, and run the statements once.** They bypass Eloquent: they take no lock and dispatch no `Reordered`. That code inserts rows without a key.
+- **A rollout that cannot stop that code first keys its new rows in one more migration, after the code stops.** That migration drops the index with `dropIndex('assets_section_id_rank_key_unique')`, runs both statements, and adds `rankKeyIndex('section_id')` again. With the index in place, the `update` fails. It renumbers every live row of a parent, and a package write can leave a key that a renumbered row takes.
+- A table that already has a `rank_key` column changes it with `$table->rankKey()->change()`. That makes it `varchar(64) collate "C" null`, and keeps every value.
+- A legacy column named `position` must go after the backfill. See [Limits](#limits).
+
+**Existing keys must be valid.** The package keeps each stored key, so an order survives the adoption unchanged. A valid key uses only `0-9`, `A-Z`, and `a-z`. Its first character sets the length of its integer part: `a` and `Z` take one more character, `b` and `Y` take two, and so on. The fraction after the integer part must not end in `0`. So `a0` to `az` are valid keys, and so are `b00` to `bzz`. A write that computes a key next to an invalid stored key throws `InvalidKey`.
+
+**2. Declare the parent and the item.**
+
+```php
+class Section extends Model implements OrdersRelations, Revisioned
+{
+    use HasConcurrencyRevisions;
+    use HasOrderedRelations;
+
+    /** @return HasMany<Asset, $this> */
+    #[OrdersRelation(SectionRevision::AssetsOrder)]
+    public function assets(): HasMany
+    {
+        return $this->hasMany(Asset::class);
+    }
+}
+
+#[OrderedIn(Section::class)]
+class Asset extends Model implements Ordered
+{
+    use IsOrdered;
+    use SoftDeletes;
+
+    /** @return BelongsTo<Section, $this> */
+    public function section(): BelongsTo
+    {
+        return $this->belongsTo(Section::class);
+    }
+}
+```
+
+A pivot order also needs `#[OrderedThrough]` on the related model. See [A related model of an ordered pivot](#a-related-model-of-an-ordered-pivot).
+
+**3. Read positions with no other call.**
+
+```php
+$section->assets;                                              // each asset carries its position
+Asset::query()->where('visible', true)->cursorPaginate(15);    // true positions, one query
+Route::get('/assets/{asset}', fn (Asset $asset): array => ['position' => $asset->position]);
+```
+
+Each read selects `position` in the statement that reads the row. `null` means that the row is not a member. Writes start from `$asset->move()` and the relation macros, as the sections below describe.
 
 ## Supported shapes
 
@@ -248,6 +361,8 @@ class Video extends Model implements Ordered, OrdersRelations, Revisioned
 
 **A `Revisioned` item leaves `rank_key` out of its own revision.** `IsOrdered` merges `rank_key` into the model's unobserved columns, so a move within a parent, a reorder, and a rebalance keep the item's own digest. A move between parents changes it, because it changes the foreign key. After `move()`, the item holds the own digest of the row that the move saved.
 
+**An item's own digest does not cover its position.** A move within the parent, an `arrange()`, and a write to another member can each change the position and keep the digest. An API that tags an item with its own digest adds the position to that ETag (ORD-39).
+
 ## Filtering an ordered relation
 
 A relation method may filter its members with `where()`. Declare every column such a filter reads in `membership:`, qualified by its table:
@@ -283,7 +398,7 @@ The package checks each relation once per process, when it first resolves. The c
 - with the parent column set to `null`, the relation compiles that pair as anything but `whereNull('<item column>')`. A fallback such as `$this->kind ?? 'audio'` fails this check, and so does a clause that applies only when the column is set;
 - a `whereIn()` or `whereNotIn()` subquery reads a table outside its own `from`, such as the item table. The position query counts the members under an alias.
 
-The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The parent's `id` needs none either, but a filter that reads it must take the pair form, such as `where('assets.root_id', $this->id)`. The check reads the relation's clauses before any global scope applies, and an order write ignores every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query. A relation with a subquery filter runs one `explain` of its position query on PostgreSQL, inside a savepoint.
+The foreign key, the morph type, the item's `deleted_at`, and a soft-deleting related model's `deleted_at` need no declaration. The parent's `id` needs none either, but a filter that reads it must take the pair form, such as `where('assets.root_id', $this->id)`. The check reads the relation's clauses before any global scope applies, and an order write ignores every global scope except `SoftDeletingScope`. It finds the parent columns that a relation reads by building the relation once with each parent column set to a probe value. The first check of each parent table runs one column-listing query. A relation with a subquery filter runs one `explain` of its position query on PostgreSQL, inside a transaction, or a savepoint when the caller holds one.
 
 The probe bypasses the column's cast, so `where('tracks.kind', $this->kind)` works when `kind` casts to an enum. A relation that reads the column through an accessor, or reads a property of the cast value such as `$this->kind->value`, throws `LogicException`.
 
@@ -393,7 +508,7 @@ Both outcomes leave the data unchanged. A move that keeps the order writes nothi
 | `parent` | The parent whose order changed. |
 | `revision` | The `NamesConcurrencyRevision` that names that order. |
 | `order` | The id of every member after the write, in order. A member's position is its index plus 1. |
-| `changed` | A `PositionChange` for each member that moved: `id`, `position` (`null` when it left this order), and `previousPosition` (`null` when it is new to this order). |
+| `changed` | A `PositionChange` for each member that the write lists: `id`, `position` (`null` when it left this order), and `previousPosition` (`null` when it is new to this order). `move()` and `moveIn()` list only the items they name, and leave out a member that shifts to make room. `arrange()` lists every member whose position changed. Read `order` for every position. |
 | `digest` | The order digest after the write, read inside the write's transaction. |
 | `source` | For a move between parents, the `OrderChange` of the parent the item left. Otherwise `null`. |
 
@@ -414,7 +529,7 @@ $change = $destination->assets()->moveIn([$third, $first], expected: $digest, pl
 
 `moveIn()` reads each item's stored parent. It then locks the destination, each source parent, and every ordering parent above them, in the order that `lockedMembers()` uses. Under the locks it re-reads the stored rows of the items and of every ordered model that it locked. It starts again when one of them moved meanwhile. After 5 attempts it throws `ContendedOrder`, which names the destination. Before it writes, it throws `NotAMember` with the id of every item that its order no longer holds. `moveIn()` compares `expected` before this check, so a stale `expected` throws `StaleConcurrencyRevision` instead. `NotAMember` remains for `expected: null` and for a current digest. A trashed or missing destination throws `UnavailableParent`, unless every item is already in it. An anchor among the moved items throws `InvalidAnchor`. An unsaved item, an item of another class or connection, and an item named twice throw `LogicException`.
 
-It returns the destination's `OrderChange`. `changed` lists each moved item whose position in the destination changed, and an item that enters has a `null` `previousPosition`. A named item whose position stays the same is not in `changed`, as in `arrange()`. `source` holds the source's change only when exactly one other parent gave items. With several, `source` is `null`, and each source's change reaches its own `Reordered`. Each item instance gets its new `position`, its new foreign key, and the destination as its loaded parent relation. A call that keeps the order writes nothing and dispatches nothing.
+It returns the destination's `OrderChange`. `changed` lists each moved item whose position in the destination changed, and an item that enters has a `null` `previousPosition`. A named item whose position stays the same is not in `changed`. A member that shifts to make room is not in `changed` either, so read `order` for every position. `source` holds the source's change only when exactly one other parent gave items. With several, `source` is `null`, and each source's change reaches its own `Reordered`. Each item instance gets its new `position`, its new foreign key, and the destination as its loaded parent relation. A call that keeps the order writes nothing and dispatches nothing.
 
 ## Reordering a parent
 
@@ -462,7 +577,7 @@ Every write that changes an order first locks the parent rows with `SELECT … F
 
 A `move()` re-reads the stored foreign key under the lock. If another transaction moved the item meanwhile, `move()` starts again against the new parent. After 5 such attempts it throws `ContendedOrder`. If another transaction trashed or deleted the item, or deleted its parent row, `move()` throws `NotAMember` and changes nothing. `move()` compares `expected` before this check, so a stale `expected` throws `StaleConcurrencyRevision` instead. `NotAMember` remains for `expected: null` and for a current digest.
 
-**A trashed or missing parent takes no new member.** A create, a `createInOrder()`, a move into another parent, a save that changes the parent, and a restore check the destination's locked row. When that row is soft deleted, or gone, the write throws `UnavailableParent` and changes nothing. Its `reason` is a `ParentUnavailability` case: `Trashed` or `Missing`. The check reads the row under the lock, so a write that waited on a concurrent delete sees the delete. A parent row that is gone counts as `Missing`, whether the write holds the parent instance or reads it by its key. Items can still leave a trashed parent: a move out of it, a delete from it, a move inside it, and an `arrange()` of it all succeed.
+**A trashed or missing parent takes no new member.** A create, a `createInOrder()`, a move into another parent, a save that changes the parent, and a restore check the destination's locked row. When that row is soft deleted, or gone, the write throws `UnavailableParent` and changes nothing. Its `reason` is a `ParentUnavailability` case: `Trashed` or `Missing`. The check reads the row under the lock, so a write that waited on a concurrent delete sees the delete. A parent row that is gone counts as `Missing`, whether the write holds the parent instance or reads it by its key. Items can still leave a trashed parent: a move out of it, a delete from it, a move inside it, and an `arrange()` of it all succeed. A write inside a trashed parent reports counted positions in its `OrderChange`. Every read of its members, and the instance that the write fills, holds a `null` `position`.
 
 **Lock the parents before the item.** Every `Ordered` model implements `LocksParentsFirst` from eloquent-concurrency. `parentsToLockFirst()` returns the parent that the item's original attributes name, then the parent that its current attributes name, each once, and takes no lock. Code that locks an item before it writes it, such as an `If-Match` check, must first lock those parents by depth below the root, then in `(morph class, key)` order. An item locked before its parent can deadlock with an `arrange()` of that parent.
 
@@ -484,6 +599,8 @@ DB::transaction(function () use ($subsection, $destination, $ifMatch): void {
 
 The flow compares the destination's `If-Match` once, after `lockedMembers()` holds the locks, so `moveIn()` takes `expected: null`.
 
+For a pivot relation, `lockedMembers()` returns the related models, but `moveIn()` takes the pivots. Pass `->pluck('pivot')` to `moveIn()`.
+
 `lockedMembers(Model ...$alsoLock)` locks the parent, each model in `$alsoLock`, and every ordering parent above them, up to the root. It reads the parents of each ordered model from its stored row, and the parents that each model's pivot rows reach. It also locks the parents that a model's `parentsToLockFirst()` names, but only the stored parents set the lock order. A held model whose loaded attributes name an old parent therefore cannot change the order. It locks ancestors before descendants: by depth below the root, then in `(morph class, key)` order within one depth. A model's depth is its longest path to a root, so each model locks once, after every parent it has. The call then re-reads the stored foreign keys of every ordered model that it locked. If another transaction moved one of them meanwhile, the call releases its locks and starts again. After 5 such attempts it throws `ContendedOrder`. It then returns the parent's current members in order, with `position` selected. The list includes a member that a global scope hides, and no trashed member. An API must therefore not render the list to a caller, because a tenant scope does not filter it. For a pivot relation it returns the related models, and each `pivot` carries its `position`. Like `arrange()`, it reads the declared relation and ignores a constraint that the caller adds. It refuses no trashed parent. Outside a transaction it throws `LogicException`, because its row locks would end with the statement. Before it locks anything, it throws `LogicException` for a model to lock that is unsaved or uses another connection than the parent, because the transaction cannot hold that lock.
 
 **Take an application lock before the first package write.** A package write locks parents as it runs. A lock that the application takes after it can deadlock with a transaction that takes the same locks in the other order. So take any lock of your own first, and pass every parent that the transaction writes to `lockedMembers()`.
@@ -495,6 +612,20 @@ No attribute value makes `parentsToLockFirst()` throw. It leaves out a parent th
 A model that uses both traits locks that whole list by depth below the root, then in `(morph class, key)` order, before it locks any parent for a single role. A soft delete, a restore, and a save that changes a column the pivot parents watch all lock it this way. Such a write therefore cannot deadlock with a caller that locks the sorted list first.
 
 **A parent that is also an item locks its own parents first.** A save of such a model can change a declared parent column and a column that its own order watches, such as its foreign key. That save locks the sorted `parentsToLockFirst()` list before it locks the model's own row. An `arrange()` of the model's parent locks that parent before it writes the model, so the two writes cannot deadlock. The order of the two traits in the class does not change this.
+
+## Transactions and savepoints
+
+The package opens these transactions around the application's writes. Laravel's `transaction()` opens a savepoint when a transaction is already open, so each one adds one to `DB::transactionLevel()` while it runs.
+
+| Write | What the package opens |
+|---|---|
+| `save()` or `delete()` of an item, of a parent that uses `HasOrderedRelations`, or of a related model that uses `OrdersThroughPivots` | One transaction, through eloquent-concurrency's `WritesInTransactions`, whether or not the write changes an order. The events that `save()` and `delete()` fire run inside it. `update()`, `restore()`, and `forceDelete()` reach `save()` or `delete()`, so each opens one too. `restoring`, `restored`, `forceDeleting`, and `forceDeleted` fire outside it. `attach()` and `detach()` save or delete each pivot row, so each opens one transaction per pivot row. A batch of pivots is atomic only inside an application transaction. |
+| `move()`, `arrange()`, `moveIn()`, and `createInOrder()` | One transaction. The copies that the write saves open none, so their events run directly inside it. Each record that `createInOrder()` creates goes through `save()`, which opens one more. For a pivot relation, a record saves the related model and then the pivot, so it opens two in turn, never two at once. |
+| `lockedMembers()` | No transaction: it requires the caller's. |
+| Each attempt to lock an order inside `move()`, `moveIn()`, `lockedMembers()`, a `save()` of an existing item, or a `delete()` of an item, including a soft delete, a force delete, and a `detach()` of an ordered pivot | One savepoint. The package releases it once it holds the locks, or rolls back to it before the next attempt. `arrange()`, `createInOrder()`, and a create lock their parents directly, with no savepoint and no retry. |
+| The first check of a relation that filters through a subquery | One transaction around one `explain`, once per relation and process. Inside the caller's transaction it is a savepoint. |
+
+`Reordered` and `Rebalanced` dispatch after the outermost transaction commits.
 
 ## Model events
 
@@ -644,6 +775,7 @@ $this->moveOnFirstRead($asset->section(), $other);    // points the foreign key 
 | `StaleConcurrencyRevision` (`RuntimeException`, from eloquent-concurrency) | `expected` does not match the order digest. |
 | `MembershipMismatch` (`InvalidArgumentException`) | `arrange()` does not list each current member exactly once. |
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
+| `InvalidKey` (`InvalidArgumentException`) | A write computes a key next to a stored rank key that is not valid. See [Adopting on an existing table](#adopting-on-an-existing-table). |
 | `ContendedOrder` (`RuntimeException`) | The item, the parent passed to `lockedMembers()`, or an item passed to `moveIn()` changed parent during each of 5 attempts to lock its order. For `lockedMembers()` and `moveIn()` the message names the relation's parent. |
 | `NotAMember` (`InvalidArgumentException`) | `move()` or `moveIn()` names an item that its order no longer holds, because another transaction trashed or deleted it or deleted its parent row. `class` and `ids` name the items, every one for `moveIn()`. The move changed nothing. |
 | `UnavailableParent` (`RuntimeException`) | A create, a `createInOrder()`, a move into another parent, a save that changes the parent, or a restore targets a parent whose locked row is trashed or gone. `parent` names the parent, and `reason` is `ParentUnavailability::Trashed` or `ParentUnavailability::Missing`. The write changed nothing. |

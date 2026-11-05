@@ -5,6 +5,9 @@ parameters:
             message: '#^Dynamic call to static method Illuminate\\Database\\Schema\\Blueprint::rankKey\(\)\.$#'
         -
             identifier: staticMethod.dynamicCall
+            message: '#^Dynamic call to static method Illuminate\\Database\\Schema\\Blueprint::rankKeyIndex\(\)\.$#'
+        -
+            identifier: staticMethod.dynamicCall
             message: '#^Dynamic call to static method Illuminate\\Database\\Eloquent\\Relations\\\w+<.+>::arrange\(\)\.$#'
         -
             identifier: staticMethod.dynamicCall
