@@ -18,6 +18,7 @@ use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Support\Database\Eloquent\Ordering\Schema\Macros;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 use WeakMap;
 
 /**
@@ -33,8 +34,8 @@ class Provider extends ServiceProvider
     {
         (new Macros)->register();
 
-        Builder::macro('withPositions', function (): Builder {
-            throw new LogicException(sprintf('[withPositions()] numbers only a query that [%s::query()] returns.', OrderedRelation::class));
+        Builder::macro('withoutPositions', function (): Builder {
+            return $this->withoutGlobalScope(SelectsPosition::class);
         });
 
         Event::listen(['eloquent.creating: *', 'eloquent.updating: *'], self::requirePreparedOrder(...));
@@ -239,7 +240,7 @@ class Provider extends ServiceProvider
         assert($relation instanceof BelongsToMany);
 
         $pivotClass = $relation->getPivotClass();
-        $query = (new $pivotClass)->setTable($relation->getTable())->setConnection($related->getConnectionName())->newQueryWithoutScopes()->useWritePdo()
+        $query = (new $pivotClass)->setTable($relation->getTable())->setConnection($related->getConnectionName())->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->useWritePdo()
             ->where($relation->getRelatedPivotKeyName(), $related->getAttribute($relation->getRelatedKeyName()));
 
         if ($relation instanceof MorphToMany) {
@@ -260,7 +261,7 @@ class Provider extends ServiceProvider
         $reached = [];
         $ownerKey = $relation->getParentKeyName();
 
-        foreach ($template->newQueryWithoutScopes()->useWritePdo()->whereIn($ownerKey, array_keys($pivots))->orderBy($ownerKey)->get() as $model) {
+        foreach ($template->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->useWritePdo()->whereIn($ownerKey, array_keys($pivots))->orderBy($ownerKey)->get() as $model) {
             if ($model instanceof OrdersRelations && $model instanceof Revisioned) {
                 $reached[] = [new OrderedRelation($model, $declaration->revision), array_values(array_filter($pivots[self::keyOf($model->getAttribute($ownerKey))] ?? []))];
             }

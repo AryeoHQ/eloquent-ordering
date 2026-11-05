@@ -20,6 +20,7 @@ use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
@@ -32,6 +33,14 @@ class ProviderTest extends TestCase
     public function it_boots_the_provider(): void
     {
         $this->assertTrue($this->app->providerIsLoaded(Provider::class));
+    }
+
+    #[Test]
+    public function it_registers_a_without_positions_macro_on_every_eloquent_builder(): void
+    {
+        $this->assertContains(SelectsPosition::class, Customer::query()->withoutPositions()->removedScopes());
+        $this->assertContains(SelectsPosition::class, ListingCustomer::query()->withoutPositions()->removedScopes());
+        $this->assertSame([], Customer::query()->withoutPositions()->get()->all());
     }
 
     #[Test]
@@ -123,7 +132,7 @@ class ProviderTest extends TestCase
     }
 
     #[Test]
-    public function it_needs_no_ordered_through_on_a_related_model_whose_columns_no_order_watches(): void
+    public function it_refuses_a_parent_whose_ordered_pivots_reach_a_model_that_no_order_watches_without_orders_through_pivots(): void
     {
         $related = (new class extends Model
         {
@@ -150,7 +159,10 @@ class ProviderTest extends TestCase
         };
         $parent::$related = $related;
 
-        $this->assertSame(ListingRevision::CustomersOrder, $parent->orderedRelation(ListingRevision::CustomersOrder)->revision);
+        $this->assertRefused(
+            sprintf('[%s::customers()] orders the pivots of [%2$s], so [%2$s] must use [%3$s].', $parent::class, $related, OrdersThroughPivots::class),
+            $parent,
+        );
     }
 
     #[Test]

@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Model;
 use ReflectionMethod;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Exceptions\WriteHalted;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 use WeakMap;
 
 /**
@@ -25,7 +26,7 @@ final class OrderWrite
 
     public static function copy(Model $model, bool $timestamps): null|Model
     {
-        $copy = $model->newQueryWithoutScopes()->useWritePdo()->whereKey($model->getKey())->first();
+        $copy = $model->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->useWritePdo()->whereKey($model->getKey())->first();
 
         if ($copy !== null) {
             $copy->timestamps = $timestamps;
@@ -42,7 +43,7 @@ final class OrderWrite
     {
         $copies = [];
 
-        foreach ($template->newQueryWithoutScopes()->useWritePdo()->whereIn($template->getQualifiedKeyName(), $ids)->get() as $copy) {
+        foreach ($template->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->useWritePdo()->whereIn($template->getQualifiedKeyName(), $ids)->get() as $copy) {
             $key = $copy->getKey();
 
             if (is_int($key) || is_string($key)) {

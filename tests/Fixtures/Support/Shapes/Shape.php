@@ -14,6 +14,7 @@ use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
+use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 
 abstract class Shape
 {
@@ -124,7 +125,7 @@ abstract class Shape
 
     public function find(int|string $id): Model&Ordered
     {
-        $member = $this->memberClass()::query()->withoutGlobalScopes()->findOrFail($id);
+        $member = $this->memberClass()::query()->withoutGlobalScopes()->withGlobalScope(SelectsPosition::class, new SelectsPosition)->findOrFail($id);
 
         assert($member instanceof Ordered);
 

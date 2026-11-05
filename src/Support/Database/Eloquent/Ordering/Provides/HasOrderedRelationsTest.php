@@ -39,6 +39,8 @@ use Tests\Fixtures\Support\Clips\Clip;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\Customerable;
 use Tests\Fixtures\Support\Events\ModelEvents;
+use Tests\Fixtures\Support\Listings\KeyedListing;
+use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Playlists\Playlist;
@@ -49,6 +51,7 @@ use Tests\Fixtures\Support\Sections\SectionRevision;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Shelves\Shelf;
+use Tests\Fixtures\Support\Tours\KeyedTour;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\Fixtures\Support\Tracks\Track;
@@ -263,63 +266,18 @@ class HasOrderedRelationsTest extends TestCase
         }, TourRevision::ScenesOrder, 'scenes()'];
 
         yield 'belongs to many' => [static function (string $ownerKey): Model&OrdersRelations {
-            $parent = new class extends Model implements OrdersRelations, Revisioned
-            {
-                use HasConcurrencyRevisions;
-                use HasOrderedRelations;
-
-                public string $ownerKey = 'id';
-
-                protected $table = 'listings';
-
-                /**
-                 * @return BelongsToMany<Model, $this, ListingCustomer>
-                 */
-                #[OrdersRelation(ListingRevision::CustomersOrder)]
-                public function customers(): BelongsToMany
-                {
-                    return $this->belongsToMany(HasOrderedRelationsTest::unwatchedCustomer(), 'listing_customer', 'listing_id', 'customer_id', $this->ownerKey)->using(ListingCustomer::class);
-                }
-            };
+            $parent = new KeyedListing;
             $parent->ownerKey = $ownerKey;
 
             return $parent;
         }, ListingRevision::CustomersOrder, 'customers()'];
 
         yield 'morph to many' => [static function (string $ownerKey): Model&OrdersRelations {
-            $parent = new class extends Model implements OrdersRelations, Revisioned
-            {
-                use HasConcurrencyRevisions;
-                use HasOrderedRelations;
-
-                public string $ownerKey = 'id';
-
-                protected $table = 'tours';
-
-                /**
-                 * @return MorphToMany<Model, $this, Customerable>
-                 */
-                #[OrdersRelation(TourRevision::CustomersOrder)]
-                public function customers(): MorphToMany
-                {
-                    return $this->morphToMany(HasOrderedRelationsTest::unwatchedCustomer(), 'customerable', 'customerables', relatedPivotKey: 'customer_id', parentKey: $this->ownerKey)->using(Customerable::class);
-                }
-            };
+            $parent = new KeyedTour;
             $parent->ownerKey = $ownerKey;
 
             return $parent;
         }, TourRevision::CustomersOrder, 'customers()'];
-    }
-
-    /**
-     * @return class-string<Model>
-     */
-    public static function unwatchedCustomer(): string
-    {
-        return (new class extends Model
-        {
-            protected $table = 'customers';
-        })::class;
     }
 
     /**
@@ -383,6 +341,14 @@ class HasOrderedRelationsTest extends TestCase
     }
 
     /**
+     * @return iterable<string, array{PivotShape}>
+     */
+    public static function pivots(): iterable
+    {
+        return PivotShape::pivots();
+    }
+
+    /**
      * @param  Closure(Shape): array{list<Model>, Closure(): mixed, list<string>}  $prepare
      */
     #[DataProvider('eloquentWrites')]
@@ -431,6 +397,20 @@ class HasOrderedRelationsTest extends TestCase
 
         $this->assertSame($section, $relation->parent);
         $this->assertSame(SectionRevision::AssetsOrder, $relation->revision);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_selects_the_pivot_position_in_a_parent_query_that_runs_before_the_related_model_boots(PivotShape $shape): void
+    {
+        [$parent, [$member]] = $shape->with(1);
+        $customer = Customer::query()->findOrFail($member->getAttribute('customer_id'));
+        $inverse = $parent instanceof Listing ? 'listings' : 'tours';
+        Model::clearBootedModels();
+
+        $pivots = $customer->{$inverse}()->get()->map(fn (Model $parent): mixed => $parent->getRelation('pivot')->getAttribute('position'));
+
+        $this->assertSame([1], $pivots->all());
     }
 
     #[Test]
