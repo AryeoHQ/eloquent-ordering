@@ -61,6 +61,43 @@ class ContendedOrderTest extends TestCase
         $this->assertSame($before, $this->stored($shape, $moved, $source, $other));
     }
 
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_gives_up_a_move_in_after_five_attempts_when_an_item_changes_parent_before_each_lock(Shape $shape): void
+    {
+        [$source, [, $moved]] = $shape->with(2);
+        $other = $shape->createParent();
+        [$destination] = $shape->with(1);
+        $before = [$this->stored($shape, $moved, $source, $other), $shape->digest($destination), $shape->rankKeys($destination)];
+        $table = $shape->memberTable();
+        $reads = 0;
+
+        DB::listen(function (QueryExecuted $query) use (&$reads, $shape, $moved, $source, $other, $table): void {
+            if (! str_starts_with($query->sql, sprintf('select "%s", ', $moved->getKeyName())) || ! str_contains($query->sql, sprintf('from "%s" where "%s"."%s" in', $table, $table, $moved->getKeyName()))) {
+                return;
+            }
+
+            throw_if(++$reads > 10, RuntimeException::class, 'The item was read past five attempts.');
+
+            $row = DB::table($table)->where('id', $moved->getKey())->first();
+            $this->assertIsObject($row);
+
+            DB::table($table)->where('id', $moved->getKey())->update([
+                $shape->foreignKey() => $row->{$shape->foreignKey()} === $source->getKey() ? $other->getKey() : $source->getKey(),
+            ]);
+        });
+
+        try {
+            $shape->relation($destination)->moveIn([$moved], expected: null);
+            $this->fail('An item that changed parent before each lock was moved in.');
+        } catch (ContendedOrder $exception) {
+            $this->assertStringContainsString(sprintf('[%s:%s]', $destination::class, $destination->getKey()), $exception->getMessage());
+        }
+
+        $this->assertSame(10, $reads);
+        $this->assertSame($before, [$this->stored($shape, $moved, $source, $other), $shape->digest($destination), $shape->rankKeys($destination)]);
+    }
+
     /**
      * @return list<mixed>
      */

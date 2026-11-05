@@ -160,16 +160,18 @@ class Asset extends Model implements Ordered
 }
 ```
 
-Every order write starts from the item or from the parent's Eloquent relation. `move()` writes through the item, and `arrange()` writes through the relation:
+Every order write starts from the item or from the parent's Eloquent relation. `move()` writes through the item. `arrange()`, `moveIn()`, and `createInOrder()` write through the relation:
 
 ```php
 $asset->move(Placement::first(), expected: $digest);
 $section->assets()->arrange([$thirdId, $firstId, $secondId], expected: $digest);
+$section->assets()->moveIn([$asset, $other], expected: $digest);
+$section->assets()->createInOrder([['name' => 'Front'], ['name' => 'Back']]);
 ```
 
-`arrange()` is a macro on every Eloquent relation. It resolves the declaration by the ordered item class: the related class of a HasMany or MorphMany, and the pivot class of a BelongsToMany or MorphToMany. The relation must also match the declared relation's keys: the foreign key, the owner key, and the morph type and class. A pivot relation must also match the pivot table, the related pivot key, the related table, and the related key. A relation that orders nothing throws `LogicException`.
+Each of these relation writes is a macro on every Eloquent relation. It resolves the declaration by the ordered item class: the related class of a HasMany or MorphMany, and the pivot class of a BelongsToMany or MorphToMany. The relation must also match the declared relation's keys: the foreign key, the owner key, and the morph type and class. A pivot relation must also match the pivot table, the related pivot key, the related table, and the related key. A relation that orders nothing throws `LogicException`.
 
-PHPStan reports a macro call such as `arrange()` as a dynamic call to a static method. The package registers `tooling/phpstan/rules.neon` under `extra.tooling.phpstan.rules`, so an adopter on `aryeo/tooling-laravel` gets its suppression with no change. Any other PHPStan setup includes it in `phpstan.neon`:
+PHPStan reports a macro call such as `arrange()`, `moveIn()`, `createInOrder()`, or `lockedMembers()` as a dynamic call to a static method. The package registers `tooling/phpstan/rules.neon` under `extra.tooling.phpstan.rules`, so an adopter on `aryeo/tooling-laravel` gets its suppression with no change. Any other PHPStan setup includes it in `phpstan.neon`:
 
 ```neon
 includes:
@@ -364,6 +366,10 @@ $asset->save();                                                  // after the an
 
 An anchor must be a current member of the same parent. Otherwise `InvalidAnchor` (`InvalidArgumentException`) is thrown. `placeAt()` throws `LogicException` for a saved item, and for a placement that names a parent. A create takes no `expected`, because it leaves no parent.
 
+**Create several items at once with `createInOrder()`.** It creates each record through the relation, as the relation's `create()` does, in the order given, after every member. It runs in one transaction and dispatches one `Reordered` for the collection, which lists every new member. The api-standards treat a bulk create as one create per instance (ACT-12), so an API that serves a bulk-create action with `createInOrder()` emits one `reordered` event per created item itself. The keys come from one `FractionalIndex::keysBetween()` call. When another write in the same transaction takes a key at the end of the parent, the remaining keys come from one more call. It returns the created models, as `createMany()` does. For a pivot relation each record holds the related model's attributes, and the relation attaches it. A trashed or missing parent throws `UnavailableParent`, and nothing is created. An empty list returns an empty collection, and locks and checks nothing.
+
+A create that a listener makes during `createInOrder()` joins no batch. It takes the key for its own placement and dispatches its own `Reordered`. A nested `createInOrder()` on the same parent also dispatches its own `Reordered`, which lists only its own records.
+
 ## Moving an item
 
 ```php
@@ -394,6 +400,21 @@ Both outcomes leave the data unchanged. A move that keeps the order writes nothi
 After a move between two parents of one class, the item's loaded parent relation holds the destination. A morph move to a parent of another class unloads that relation instead, so read the destination from `OrderChange::$parent`.
 
 A save through Eloquent that changes the parent, such as `$asset->update(['section_id' => $other->id])`, moves the item to the end of the new parent without an `expected` check, so use `move()` when the caller needs one. Such a save is no substitute for ORD-08, which requires an API to return 422 for an update that would move an item to another ordered collection. A save that leaves every parent, such as one that sets a nullable foreign key to `null`, clears the item's rank key.
+
+## Moving several items
+
+```php
+$change = $destination->assets()->moveIn([$third, $first], expected: $digest);                              // last
+$change = $destination->assets()->moveIn([$third, $first], expected: $digest, placement: Placement::first());
+```
+
+`moveIn(iterable $items, ?string $expected, ?Placement $placement = null)` moves every item to one placement in the relation's parent, in the order given. The items can come from any parents, including this one. `null` places them last. The placement names no parent, because the relation names the destination. Pass the item class: the pivot for a pivot relation.
+
+`expected` is required, and holds the order revision of the destination. It works as `move()`'s does. An item whose instance names a parent that the item no longer has throws `StaleConcurrencyRevision`, as `move()` does. `expected: null` skips both checks and moves each item from its stored parent.
+
+`moveIn()` reads each item's stored parent. It then locks the destination, each source parent, and every ordering parent above them, in the order that `lockedMembers()` uses. Under the locks it re-reads the stored rows of the items and of every ordered model that it locked. It starts again when one of them moved meanwhile. After 5 attempts it throws `ContendedOrder`, which names the destination. Before it writes, it throws `NotAMember` with the id of every item that its order no longer holds. `moveIn()` compares `expected` before this check, so a stale `expected` throws `StaleConcurrencyRevision` instead. `NotAMember` remains for `expected: null` and for a current digest. A trashed or missing destination throws `UnavailableParent`, unless every item is already in it. An anchor among the moved items throws `InvalidAnchor`. An unsaved item, an item of another class or connection, and an item named twice throw `LogicException`.
+
+It returns the destination's `OrderChange`. `changed` lists each moved item whose position in the destination changed, and an item that enters has a `null` `previousPosition`. A named item whose position stays the same is not in `changed`, as in `arrange()`. `source` holds the source's change only when exactly one other parent gave items. With several, `source` is `null`, and each source's change reaches its own `Reordered`. Each item instance gets its new `position`, its new foreign key, and the destination as its loaded parent relation. A call that keeps the order writes nothing and dispatches nothing.
 
 ## Reordering a parent
 
@@ -433,7 +454,7 @@ Every write that changes an order first locks the parent rows with `SELECT … F
 
 - A create always locks its parent.
 - An update locks only when `rank_key`, a foreign key, a morph type, a declared item column, or `deleted_at` is dirty.
-- A delete, `move()`, and `arrange()` lock too.
+- A delete, `move()`, `moveIn()`, `arrange()`, and `createInOrder()` lock too.
 - A save of a parent locks it when a declared parent column is dirty.
 - A soft delete, a restore, or a declared-column save of a pivot's related model locks every parent that its pivots reach.
 - A create, a restore, a delete, and a watched-column save of a pivot lock its related row `FOR SHARE` after the parent, when the relation filters on the related model. The filter is the related model's `deleted_at` or a declared related column. The pivot write then waits for a related write that has not committed, and reads its result.
@@ -441,7 +462,7 @@ Every write that changes an order first locks the parent rows with `SELECT … F
 
 A `move()` re-reads the stored foreign key under the lock. If another transaction moved the item meanwhile, `move()` starts again against the new parent. After 5 such attempts it throws `ContendedOrder`. If another transaction trashed or deleted the item, or deleted its parent row, `move()` throws `NotAMember` and changes nothing. `move()` compares `expected` before this check, so a stale `expected` throws `StaleConcurrencyRevision` instead. `NotAMember` remains for `expected: null` and for a current digest.
 
-**A trashed or missing parent takes no new member.** A create, a move into another parent, a save that changes the parent, and a restore check the destination's locked row. When that row is soft deleted, or gone, the write throws `UnavailableParent` and changes nothing. Its `reason` is a `ParentUnavailability` case: `Trashed` or `Missing`. The check reads the row under the lock, so a write that waited on a concurrent delete sees the delete. A parent row that is gone counts as `Missing`, whether the write holds the parent instance or reads it by its key. Items can still leave a trashed parent: a move out of it, a delete from it, a move inside it, and an `arrange()` of it all succeed.
+**A trashed or missing parent takes no new member.** A create, a `createInOrder()`, a move into another parent, a save that changes the parent, and a restore check the destination's locked row. When that row is soft deleted, or gone, the write throws `UnavailableParent` and changes nothing. Its `reason` is a `ParentUnavailability` case: `Trashed` or `Missing`. The check reads the row under the lock, so a write that waited on a concurrent delete sees the delete. A parent row that is gone counts as `Missing`, whether the write holds the parent instance or reads it by its key. Items can still leave a trashed parent: a move out of it, a delete from it, a move inside it, and an `arrange()` of it all succeed.
 
 **Lock the parents before the item.** Every `Ordered` model implements `LocksParentsFirst` from eloquent-concurrency. `parentsToLockFirst()` returns the parent that the item's original attributes name, then the parent that its current attributes name, each once, and takes no lock. Code that locks an item before it writes it, such as an `If-Match` check, must first lock those parents by depth below the root, then in `(morph class, key)` order. An item locked before its parent can deadlock with an `arrange()` of that parent.
 
@@ -455,15 +476,13 @@ DB::transaction(function () use ($subsection, $destination, $ifMatch): void {
         throw new StaleConcurrencyRevision($destination, SectionRevision::AssetsOrder, $ifMatch);
     }
 
-    foreach ($assets as $asset) {
-        $asset->move(Placement::last()->in($destination), expected: null);
-    }
+    $destination->assets()->moveIn($assets, expected: null);
 
     $subsection->delete();
 });
 ```
 
-The flow compares the destination's `If-Match` once, after `lockedMembers()` holds the locks, so each `move()` takes `expected: null`.
+The flow compares the destination's `If-Match` once, after `lockedMembers()` holds the locks, so `moveIn()` takes `expected: null`.
 
 `lockedMembers(Model ...$alsoLock)` locks the parent, each model in `$alsoLock`, and every ordering parent above them, up to the root. It reads the parents of each ordered model from its stored row, and the parents that each model's pivot rows reach. It also locks the parents that a model's `parentsToLockFirst()` names, but only the stored parents set the lock order. A held model whose loaded attributes name an old parent therefore cannot change the order. It locks ancestors before descendants: by depth below the root, then in `(morph class, key)` order within one depth. A model's depth is its longest path to a root, so each model locks once, after every parent it has. The call then re-reads the stored foreign keys of every ordered model that it locked. If another transaction moved one of them meanwhile, the call releases its locks and starts again. After 5 such attempts it throws `ContendedOrder`. It then returns the parent's current members in order, with `position` selected. The list includes a member that a global scope hides, and no trashed member. An API must therefore not render the list to a caller, because a tenant scope does not filter it. For a pivot relation it returns the related models, and each `pivot` carries its `position`. Like `arrange()`, it reads the declared relation and ignores a constraint that the caller adds. It refuses no trashed parent. Outside a transaction it throws `LogicException`, because its row locks would end with the statement. Before it locks anything, it throws `LogicException` for a model to lock that is unsaved or uses another connection than the parent, because the transaction cannot hold that lock.
 
@@ -481,7 +500,7 @@ A model that uses both traits locks that whole list by depth below the root, the
 
 The package saves every row it writes through Eloquent, so each row fires the native `saving`, `updating`, `updated`, and `saved` events. Observers, `Event::listen('eloquent.updated: …')` listeners, and `$dispatchesEvents` classes all receive them.
 
-- **Items.** A `move()`, an `arrange()`, a rebalance, and the soft delete listener each save a fresh copy of every item whose `rank_key` or foreign key they write. The package loads each copy by key on the write connection.
+- **Items.** A `move()`, a `moveIn()`, an `arrange()`, a rebalance, and the soft delete listener each save a fresh copy of every item whose `rank_key` or foreign key they write. The package loads each copy by key on the write connection.
 - **Parents.** An order write saves no parent row, so a parent fires no event for it. A parent fires its own events only when the caller saves it.
 - **Order.** A row that the caller saves through Eloquent, such as a create, a `delete()`, or a `restore()`, fires its own events around the package's item writes.
 
@@ -515,6 +534,8 @@ Event::listen(Reordered::class, function (Reordered $event): void {
 | A save through Eloquent that changes a declared parent column | One, which lists every member that left and every row that entered. None when every member stays. |
 | A soft delete, a restore, or a declared-column save of a pivot's related model | One for each pivot that leaves or enters its relation. |
 | `arrange()` | One. |
+| `moveIn()` | One for each parent that an item leaves, in lock order, then one for the destination. None for the destination when its relation excludes every item that enters. |
+| `createInOrder()` | One, which lists every created member. None when the relation excludes every new row. |
 | A create, including a pivot `attach()` | One. None when the relation excludes the new row. |
 | A delete, soft or force, including a pivot `detach()` | One. |
 | `restore()` | One when the stored row was trashed, and the item enters last. None when the relation excludes the restored row, or when another request already restored or force deleted the row. A restore of a row that another request already restored, and that also changes the parent, counts as a save that changes the parent. |
@@ -558,10 +579,11 @@ Asset::query()->whereKey($id)->delete();                              // changes
 - **A package write saves each copy through `Model::save()`.** A `save()` override in the model class does not run for a copy, and the copy fires its model events all the same.
 - **`move()` and `arrange()` save fresh copies, not the caller's instances.** An unsaved change on the item or on the parent stays unsaved.
 - **`WriteHalted` does not name the event.** A caller cannot tell whether a `saving` or an `updating` listener halted the write.
+- **A listener that writes to the same order during an order write can fail it.** The package keeps clear of a key that a listener's create, a nested `createInOrder()`, or an `updated` listener during `moveIn()` takes. An `updating` listener on a copy the write is saving, or a listener that rebalances or arranges the same order, can still take a key the write holds. The write then rolls back with a unique violation on `rankKeyIndex()`, and no order changes. Write to the same order after the write returns, or from a queued listener.
 - **The late-change check of an item has gaps.** An `updating` listener that returns a value other than `null` stops the listeners after it, so the check does not run. A wildcard `updating` listener registered after this package's provider runs after the check, so its change escapes too. A related model has no such gap, because its `updated` listener checks the prepared columns again and refuses an unprepared change.
 - **Every model's `creating` and `updating` events run one more listener.** The late-change check costs two `WeakMap` lookups.
 - **`arrange()` and a rebalance refresh no item instance in memory.** An instance keeps the `rank_key` it was read with, and a `Revisioned` item keeps its own revision. Reload the item.
-- **`attach([a, b])` and `detach([a, b])` dispatch one `Reordered` per pivot.** Each pivot row is one order write, and no batch API exists.
+- **`attach([a, b])` and `detach([a, b])` dispatch one `Reordered` per pivot.** Each pivot row is one order write. `createInOrder()` and `moveIn()` are the batch writes, and each dispatches one `Reordered` per parent it changes.
 - **The inverse side of a `MorphToMany` cannot be ordered.** Order it from the side that names the morph type. A `morphedByMany` relation throws `LogicException`.
 - **An item's class must match the relation's class exactly.** A subclass of the related model does not resolve. For a pivot relation, the `using()` class must be the item class.
 - **The parent key, the owner key, and the item key must be named `id`.** Any other name throws `LogicException`.
@@ -594,9 +616,9 @@ Asset::query()->whereKey($id)->delete();                              // changes
 | `StaleConcurrencyRevision` (`RuntimeException`, from eloquent-concurrency) | `expected` does not match the order digest. |
 | `MembershipMismatch` (`InvalidArgumentException`) | `arrange()` does not list each current member exactly once. |
 | `InvalidAnchor` (`InvalidArgumentException`) | An anchor is not a current member of the parent. |
-| `ContendedOrder` (`RuntimeException`) | The item, or the parent passed to `lockedMembers()`, changed parent during each of 5 attempts to lock its order. |
-| `NotAMember` (`InvalidArgumentException`) | `move()` names an item that its order no longer holds, because another transaction trashed or deleted it or deleted its parent row. `class` and `ids` name the items. The move changed nothing. |
-| `UnavailableParent` (`RuntimeException`) | A create, a move into another parent, a save that changes the parent, or a restore targets a parent whose locked row is trashed or gone. `parent` names the parent, and `reason` is `ParentUnavailability::Trashed` or `ParentUnavailability::Missing`. The write changed nothing. |
+| `ContendedOrder` (`RuntimeException`) | The item, the parent passed to `lockedMembers()`, or an item passed to `moveIn()` changed parent during each of 5 attempts to lock its order. For `lockedMembers()` and `moveIn()` the message names the relation's parent. |
+| `NotAMember` (`InvalidArgumentException`) | `move()` or `moveIn()` names an item that its order no longer holds, because another transaction trashed or deleted it or deleted its parent row. `class` and `ids` name the items, every one for `moveIn()`. The move changed nothing. |
+| `UnavailableParent` (`RuntimeException`) | A create, a `createInOrder()`, a move into another parent, a save that changes the parent, or a restore targets a parent whose locked row is trashed or gone. `parent` names the parent, and `reason` is `ParentUnavailability::Trashed` or `ParentUnavailability::Missing`. The write changed nothing. |
 | `UnselectedPosition` (`LogicException`) | Code reads `position` on an item whose query selected none: an explicit select list, a group, a having, `distinct`, a union, `withoutPositions()`, a model's `$withCount`, `withoutGlobalScopes()`, a `BelongsToMany` paginator or chunk, a locking read outside a transaction, or a locking read whose lock lets another transaction update the row. `isset()` and `??` throw too. The exception names the item. |
 | `WriteHalted` (`RuntimeException`) | A `saving` or `updating` listener returned `false` for a copy that an order write saved. The message names the model and its key. The write rolled back. |
-| `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a membership declares a timestamp that Eloquent sets, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order or a declared parent column after the package prepared the write, a watched related column changed without a prepared order write, a relation reads a parent column in a form other than `<item column> = <parent column>`, a relation filters through a subquery that reads a table outside it, a relation joins a table other than its pivot table, a relation compares a column to an expression in a `where()`, or `lockedMembers()` runs outside a transaction or receives a model that is unsaved or on another connection. On a parent's first declaration read: an ordered pivot relation reaches a related model that does not use `OrdersThroughPivots`, or that omits the parent from `#[OrderedThrough]`. |
+| `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a membership declares a timestamp that Eloquent sets, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order or a declared parent column after the package prepared the write, a watched related column changed without a prepared order write, a relation reads a parent column in a form other than `<item column> = <parent column>`, a relation filters through a subquery that reads a table outside it, a relation joins a table other than its pivot table, a relation compares a column to an expression in a `where()`, `lockedMembers()` runs outside a transaction or receives a model that is unsaved or on another connection, or `moveIn()` receives an item that is unsaved, of another class or connection, or named twice, or a placement that names a parent. On a parent's first declaration read: an ordered pivot relation reaches a related model that does not use `OrdersThroughPivots`, or that omits the parent from `#[OrderedThrough]`. |

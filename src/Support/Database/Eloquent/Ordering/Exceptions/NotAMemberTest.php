@@ -126,6 +126,37 @@ class NotAMemberTest extends TestCase
     }
 
     #[Test]
+    public function it_refuses_a_move_in_with_an_expected_revision_of_a_member_trashed_since_the_revision_was_read(): void
+    {
+        $drawer = Drawer::create();
+        [$note, $other] = [$this->addNote($drawer), $this->addNote($drawer)];
+        $expected = $drawer->concurrencyRevision(DrawerRevision::NotesOrder);
+        Note::query()->findOrFail($note->id)->delete();
+        $before = $this->storedNotes($drawer);
+
+        $this->assertStale($drawer, DrawerRevision::NotesOrder, $expected, fn (): mixed => $drawer->notes()->moveIn([$other, $note], expected: $expected));
+        $this->assertNotAMember(Note::class, $note->id, fn (): mixed => $drawer->notes()->moveIn([$other, $note], expected: $drawer->concurrencyRevision(DrawerRevision::NotesOrder)));
+
+        $this->assertSame($before, $this->storedNotes($drawer));
+    }
+
+    #[Test]
+    public function it_refuses_a_move_in_with_an_expected_revision_of_a_member_hard_deleted_since_the_revision_was_read(): void
+    {
+        $playlist = Playlist::create(['kind' => 'song']);
+        $track = Track::create(['playlist_id' => $playlist->id, 'kind' => 'song']);
+        $other = Track::create(['playlist_id' => $playlist->id, 'kind' => 'song']);
+        $expected = $playlist->concurrencyRevision(PlaylistRevision::TracksOrder);
+        Track::query()->findOrFail($track->id)->delete();
+        $before = $this->storedTracks($playlist);
+
+        $this->assertStale($playlist, PlaylistRevision::TracksOrder, $expected, fn (): mixed => $playlist->tracks()->moveIn([$other, $track], expected: $expected));
+        $this->assertNotAMember(Track::class, $track->id, fn (): mixed => $playlist->tracks()->moveIn([$other, $track], expected: $playlist->concurrencyRevision(PlaylistRevision::TracksOrder)));
+
+        $this->assertSame($before, $this->storedTracks($playlist));
+    }
+
+    #[Test]
     public function it_refuses_a_move_of_a_member_whose_parent_row_is_gone(): void
     {
         $tour = Tour::create();
