@@ -107,7 +107,7 @@ class IsOrderedTest extends TestCase
             'a move of the first member to the front' => [3, fn (array $members, null|string $expected): OrderChange => $members[0]->move(Placement::first(), $expected)],
             'a move of the last member to the back' => [3, fn (array $members, null|string $expected): OrderChange => $members[2]->move(Placement::last(), $expected)],
             'a move of the only member' => [1, fn (array $members, null|string $expected): OrderChange => $members[0]->move(Placement::first(), $expected)],
-            'a move into the parent it is in' => [2, fn (array $members, null|string $expected): OrderChange => $members[1]->move(Placement::last()->in($members[1]->orderingRelation()->parent), $expected)],
+            'a move into the parent it is in' => [2, fn (array $members, null|string $expected, Model $parent): OrderChange => $members[1]->move(Placement::last()->in($parent), $expected)],
             'a move that expects nothing' => [3, fn (array $members, null|string $expected): OrderChange => $members[1]->move(Placement::after($members[0]->getKey()), null)],
         ]);
     }
@@ -178,7 +178,7 @@ class IsOrderedTest extends TestCase
             'a reorder' => [static function (Shape $shape): array {
                 [$parent, [$first, $second, $third]] = $shape->with(3);
 
-                return [[$parent], fn (): OrderChange => $shape->orderedRelation($parent)->reorder([self::keyOf($third), self::keyOf($first), self::keyOf($second)], expected: null)];
+                return [[$parent], fn (): OrderChange => $shape->arrange($parent, [self::keyOf($third), self::keyOf($first), self::keyOf($second)], expected: null)];
             }],
             'a soft delete' => [static function (Shape $shape): array {
                 [$parent, [, $member]] = $shape->with(2);
@@ -342,7 +342,7 @@ class IsOrderedTest extends TestCase
     public function it_reads_the_position_its_query_selected_without_a_query_and_refuses_one_it_did_not_select(Shape $shape): void
     {
         [$parent, [, $second]] = $shape->with(3);
-        $selected = $shape->orderedRelation($parent)->query()->get();
+        $selected = $shape->ordered($parent)->get();
         $unselected = $shape->memberClass()::query()->withoutPositions()->findOrFail($this->key($second));
         DB::enableQueryLog();
 
@@ -397,7 +397,7 @@ class IsOrderedTest extends TestCase
     public function it_saves_a_member_with_a_selected_position_without_writing_it(Shape $shape): void
     {
         [$parent] = $shape->with(2);
-        $member = $shape->item($shape->orderedRelation($parent)->query()->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 2));
+        $member = $shape->item($shape->ordered($parent)->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 2));
         DB::enableQueryLog();
 
         $member->setAttribute('title', 'Dusk');
@@ -416,7 +416,7 @@ class IsOrderedTest extends TestCase
     {
         [$parent] = $shape->with(3);
         [$destination] = $shape->with(1);
-        $member = $shape->item($shape->orderedRelation($parent)->query()->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 3));
+        $member = $shape->item($shape->ordered($parent)->get()->firstOrFail(fn (Model $result): bool => $shape->item($result)->getAttribute('position') === 3));
         $events = ModelEvents::record();
         DB::enableQueryLog();
 
@@ -635,7 +635,7 @@ class IsOrderedTest extends TestCase
         $this->assertNotSame($deleted, $shape->digest($parent));
         $this->assertSame($shape->digest($parent), $parent->concurrencyRevision($shape->revision()));
         $this->assertFalse($parent->isDirty());
-        $this->assertSame($parent, $first->orderingRelation()->parent);
+        $this->assertSame($parent, $first->move(Placement::last(), expected: null)->parent);
     }
 
     #[DataProvider('shapes')]
@@ -770,7 +770,7 @@ class IsOrderedTest extends TestCase
 
         $this->assertSame($shape->digest($parent), $parent->concurrencyRevision($shape->revision()));
         $this->assertFalse($parent->isDirty());
-        $this->assertSame($parent, $member->orderingRelation()->parent);
+        $this->assertSame($parent, $member->move(Placement::last(), expected: null)->parent);
     }
 
     #[DataProvider('shapes')]
@@ -812,8 +812,10 @@ class IsOrderedTest extends TestCase
         $member = $shape->newUnheldMember($parent);
         $member->save();
 
-        $this->assertNotSame($parent, $member->orderingRelation()->parent);
-        $this->assertSame($shape->digest($parent), $member->orderingRelation()->parent->concurrencyRevision($shape->revision()));
+        $held = $member->move(Placement::last(), expected: null)->parent;
+
+        $this->assertNotSame($parent, $held);
+        $this->assertSame($shape->digest($parent), $held->concurrencyRevision($shape->revision()));
     }
 
     #[Test]
@@ -834,11 +836,11 @@ class IsOrderedTest extends TestCase
         $this->assertSame($assets, $shape->digest($section, SectionRevision::AssetsOrder));
         $this->assertNotSame($empty, $shape->digest($section, SectionRevision::VideosOrder));
 
-        $this->assertSame(SectionRevision::AssetsOrder, $asset->orderingRelation()->revision);
-        $this->assertSame(SectionRevision::VideosOrder, $video->orderingRelation()->revision);
+        $this->assertSame(SectionRevision::AssetsOrder, $asset->move(Placement::last(), expected: null)->revision);
+        $this->assertSame(SectionRevision::VideosOrder, $video->move(Placement::last(), expected: null)->revision);
         $this->assertSame(1, $asset->getAttribute('position'));
         $this->assertSame(1, $video->position);
-        $this->assertSame([$video->id], $section->orderedRelation(SectionRevision::VideosOrder)->query()->pluck('id')->all());
+        $this->assertSame([$video->id], Shape::inOrder($section, SectionRevision::VideosOrder)->pluck('id')->all());
     }
 
     #[Test]
@@ -1133,8 +1135,8 @@ class IsOrderedTest extends TestCase
         $this->assertSame($shape->digest($destination), $destination->concurrencyRevision($shape->revision()));
         $this->assertFalse($source->isDirty());
         $this->assertFalse($destination->isDirty());
-        $this->assertSame($destination, $moved->orderingRelation()->parent);
         $this->assertSame(2, $moved->getAttribute('position'));
+        $this->assertSame($destination, $moved->getRelation($shape->parentRelation()));
     }
 
     #[DataProvider('shapes')]
@@ -1250,9 +1252,9 @@ class IsOrderedTest extends TestCase
         $this->assertSame($revisions, [$shape->digest($source), $shape->digest($destination)]);
         $this->assertSame($destination->getKey(), $stale->getAttribute($shape->foreignKey()));
         $this->assertSame($destination->getKey(), $stale->getRawOriginal($shape->foreignKey()));
-        $this->assertTrue($destination->is($stale->orderingRelation()->parent));
         $this->assertSame(2, $stale->getAttribute('position'));
         $this->assertFalse($stale->isDirty());
+        $this->assertTrue($destination->is($stale->move(Placement::last(), expected: null)->parent));
         $this->assertOrder($shape, [$holder->getKey(), $member->getKey()], $destination);
         $this->assertOrder($shape, [], $source);
     }
@@ -1440,7 +1442,7 @@ class IsOrderedTest extends TestCase
         $this->assertRejected(
             $shape,
             LogicException::class,
-            fn (): OrderChange => $shape->orderedRelation($parent)->reorder([self::keyOf($third), self::keyOf($first), self::keyOf($second)], expected: null),
+            fn (): OrderChange => $shape->arrange($parent, [self::keyOf($third), self::keyOf($first), self::keyOf($second)], expected: null),
             $parent,
         );
         $this->assertSame([], $this->reorders);
@@ -1491,12 +1493,12 @@ class IsOrderedTest extends TestCase
         $this->assertOrder($shape, $ids, $parent);
         $this->assertSame($ids, $change->order);
         $this->assertSame([['id' => $this->key($members[$moved]), 'position' => (int) array_search($moved, $expected, true) + 1, 'previousPosition' => $moved + 1]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($parent, $change->relation->parent);
-        $this->assertSame($shape->revision(), $change->relation->revision);
+        $this->assertSame($parent, $change->parent);
+        $this->assertSame($shape->revision(), $change->revision);
         $this->assertNull($change->source);
-        $this->assertNotSame($digest, $change->revision);
-        $this->assertSame($shape->digest($parent), $change->revision);
-        $this->assertSame($change->revision, $parent->concurrencyRevision($shape->revision()));
+        $this->assertNotSame($digest, $change->digest);
+        $this->assertSame($shape->digest($parent), $change->digest);
+        $this->assertSame($change->digest, $parent->concurrencyRevision($shape->revision()));
         $this->assertFalse($parent->isDirty());
         $this->assertFalse($members[$moved]->isDirty());
     }
@@ -1514,26 +1516,25 @@ class IsOrderedTest extends TestCase
         $this->assertOrder($shape, [$first->getKey(), $third->getKey()], $source);
         $this->assertOrder($shape, [$anchor->getKey(), $moved->getKey(), $last->getKey()], $destination);
 
-        $this->assertSame($destination, $change->relation->parent);
+        $this->assertSame($destination, $change->parent);
         $this->assertSame([$anchor->getKey(), $moved->getKey(), $last->getKey()], $change->order);
         $this->assertSame([['id' => $this->key($moved), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
-        $this->assertNotSame($digests[1], $change->revision);
-        $this->assertSame($shape->digest($destination), $change->revision);
-        $this->assertSame($change->revision, $destination->concurrencyRevision($shape->revision()));
+        $this->assertNotSame($digests[1], $change->digest);
+        $this->assertSame($shape->digest($destination), $change->digest);
+        $this->assertSame($change->digest, $destination->concurrencyRevision($shape->revision()));
         $this->assertFalse($destination->isDirty());
 
         $this->assertNotNull($change->source);
-        $this->assertSame($source, $change->source->relation->parent);
+        $this->assertSame($source, $change->source->parent);
         $this->assertSame([$first->getKey(), $third->getKey()], $change->source->order);
         $this->assertSame([['id' => $this->key($moved), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $change->source->changed));
-        $this->assertNotSame($digests[0], $change->source->revision);
-        $this->assertSame($shape->digest($source), $change->source->revision);
-        $this->assertSame($change->source->revision, $source->concurrencyRevision($shape->revision()));
+        $this->assertNotSame($digests[0], $change->source->digest);
+        $this->assertSame($shape->digest($source), $change->source->digest);
+        $this->assertSame($change->source->digest, $source->concurrencyRevision($shape->revision()));
         $this->assertFalse($source->isDirty());
 
         $this->assertSame($destination->getKey(), $moved->getAttribute($shape->foreignKey()));
         $this->assertSame($destination, $moved->getRelation($shape->parentRelation()));
-        $this->assertSame($destination, $moved->orderingRelation()->parent);
         $this->assertSame(2, $moved->getAttribute('position'));
         $this->assertFalse($moved->isDirty());
     }
@@ -1593,8 +1594,8 @@ class IsOrderedTest extends TestCase
         $change = $second->move(Placement::first(), expected: null);
 
         $this->assertOrder($shape, [$second->getKey(), $first->getKey()], $parent);
-        $this->assertNotSame($digest, $change->revision);
-        $this->assertSame($shape->digest($parent), $change->revision);
+        $this->assertNotSame($digest, $change->digest);
+        $this->assertSame($shape->digest($parent), $change->digest);
     }
 
     #[DataProvider('shapes')]
@@ -1658,7 +1659,7 @@ class IsOrderedTest extends TestCase
 
         $change = $stale->move(Placement::first(), expected: null);
 
-        $this->assertSame($elsewhere->getKey(), $change->relation->parent->getKey());
+        $this->assertSame($elsewhere->getKey(), $change->parent->getKey());
         $this->assertOrder($shape, [$first->getKey()], $source);
         $this->assertOrder($shape, [$moved->getKey(), $member->getKey()], $elsewhere);
     }
@@ -1675,12 +1676,11 @@ class IsOrderedTest extends TestCase
 
         $change = $stale->move($placement, expected: null);
 
-        $this->assertTrue($destination->is($change->relation->parent));
+        $this->assertTrue($destination->is($change->parent));
         $this->assertSame($destination->getKey(), $stale->getAttribute($shape->foreignKey()));
         $this->assertSame($destination->getKey(), $stale->getRawOriginal($shape->foreignKey()));
         $this->assertSame(['title' => 'Dusk'], $stale->getDirty());
-        $this->assertSame($change->relation->parent, $stale->getRelation($shape->parentRelation()));
-        $this->assertSame($change->relation->parent, $stale->orderingRelation()->parent);
+        $this->assertSame($change->parent, $stale->getRelation($shape->parentRelation()));
         $this->assertSame($position, $stale->getAttribute('position'));
         $this->assertOrder($shape, $position === 1 ? [$member->getKey(), $holder->getKey()] : [$holder->getKey(), $member->getKey()], $destination);
         $this->assertOrder($shape, [], $source);
@@ -1696,7 +1696,7 @@ class IsOrderedTest extends TestCase
         $shape->find($this->key($member))->move(Placement::last()->in($destination), expected: null);
 
         $change = $stale->move(Placement::first(), expected: null);
-        $stale->move(Placement::last(), $change->revision);
+        $stale->move(Placement::last(), $change->digest);
 
         $this->assertOrder($shape, [$holder->getKey(), $member->getKey()], $destination);
     }
@@ -1714,7 +1714,7 @@ class IsOrderedTest extends TestCase
         $stale->move(Placement::first()->in($destination), expected: null);
 
         $this->assertSame($destination, $stale->getRelation($shape->parentRelation()));
-        $this->assertSame($destination, $stale->orderingRelation()->parent);
+        $this->assertSame($destination, $stale->move(Placement::first(), expected: null)->parent);
         $this->assertOrder($shape, [$member->getKey(), $holder->getKey()], $destination);
         $this->assertOrder($shape, [], $elsewhere);
         $this->assertOrder($shape, [], $source);
@@ -1785,7 +1785,7 @@ class IsOrderedTest extends TestCase
     }
 
     /**
-     * @param  Closure(list<Model&Ordered>, null|string): OrderChange  $move
+     * @param  Closure(list<Model&Ordered>, null|string, Model): OrderChange  $move
      */
     #[DataProvider('unchangedMoves')]
     #[Test]
@@ -1797,11 +1797,11 @@ class IsOrderedTest extends TestCase
         $ids = array_map(fn (Model $member): mixed => $member->getKey(), $members);
         DB::enableQueryLog();
 
-        $change = $move($members, $revision);
+        $change = $move($members, $revision, $parent);
 
         $this->assertSame([], $this->writes());
         $this->assertSame([], $change->changed);
-        $this->assertSame($revision, $change->revision);
+        $this->assertSame($revision, $change->digest);
         $this->assertSame($ids, $change->order);
         $this->assertSame($revision, $shape->digest($parent));
         $this->assertSame($keys, $shape->rankKeys($parent));
@@ -1929,7 +1929,7 @@ class IsOrderedTest extends TestCase
         $shape->customers($parent)->attach($customer);
         $attached = $shape->pivotOf($parent, $customer);
 
-        $shape->orderedRelation($parent)->reorder([$this->key($attached), $this->key($first)], expected: null);
+        $shape->arrange($parent, [$this->key($attached), $this->key($first)], expected: null);
 
         $this->assertSame([$attached->getKey(), $first->getKey()], $shape->members($parent));
         $this->assertSame([$attached->getKey(), $first->getKey(), $hidden->getKey()], $this->storedOrder($shape, $parent));
@@ -1972,7 +1972,7 @@ class IsOrderedTest extends TestCase
         $this->assertSame(2, $shape->find($this->key($last))->getAttribute('position'));
         $this->assertRejected($shape, InvalidAnchor::class, fn (): OrderChange => $last->move(Placement::before($this->key($hidden)), expected: null), $parent);
         $this->assertRejected($shape, InvalidAnchor::class, fn (): Model => $shape->add($parent, Placement::before($this->key($hidden))), $parent);
-        $this->assertRejected($shape, MembershipMismatch::class, fn (): OrderChange => $shape->orderedRelation($parent)->reorder([$this->key($last), $this->key($hidden), $this->key($first)], expected: null), $parent);
+        $this->assertRejected($shape, MembershipMismatch::class, fn (): OrderChange => $shape->arrange($parent, [$this->key($last), $this->key($hidden), $this->key($first)], expected: null), $parent);
     }
 
     #[Test]
@@ -1992,10 +1992,12 @@ class IsOrderedTest extends TestCase
 
         $this->assertSame($touring, $this->sceneRevision($tour));
         $this->assertNotSame($empty, $listing->concurrencyRevision(ListingRevision::ScenesOrder));
-        $this->assertSame([$inTour->id], $tour->orderedRelation(TourRevision::ScenesOrder)->query()->pluck('id')->all());
-        $this->assertSame([$inListing->id], $listing->orderedRelation(ListingRevision::ScenesOrder)->query()->pluck('id')->all());
-        $this->assertSame(ListingRevision::ScenesOrder, Scene::query()->findOrFail($inListing->id)->orderingRelation()->revision);
-        $this->assertInstanceOf(Listing::class, Scene::query()->findOrFail($inListing->id)->orderingRelation()->parent);
+        $this->assertSame([$inTour->id], Shape::inOrder($tour, TourRevision::ScenesOrder)->pluck('id')->all());
+        $this->assertSame([$inListing->id], Shape::inOrder($listing, ListingRevision::ScenesOrder)->pluck('id')->all());
+        $read = Scene::query()->findOrFail($inListing->id)->move(Placement::last(), expected: null);
+
+        $this->assertSame(ListingRevision::ScenesOrder, $read->revision);
+        $this->assertInstanceOf(Listing::class, $read->parent);
     }
 
     #[Test]
@@ -2010,10 +2012,10 @@ class IsOrderedTest extends TestCase
 
         $change = $moved->move(Placement::first()->in($listing), expected: $digests[1]);
 
-        $this->assertSame($listing, $change->relation->parent);
+        $this->assertSame($listing, $change->parent);
         $this->assertSame([$moved->id, $member->id], $change->order);
         $this->assertNotNull($change->source);
-        $this->assertSame($tour, $change->source->relation->parent);
+        $this->assertSame($tour, $change->source->parent);
         $this->assertSame([$staying->id], $change->source->order);
         $this->assertSame($this->sceneRevision($tour), $tour->concurrencyRevision(TourRevision::ScenesOrder));
         $this->assertNotSame($digests[0], $this->sceneRevision($tour));
@@ -2023,8 +2025,8 @@ class IsOrderedTest extends TestCase
         $this->assertSame($listing->id, $moved->sceneable_id);
         $this->assertSame(['sceneable_type' => $listing->getMorphClass(), 'sceneable_id' => $listing->id], (array) DB::table('scenes')->where('id', $moved->id)->first(['sceneable_type', 'sceneable_id']));
         $this->assertFalse($moved->relationLoaded('sceneable'));
-        $this->assertSame($listing, $moved->orderingRelation()->parent);
         $this->assertSame(1, $moved->position);
+        $this->assertSame($listing, $moved->move(Placement::first(), expected: null)->parent);
     }
 
     #[Test]
@@ -2040,12 +2042,12 @@ class IsOrderedTest extends TestCase
         $this->assertSame(['board_id' => null, 'album_id' => $album->id], (array) DB::table('photos')->where('id', $moved->id)->first(['board_id', 'album_id']));
         $this->assertNull($moved->board_id);
         $this->assertSame($album->id, $moved->album_id);
-        $this->assertSame($album, $change->relation->parent);
+        $this->assertSame($album, $change->parent);
         $this->assertSame([$moved->id], $change->order);
         $this->assertNotNull($change->source);
-        $this->assertSame($board, $change->source->relation->parent);
+        $this->assertSame($board, $change->source->parent);
         $this->assertSame([$staying->id], $change->source->order);
-        $this->assertSame($album, $moved->orderingRelation()->parent);
+        $this->assertSame($album, $moved->move(Placement::last(), expected: null)->parent);
     }
 
     #[Test]
@@ -2069,7 +2071,7 @@ class IsOrderedTest extends TestCase
             $result = $rivals[0]->wait();
 
             $this->assertSame('stale', $result->output(), $result->errorOutput());
-            $this->assertSame($this->sectionRevision($section), $change->revision);
+            $this->assertSame($this->sectionRevision($section), $change->digest);
             $this->assertOrder(new HasManyShape, [$third->id, $first->id, $second->id], $section);
         } finally {
             $this->finishRace($rivals, $section);
@@ -2514,7 +2516,7 @@ class IsOrderedTest extends TestCase
     public function it_fills_the_position_after_a_membership_change_takes_out_a_track_with_a_selected_position(): void
     {
         [$playlist, [, $second]] = $this->playlist('audio', ['audio', 'audio', 'audio']);
-        $leaving = $playlist->orderedRelation(PlaylistRevision::TracksOrder)->query()->get()->firstOrFail(fn (Model $track): bool => $track->getKey() === $second->id);
+        $leaving = Shape::inOrder($playlist, PlaylistRevision::TracksOrder)->get()->firstOrFail(fn (Model $track): bool => $track->getKey() === $second->id);
         $this->assertSame(2, $leaving->getAttribute('position'));
 
         $leaving->setAttribute('kind', 'video');
@@ -2619,10 +2621,10 @@ class IsOrderedTest extends TestCase
         Event::listen(Reordered::class, function (Reordered $event): void {
             $change = $event->change;
             $this->reorders[] = [
-                $change->relation->parent->getKey(),
+                $change->parent->getKey(),
                 $change->order,
                 array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $change->changed),
-                $change->revision,
+                $change->digest,
             ];
         });
     }

@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Ordering;
 
+use Illuminate\Database\Eloquent\Model;
+use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
+use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
+
 final readonly class OrderChange
 {
     /**
@@ -11,10 +15,11 @@ final readonly class OrderChange
      * @param  list<PositionChange>  $changed
      */
     public function __construct(
-        public OrderedRelation $relation,
+        public Model&Revisioned $parent,
+        public NamesConcurrencyRevision $revision,
         public array $order,
         public array $changed,
-        public string $revision,
+        public string $digest,
         public null|OrderChange $source = null,
     ) {}
 }

@@ -118,7 +118,7 @@ class ReorderedTest extends TestCase
                     [$parent, $members] = $shape->with(3);
                     $ids = array_map(fn (Model $member): mixed => $member->getKey(), array_reverse($members));
 
-                    return fn (): mixed => $shape->orderedRelation($parent)->reorder($ids, null);
+                    return fn (): mixed => $shape->arrange($parent, $ids, null);
                 },
                 1,
             ],
@@ -181,7 +181,7 @@ class ReorderedTest extends TestCase
             'a move to where it is' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $members[1]->move(Placement::after($members[0]->getKey()), null)],
             'a move of the first member to the front' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $members[0]->move(Placement::first(), null)],
             'a move into the parent it is in' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $members[1]->move(Placement::after($members[0]->getKey())->in($parent), null)],
-            'a reorder to the current order' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $shape->orderedRelation($parent)->reorder(array_map(fn (Model $member): mixed => $member->getKey(), $members), null)],
+            'a reorder to the current order' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $shape->arrange($parent, array_map(fn (Model $member): mixed => $member->getKey(), $members), null)],
             'a save that changes nothing' => [fn (Shape $shape, Model&OrdersRelations $parent, array $members): mixed => $members[1]->save()],
         ]);
     }
@@ -211,10 +211,10 @@ class ReorderedTest extends TestCase
 
         $change = $this->dispatched[0]->change;
 
-        $this->assertSame($parent, $change->relation->parent);
+        $this->assertSame($parent, $change->parent);
         $this->assertSame([$member->getKey(), $first->getKey(), $second->getKey()], $change->order);
         $this->assertSame([['id' => $this->key($member), 'position' => 1, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($shape->digest($parent), $change->revision);
+        $this->assertSame($shape->digest($parent), $change->digest);
         $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
     }
@@ -237,10 +237,10 @@ class ReorderedTest extends TestCase
 
         $change = $this->dispatched[0]->change;
 
-        $this->assertSame($parent, $change->relation->parent);
+        $this->assertSame($parent, $change->parent);
         $this->assertSame($pivot->getKey(), $change->order[1]);
         $this->assertSame([['id' => $this->key($pivot), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($shape->digest($parent), $change->revision);
+        $this->assertSame($shape->digest($parent), $change->digest);
         $this->assertSame([$this->baseline], $this->levels);
     }
 
@@ -272,8 +272,8 @@ class ReorderedTest extends TestCase
         $this->assertCount(2, $this->dispatched);
         $this->assertSame($change->source, $this->dispatched[0]->change);
         $this->assertSame($change, $this->dispatched[1]->change);
-        $this->assertSame($source, $this->dispatched[0]->change->relation->parent);
-        $this->assertSame($destination, $this->dispatched[1]->change->relation->parent);
+        $this->assertSame($source, $this->dispatched[0]->change->parent);
+        $this->assertSame($destination, $this->dispatched[1]->change->parent);
         $this->assertSame([$this->baseline, $this->baseline], $this->levels);
     }
 
@@ -292,16 +292,16 @@ class ReorderedTest extends TestCase
 
         [$left, $entered] = [$this->dispatched[0]->change, $this->dispatched[1]->change];
 
-        $this->assertSame($source, $left->relation->parent);
+        $this->assertSame($source, $left->parent);
         $this->assertSame([$first->getKey(), $third->getKey()], $left->order);
         $this->assertSame([['id' => $this->key($moved), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $left->changed));
-        $this->assertSame($shape->digest($source), $left->revision);
+        $this->assertSame($shape->digest($source), $left->digest);
         $this->assertNull($left->source);
 
-        $this->assertSame($destination, $entered->relation->parent);
+        $this->assertSame($destination, $entered->parent);
         $this->assertSame([$member->getKey(), $moved->getKey()], $entered->order);
         $this->assertSame([['id' => $this->key($moved), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $entered->changed));
-        $this->assertSame($shape->digest($destination), $entered->revision);
+        $this->assertSame($shape->digest($destination), $entered->digest);
         $this->assertSame($left, $entered->source);
         $this->assertSame([$this->baseline, $this->baseline], $this->levels);
     }
@@ -323,10 +323,10 @@ class ReorderedTest extends TestCase
 
         $change = $this->dispatched[0]->change;
 
-        $this->assertSame($destination, $change->relation->parent);
+        $this->assertSame($destination, $change->parent);
         $this->assertSame([$member->getKey(), $moved->getKey()], $change->order);
         $this->assertSame([['id' => $this->key($moved), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($shape->digest($destination), $change->revision);
+        $this->assertSame($shape->digest($destination), $change->digest);
         $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
     }
@@ -393,10 +393,10 @@ class ReorderedTest extends TestCase
 
         $change = $this->dispatched[0]->change;
 
-        $this->assertSame($parent, $change->relation->parent);
+        $this->assertSame($parent, $change->parent);
         $this->assertSame(array_map(fn (Model $member): mixed => $member->getKey(), $staying), $change->order);
         $this->assertSame([['id' => $this->key($leaving), 'position' => null, 'previousPosition' => 1]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($change->relation->concurrencyRevision(), $change->revision);
+        $this->assertSame($change->parent->concurrencyRevision($change->revision), $change->digest);
         $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
     }
@@ -417,10 +417,10 @@ class ReorderedTest extends TestCase
 
         $change = $this->dispatched[0]->change;
 
-        $this->assertTrue($parent->is($change->relation->parent));
+        $this->assertTrue($parent->is($change->parent));
         $this->assertSame(array_map(fn (Model $member): mixed => $member->getKey(), [...$members, $arriving]), $change->order);
         $this->assertSame([['id' => $this->key($arriving), 'position' => count($members) + 1, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($change->relation->concurrencyRevision(), $change->revision);
+        $this->assertSame($change->parent->concurrencyRevision($change->revision), $change->digest);
         $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
     }
@@ -444,15 +444,15 @@ class ReorderedTest extends TestCase
 
         [$left, $entered] = [$this->dispatched[0]->change, $this->dispatched[1]->change];
 
-        $this->assertTrue($source->is($left->relation->parent));
+        $this->assertTrue($source->is($left->parent));
         $this->assertSame([], $left->order);
         $this->assertSame([['id' => $this->key($stale), 'position' => null, 'previousPosition' => 1]], array_map(get_object_vars(...), $left->changed));
-        $this->assertSame($shape->digest($source), $left->revision);
+        $this->assertSame($shape->digest($source), $left->digest);
 
-        $this->assertSame($destination, $entered->relation->parent);
+        $this->assertSame($destination, $entered->parent);
         $this->assertSame([$member->getKey(), $stale->getKey()], $entered->order);
         $this->assertSame([['id' => $this->key($stale), 'position' => 2, 'previousPosition' => null]], array_map(get_object_vars(...), $entered->changed));
-        $this->assertSame($shape->digest($destination), $entered->revision);
+        $this->assertSame($shape->digest($destination), $entered->digest);
         $this->assertSame($left, $entered->source);
         $this->assertSame([$this->baseline, $this->baseline], $this->levels);
     }
@@ -465,7 +465,7 @@ class ReorderedTest extends TestCase
         $ids = array_map(fn (Model $member): mixed => $member->getKey(), array_reverse($members));
         $this->forget();
 
-        $change = $shape->orderedRelation($parent)->reorder($ids, null);
+        $change = $shape->arrange($parent, $ids, null);
 
         $this->assertCount(1, $this->dispatched);
         $this->assertSame($change, $this->dispatched[0]->change);
@@ -485,10 +485,10 @@ class ReorderedTest extends TestCase
 
         $change = $this->dispatched[0]->change;
 
-        $this->assertSame($parent, $change->relation->parent);
+        $this->assertSame($parent, $change->parent);
         $this->assertSame([$first->getKey(), $third->getKey()], $change->order);
         $this->assertSame([['id' => $this->key($second), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($shape->digest($parent), $change->revision);
+        $this->assertSame($shape->digest($parent), $change->digest);
         $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
     }
@@ -506,10 +506,10 @@ class ReorderedTest extends TestCase
 
         $change = $this->dispatched[0]->change;
 
-        $this->assertSame($parent, $change->relation->parent);
+        $this->assertSame($parent, $change->parent);
         $this->assertSame([$first->getKey(), $third->getKey()], $change->order);
         $this->assertSame([['id' => $this->key($second), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($shape->digest($parent), $change->revision);
+        $this->assertSame($shape->digest($parent), $change->digest);
         $this->assertSame([$this->baseline], $this->levels);
     }
 
@@ -531,10 +531,10 @@ class ReorderedTest extends TestCase
 
         $change = $this->dispatched[0]->change;
 
-        $this->assertTrue($parent->is($change->relation->parent));
+        $this->assertTrue($parent->is($change->parent));
         $this->assertSame([$second->getKey(), $third->getKey(), $first->getKey()], $change->order);
         $this->assertSame([['id' => $this->key($first), 'position' => 3, 'previousPosition' => null]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($shape->digest($parent), $change->revision);
+        $this->assertSame($shape->digest($parent), $change->digest);
         $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
     }
@@ -589,10 +589,10 @@ class ReorderedTest extends TestCase
 
         $change = $this->dispatched[0]->change;
 
-        $this->assertSame($parent, $change->relation->parent);
+        $this->assertSame($parent, $change->parent);
         $this->assertSame([$firstPivot->getKey(), $thirdPivot->getKey()], $change->order);
         $this->assertSame([['id' => $this->key($secondPivot), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $change->changed));
-        $this->assertSame($shape->digest($parent), $change->revision);
+        $this->assertSame($shape->digest($parent), $change->digest);
         $this->assertSame([$this->baseline], $this->levels);
     }
 
@@ -724,7 +724,7 @@ class ReorderedTest extends TestCase
 
         $members[3]->move(Placement::first(), null);
         $keys[] = $shape->rankKeys($parent);
-        $shape->orderedRelation($parent)->reorder($ids, null);
+        $shape->arrange($parent, $ids, null);
         $keys[] = $shape->rankKeys($parent);
 
         $this->assertCount(2, $this->dispatched);

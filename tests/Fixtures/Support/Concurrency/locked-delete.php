@@ -22,8 +22,8 @@ $reorders = [];
 
 Event::listen(Reordered::class, static function (Reordered $event) use (&$reorders): void {
     $reorders[] = [
-        $event->change->relation->parent::class,
-        $event->change->relation->parent->getKey(),
+        $event->change->parent::class,
+        $event->change->parent->getKey(),
         array_map(static fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $event->change->changed),
     ];
 });

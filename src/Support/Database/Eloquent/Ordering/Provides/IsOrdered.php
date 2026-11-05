@@ -74,7 +74,7 @@ trait IsOrdered
             OrderedRelation::requirePrepared($item);
             $item->forgetPosition();
 
-            $relation = $item->orderingRelation();
+            $relation = $item->currentOrderedRelation();
             $relation = array_find($item->lockedOrderedRelations, static fn (OrderedRelation $locked): bool => $locked->is($relation)) ?? $relation;
 
             $item->assignRankKey($relation->keyAt($item->placement ?? Placement::last()));
@@ -209,24 +209,19 @@ trait IsOrdered
                 ($destination ?? $source)->compareConcurrencyRevision($expected);
             }
 
-            $change = ($destination ?? $source)->move($this, $placement, $source);
+            $target = $destination ?? $source;
+            $change = $target->move($this, $placement, $source);
 
             if ($change->source === null && array_diff_assoc($stored, $original) !== []) {
                 $this->forceFill($stored)->syncOriginalAttributes(array_keys($stored));
             }
 
-            $this->followMovedParent([$original, $stored], $change->relation->parent);
-            $this->resolvedOrderedRelation = $change->relation;
+            $this->followMovedParent([$original, $stored], $target->parent);
+            $this->resolvedOrderedRelation = $target;
             $this->selectStoredPosition();
 
             return $change;
         });
-    }
-
-    public function orderingRelation(): OrderedRelation
-    {
-        return $this->resolveOrderedRelation($this->getAttributes())
-            ?? throw new LogicException(sprintf('[%s:%s] has no parent that orders it.', static::class, $this->getKey()));
     }
 
     /**
@@ -407,6 +402,12 @@ trait IsOrdered
         }
 
         $this->forceFill([OrderedRelation::POSITION => $stored[OrderedRelation::POSITION]])->syncOriginalAttributes([OrderedRelation::POSITION]);
+    }
+
+    private function currentOrderedRelation(): OrderedRelation
+    {
+        return $this->resolveOrderedRelation($this->getAttributes())
+            ?? throw new LogicException(sprintf('[%s:%s] has no parent that orders it.', static::class, $this->getKey()));
     }
 
     /**

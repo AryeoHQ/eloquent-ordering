@@ -5,14 +5,22 @@ declare(strict_types=1);
 namespace Tests\Fixtures\Support\Shapes;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\MorphMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
+use LogicException;
+use ReflectionClass;
+use ReflectionMethod;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
+use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
-use Support\Database\Eloquent\Ordering\OrderedRelation;
+use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\Placement;
 use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
 
@@ -132,17 +140,73 @@ abstract class Shape
         return $member;
     }
 
-    public function orderedRelation(Model&OrdersRelations $parent): OrderedRelation
+    /**
+     * @return HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>
+     */
+    public static function relationOf(Model $parent, NamesConcurrencyRevision $revision): HasMany|MorphMany|BelongsToMany
     {
-        return $parent->orderedRelation($this->revision());
+        foreach ((new ReflectionClass($parent))->getMethods(ReflectionMethod::IS_PUBLIC) as $method) {
+            foreach ($method->getAttributes(OrdersRelation::class) as $attribute) {
+                if ($attribute->newInstance()->revision === $revision) {
+                    $relation = $parent->{$method->getName()}();
+
+                    assert($relation instanceof HasMany || $relation instanceof MorphMany || $relation instanceof BelongsToMany);
+
+                    return $relation;
+                }
+            }
+        }
+
+        throw new LogicException(sprintf('[%s] declares no relation for the [%s] revision.', $parent::class, $revision->value));
+    }
+
+    /**
+     * @return HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>
+     */
+    public function relation(Model $parent): HasMany|MorphMany|BelongsToMany
+    {
+        return self::relationOf($parent, $this->revision());
+    }
+
+    /**
+     * @param  list<int|string>  $ids
+     */
+    public function arrange(Model $parent, array $ids, null|string $expected): OrderChange
+    {
+        return $this->relation($parent)->arrange($ids, $expected);
+    }
+
+    /**
+     * @return HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>
+     */
+    public function ordered(Model $parent): HasMany|MorphMany|BelongsToMany
+    {
+        return self::inOrder($parent, $this->revision());
+    }
+
+    /**
+     * @return HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>
+     */
+    public static function inOrder(Model $parent, NamesConcurrencyRevision $revision): HasMany|MorphMany|BelongsToMany
+    {
+        $relation = self::relationOf($parent, $revision);
+        $related = $relation->getRelated();
+        $table = $relation instanceof BelongsToMany ? $relation->getTable() : $related->getTable();
+        $relation->withoutGlobalScopes(array_values(array_diff(array_keys($related->getGlobalScopes()), [SoftDeletingScope::class, SelectsPosition::class])));
+
+        if ($relation instanceof BelongsToMany) {
+            $relation->withPivot('id');
+        }
+
+        return $relation->orderBy($table.'.rank_key')->orderBy($table.'.id');
     }
 
     /**
      * @return list<int|string>
      */
-    public function members(Model&OrdersRelations $parent): array
+    public function members(Model $parent): array
     {
-        return $this->orderedRelation($parent)->query()->get()->map(fn (Model $result): int|string => $this->memberKey($result))->values()->all();
+        return $this->ordered($parent)->get()->map(fn (Model $result): int|string => $this->memberKey($result))->values()->all();
     }
 
     /**
@@ -156,9 +220,9 @@ abstract class Shape
         foreach ($results as $result) {
             $attributes = $this->item($result)->getAttributes();
 
-            assert(array_key_exists(OrderedRelation::POSITION, $attributes));
+            assert(array_key_exists('position', $attributes));
 
-            $positions[$this->memberKey($result)] = $attributes[OrderedRelation::POSITION];
+            $positions[$this->memberKey($result)] = $attributes['position'];
         }
 
         return $positions;
@@ -200,7 +264,7 @@ abstract class Shape
 
     public function crowd(Model $lower, Model $upper): void
     {
-        $prefix = 'a0'.str_repeat('V', OrderedRelation::MAX_KEY_LENGTH - 3);
+        $prefix = 'a0'.str_repeat('V', 61);
 
         DB::table($this->memberTable())->where('id', $lower->getKey())->update(['rank_key' => $prefix.'V']);
         DB::table($this->memberTable())->where('id', $upper->getKey())->update(['rank_key' => $prefix.'W']);

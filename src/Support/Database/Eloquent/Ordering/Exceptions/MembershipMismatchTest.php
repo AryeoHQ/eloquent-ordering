@@ -31,7 +31,7 @@ class MembershipMismatchTest extends TestCase
         $this->assertTrue(is_int($key) || is_string($key));
 
         try {
-            $shape->orderedRelation($parent)->reorder([$key], expected: null);
+            $shape->arrange($parent, [$key], expected: null);
             $this->fail('A reorder that omits a member succeeded.');
         } catch (MembershipMismatch $exception) {
             $this->assertInstanceOf(InvalidArgumentException::class, $exception);

@@ -181,10 +181,10 @@ class ProviderTest extends TestCase
         $this->assertFalse(Event::hasListeners('eloquent.trashed: '.$viewer::class));
     }
 
-    private function assertRefused(string $message, Model&OrdersRelations $parent): void
+    private function assertRefused(string $message, Model&OrdersRelations&Revisioned $parent): void
     {
         try {
-            $parent->orderedRelation(ListingRevision::CustomersOrder);
+            $parent->concurrencyRevision(ListingRevision::CustomersOrder);
         } catch (LogicException $exception) {
             $this->assertSame($message, $exception->getMessage());
 

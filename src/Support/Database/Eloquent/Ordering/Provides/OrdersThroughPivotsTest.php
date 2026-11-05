@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Process\InvokedProcess;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
 use LogicException;
@@ -39,6 +40,7 @@ use Tests\Fixtures\Support\Listings\TwiceOrderingListing;
 use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
+use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Speakers\Speaker;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
@@ -77,6 +79,26 @@ class OrdersThroughPivotsTest extends TestCase
         $this->assertCount(3, DB::getQueryLog());
         $this->assertEquals($expected, $lazy);
         $this->assertEquals($expected, $eager);
+    }
+
+    #[DataProvider('pivots')]
+    #[Test]
+    public function it_arranges_the_pivots_that_the_documented_read_returns(PivotShape $shape): void
+    {
+        [$parent] = $shape->with(3);
+        $read = static fn (): Collection => $shape->customers($parent)->withPivot('id')->reorder($shape->customers($parent)->getTable().'.rank_key')->get();
+        $ids = $read()->map(static function (Model $customer) use ($shape): string {
+            $key = $shape->item($customer)->getKey();
+
+            assert(is_string($key));
+
+            return $key;
+        })->all();
+        $order = array_reverse($ids);
+
+        $shape->customers($parent)->arrange($order, expected: null);
+
+        $this->assertEquals(array_combine($order, [1, 2, 3]), $shape->selectedPositions($read()));
     }
 
     #[DataProvider('pivots')]
@@ -147,7 +169,7 @@ class OrdersThroughPivotsTest extends TestCase
 
         $lazy = $agency->customers()->orderBy('customers.id')->get()->map($position)->all();
         $eager = PlainAgency::query()->with('customers')->findOrFail($agency->id)->customers->sortBy('id')->map($position)->values()->all();
-        $ordered = $agency->orderedRelation(AgencyRevision::CustomersOrder)->query()->get()->map($position)->all();
+        $ordered = Shape::inOrder($agency, AgencyRevision::CustomersOrder)->get()->map($position)->all();
         $inverse = $first->agencies()->orderBy('agencies.id')->get()->map($position)->all();
 
         $this->assertSame([2, 1], $lazy);
@@ -857,11 +879,11 @@ class OrdersThroughPivotsTest extends TestCase
         Event::listen(Reordered::class, function (Reordered $event): void {
             $change = $event->change;
             $this->reorders[] = [
-                $change->relation->parent::class,
-                $change->relation->parent->getKey(),
+                $change->parent::class,
+                $change->parent->getKey(),
                 $change->order,
                 array_map(fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $change->changed),
-                $change->revision,
+                $change->digest,
             ];
         });
     }

@@ -21,7 +21,7 @@ Event::listen(Reordered::class, static function (Reordered $event) use (&$reorde
     $reorders[] = [
         $event->change->order,
         array_map(static fn (PositionChange $changed): array => [$changed->id, $changed->position, $changed->previousPosition], $event->change->changed),
-        $event->change->revision,
+        $event->change->digest,
     ];
 });
 

@@ -10,4 +10,5 @@ enum ListingRevision: string implements NamesConcurrencyRevision
 {
     case CustomersOrder = 'customers_order';
     case ScenesOrder = 'scenes_order';
+    case AgencyCustomersOrder = 'agency_customers_order';
 }
