@@ -22,6 +22,8 @@ use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Events\Reordered;
 use Support\Database\Eloquent\Ordering\Exceptions\InvalidAnchor;
 use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
+use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
+use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Exceptions\UnselectedPosition;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\OrderChange;
@@ -34,10 +36,12 @@ use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Boards\Board;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Drawers\Drawer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Events\ModelUpdated;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingRevision;
+use Tests\Fixtures\Support\Notes\Note;
 use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Photos\Photo;
 use Tests\Fixtures\Support\Playlists\Playlist;
@@ -1730,7 +1734,8 @@ class IsOrderedTest extends TestCase
         $shape->find($this->key($deleted))->delete();
 
         $this->assertRejected($shape, StaleConcurrencyRevision::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: $digest), $parent);
-        $this->assertRejected($shape, LogicException::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: null), $parent);
+        $this->assertRejected($shape, NotAMember::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: $shape->digest($parent)), $parent);
+        $this->assertRejected($shape, NotAMember::class, fn (): OrderChange => $deleted->move(Placement::first(), expected: null), $parent);
         $this->assertOrder($shape, [$first->getKey()], $parent);
     }
 
@@ -2231,7 +2236,7 @@ class IsOrderedTest extends TestCase
         $parents = $member->parentsToLockFirst();
 
         $this->assertSame([[$source::class, $source->getKey()]], array_map(fn (Model $model): array => [$model::class, $model->getKey()], $parents));
-        $this->assertRejected($shape, LogicException::class, fn (): bool => $member->save(), $source);
+        $this->assertRejected($shape, UnavailableParent::class, fn (): bool => $member->save(), $source);
     }
 
     #[Test]
@@ -2574,6 +2579,95 @@ class IsOrderedTest extends TestCase
         $this->assertSame('video', $track->playlist->kind);
         $this->assertNotSame($revision, $this->tracksRevision($playlist));
         $this->assertSame([[$playlist->id, [], [[$second->id, null, 1]], $this->tracksRevision($playlist)]], $this->reorders);
+    }
+
+    #[Test]
+    public function it_moves_a_member_out_of_a_trashed_parent_and_announces_both_parents(): void
+    {
+        $source = Drawer::create();
+        [$moved, $staying] = [$this->addNote($source), $this->addNote($source)];
+        $destination = Drawer::create();
+        $source->delete();
+        $this->recordReorders();
+
+        $change = $moved->move(Placement::first()->in($destination), expected: null);
+
+        $this->assertSame([$moved->id], $change->order);
+        $this->assertSame($destination->id, DB::table('notes')->where('id', $moved->id)->value('drawer_id'));
+        $this->assertSame([
+            [$source->id, [$staying->id], [[$moved->id, null, 1]]],
+            [$destination->id, [$moved->id], [[$moved->id, 1, null]]],
+        ], array_map(fn (array $reorder): array => array_slice($reorder, 0, 3), $this->reorders));
+    }
+
+    #[Test]
+    public function it_moves_and_arranges_the_members_inside_a_trashed_parent(): void
+    {
+        $drawer = Drawer::create();
+        [$first, $second, $third] = [$this->addNote($drawer), $this->addNote($drawer), $this->addNote($drawer)];
+        $drawer->delete();
+
+        $third->move(Placement::first()->in($drawer), expected: null);
+        $second->move(Placement::first(), expected: null);
+        $change = $drawer->notes()->arrange([$third->id, $second->id, $first->id], expected: null);
+
+        $this->assertSame([$third->id, $second->id, $first->id], $change->order);
+        $this->assertSame([$third->id, $second->id, $first->id], DB::table('notes')->where('drawer_id', $drawer->id)->orderBy('rank_key')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_deletes_a_member_from_a_trashed_parent_and_announces_it(): void
+    {
+        $drawer = Drawer::create();
+        [$deleted, $staying] = [$this->addNote($drawer), $this->addNote($drawer)];
+        $drawer->delete();
+        $this->recordReorders();
+
+        $deleted->delete();
+
+        $this->assertSoftDeleted('notes', ['id' => $deleted->id]);
+        $this->assertSame([[$drawer->id, [$staying->id], [[$deleted->id, null, 1]]]], array_map(fn (array $reorder): array => array_slice($reorder, 0, 3), $this->reorders));
+    }
+
+    #[Test]
+    public function it_deletes_a_member_of_a_held_parent_whose_row_is_gone_and_announces_nothing(): void
+    {
+        $tour = Tour::create();
+        [$deleted, $staying] = [$tour->scenes()->create(), $tour->scenes()->create()];
+        $deleted->setRelation('sceneable', $tour);
+        DB::table('tours')->where('id', $tour->id)->delete();
+        $this->recordReorders();
+
+        $deleted->delete();
+
+        $this->assertSoftDeleted('scenes', ['id' => $deleted->id]);
+        $this->assertNull(DB::table('scenes')->where('id', $deleted->id)->value('rank_key'));
+        $this->assertNotNull(DB::table('scenes')->where('id', $staying->id)->value('rank_key'));
+        $this->assertSame([], $this->reorders);
+    }
+
+    #[Test]
+    public function it_moves_a_member_out_of_a_held_parent_whose_row_is_gone_and_announces_only_its_new_parent(): void
+    {
+        $tour = Tour::create();
+        [$moving] = [$this->addScene($tour), $this->addScene($tour)];
+        $listing = Listing::create();
+        DB::table('tours')->where('id', $tour->id)->delete();
+        $this->recordReorders();
+
+        $moving->sceneable()->associate($listing);
+        $moving->save();
+
+        $this->assertSame([[$listing->id, [$moving->id], [[$moving->id, 1, null]]]], array_map(fn (array $reorder): array => array_slice($reorder, 0, 3), $this->reorders));
+    }
+
+    private function addNote(Drawer $drawer): Note
+    {
+        $note = new Note;
+        $note->drawer()->associate($drawer);
+        $note->save();
+
+        return $note;
     }
 
     private function key(Model $member): int|string

@@ -15,7 +15,7 @@ use RuntimeException;
 use Support\Database\Eloquent\Concurrency\Concerns\WritesInTransactions;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
-use Support\Database\Eloquent\Ordering\Exceptions\ContendedOrder;
+use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
 use Support\Database\Eloquent\Ordering\Exceptions\UnselectedPosition;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
@@ -34,8 +34,6 @@ trait IsOrdered
 {
     use LocksOrderedParentsFirst;
     use WritesInTransactions;
-
-    private const int ORDER_LOCK_ATTEMPTS = 5;
 
     private null|OrderedRelation $resolvedOrderedRelation = null;
 
@@ -195,19 +193,21 @@ trait IsOrdered
             $original = $this->getRawOriginal();
             [$source, , , $stored] = $this->lockCurrentOrderedRelations(static fn (): null|OrderedRelation => $destination);
 
-            if ($source === null || $stored === null) {
-                throw new LogicException(sprintf('[%s:%s] has no parent that orders it.', static::class, $this->getKey()));
-            }
-
             if ($expected !== null) {
-                $read = $this->resolveOrderedRelation($this->getRawOriginal());
+                $read = $this->remember(OrderedRelation::sourceOf($this, $this->getRawOriginal(), $this->heldOrderedParents()));
 
-                if ($read === null || ! $read->is($source)) {
+                if ($source !== null && ($read === null || ! $read->is($source))) {
                     throw new StaleConcurrencyRevision(($read ?? $source)->parent, ($read ?? $source)->revision, $expected);
                 }
 
-                ($destination ?? $source)->compareConcurrencyRevision($expected);
+                ($destination ?? $source ?? $read)?->compareConcurrencyRevision($expected);
             }
+
+            if ($source === null || $stored === null) {
+                throw new NotAMember(static::class, [OrderedRelation::keyOf($this)]);
+            }
+
+            $source->requireMember($this);
 
             $target = $destination ?? $source;
             $change = $target->move($this, $placement, $source);
@@ -294,11 +294,10 @@ trait IsOrdered
         }
 
         if (! $item->exists) {
-            $item->lockedOrderedRelations = OrderedRelation::lockAll([$item->resolveOrderedRelation($item->getAttributes())]);
-            $item->lockRelatedOfOrderedRelations();
+            $item->lockDestinationOfCreate();
         } elseif ($item->isDirty(OrderedRelation::watchedColumns($item))) {
             [$current, $item->lockedOrderedRelations, $next, $membership] = $item->lockCurrentOrderedRelations(
-                static fn (null|array $stored): null|OrderedRelation => OrderedRelation::of(
+                static fn (null|array $stored): null|OrderedRelation => OrderedRelation::destinationOf(
                     $item,
                     $stored === null ? $item->getAttributes() : [...$stored, ...array_intersect_key($item->getDirty(), $stored)],
                     $item->heldOrderedParents(),
@@ -328,6 +327,7 @@ trait IsOrdered
                 }
 
                 if ($stored[OrderedRelations::DELETED_AT] !== null) {
+                    $next?->refuseUnavailable();
                     $item->assignRankKey($next?->keyAt(Placement::last()));
                     $item->restoredInto = $next;
 
@@ -415,8 +415,22 @@ trait IsOrdered
      */
     private function resolveOrderedRelation(array $attributes): null|OrderedRelation
     {
-        $relation = OrderedRelation::of($this, $attributes, $this->heldOrderedParents());
+        return $this->remember(OrderedRelation::of($this, $attributes, $this->heldOrderedParents()));
+    }
 
+    private function lockDestinationOfCreate(): void
+    {
+        $this->lockedOrderedRelations = OrderedRelation::lockAll([$this->remember(OrderedRelation::destinationOf($this, $this->getAttributes(), $this->heldOrderedParents()))]);
+
+        foreach ($this->lockedOrderedRelations as $relation) {
+            $relation->refuseUnavailable();
+        }
+
+        $this->lockRelatedOfOrderedRelations();
+    }
+
+    private function remember(null|OrderedRelation $relation): null|OrderedRelation
+    {
         if ($relation !== null) {
             $this->resolvedOrderedRelation = $relation;
         }
@@ -432,6 +446,7 @@ trait IsOrdered
             return;
         }
 
+        $next?->refuseUnavailable();
         $this->reparented = [$current, $next, $current?->memberPosition($this)];
         $this->assignRankKey($next?->keyAt(Placement::last()));
     }
@@ -485,27 +500,19 @@ trait IsOrdered
      */
     private function lockCurrentOrderedRelations(null|Closure $resolveNext = null): array
     {
-        $moved = new RuntimeException;
-
-        for ($attempt = 1; $attempt <= self::ORDER_LOCK_ATTEMPTS; $attempt++) {
+        return OrderedRelation::retryWhileMoved($this, function (RuntimeException $moved) use ($resolveNext): array {
             $stored = $this->storedOrderedAttributes(OrderedRelation::membershipColumns($this));
-            $current = $stored === null ? null : $this->resolveOrderedRelation($stored);
+            $current = $stored === null ? null : $this->remember(OrderedRelation::sourceOf($this, $stored, $this->heldOrderedParents()));
             $next = $resolveNext === null ? null : $resolveNext($stored);
 
-            try {
-                return $this->getConnection()->transaction(function () use ($stored, $current, $next, $moved): array {
-                    $locked = OrderedRelation::lockAll([$current, $next]);
+            return $this->getConnection()->transaction(function () use ($stored, $current, $next, $moved): array {
+                $locked = OrderedRelation::lockAll([$current, $next]);
 
-                    throw_unless($this->storedOrderedAttributes(OrderedRelation::membershipColumns($this)) === $stored, $moved);
+                throw_unless($this->storedOrderedAttributes(OrderedRelation::membershipColumns($this)) === $stored, $moved);
 
-                    return [$current, $locked, $next, $stored];
-                });
-            } catch (RuntimeException $exception) {
-                throw_unless($exception === $moved, $exception);
-            }
-        }
-
-        throw new ContendedOrder($this, self::ORDER_LOCK_ATTEMPTS);
+                return [$current, $locked, $next, $stored];
+            });
+        });
     }
 
     /**
