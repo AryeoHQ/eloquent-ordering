@@ -14,7 +14,7 @@ final readonly class Rebalanced implements ShouldDispatchAfterCommit
      */
     public function __construct(
         public OrderedRelation $relation,
-        public int $revision,
+        public string $revision,
         public array $ids,
     ) {}
 }

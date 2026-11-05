@@ -11,6 +11,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use RuntimeException;
+use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
 use Tests\Fixtures\Support\Customers\Customer;
@@ -67,7 +68,7 @@ class RebalancedTest extends TestCase
         $this->assertInstanceOf(Rebalanced::class, $rebalanced);
         $this->assertSame($change->relation, $rebalanced->relation);
         $this->assertSame($change->revision, $rebalanced->revision);
-        $this->assertSame($shape->storedRevision($parent), $rebalanced->revision);
+        $this->assertSame($shape->digest($parent), $rebalanced->revision);
         $this->assertSame([$first->getKey(), $second->getKey(), $third->getKey()], $rebalanced->ids);
     }
 
@@ -106,6 +107,7 @@ class RebalancedTest extends TestCase
         $class = $shape->memberClass();
         $excluded = new $class(['customer_id' => $customer->id]);
         $shape->associate($excluded, $parent);
+        $digest = $shape->digest($parent);
         $this->forget();
 
         $excluded->placeAt(Placement::after($this->key($first)))->save();
@@ -117,8 +119,23 @@ class RebalancedTest extends TestCase
         $this->assertInstanceOf(Rebalanced::class, $rebalanced);
         $this->assertTrue($parent->is($rebalanced->relation->parent));
         $this->assertSame($shape->revision(), $rebalanced->relation->revision);
-        $this->assertSame($shape->storedRevision($parent), $rebalanced->revision);
+        $this->assertSame([$digest, $digest], [$rebalanced->revision, $shape->digest($parent)]);
         $this->assertSame([$first->getKey(), $second->getKey()], $rebalanced->ids);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_keeps_the_order_digest_when_every_rank_key_changes_and_the_order_does_not(Shape $shape): void
+    {
+        [$parent, $members] = $shape->with(3);
+        [$digest, $keys] = [$shape->digest($parent), $shape->rankKeys($parent)];
+
+        foreach (array_map(null, $members, FractionalIndex::keysBetween('a5', null, 3)) as [$member, $key]) {
+            DB::table($shape->memberTable())->where('id', $member->getKey())->update([OrderedRelation::RANK_KEY => $key]);
+        }
+
+        $this->assertNotSame($keys, $shape->rankKeys($parent));
+        $this->assertSame($digest, $shape->digest($parent));
     }
 
     #[DataProvider('shapes')]

@@ -15,10 +15,8 @@ use Tests\Fixtures\Support\Binders\Binder;
 
 /**
  * @property int $id
- * @property int $concurrency_revision
- * @property int $binders_order_concurrency_revision
+ * @property string $concurrency_revision
  */
-#[OrdersRelation(ShelfRevision::BindersOrder, relation: 'binders')]
 class Shelf extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -29,6 +27,7 @@ class Shelf extends Model implements OrdersRelations, Revisioned
     /**
      * @return HasMany<Binder, $this>
      */
+    #[OrdersRelation(ShelfRevision::BindersOrder)]
     public function binders(): HasMany
     {
         return $this->hasMany(Binder::class);

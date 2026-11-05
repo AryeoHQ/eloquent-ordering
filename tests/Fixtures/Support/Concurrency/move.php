@@ -16,7 +16,7 @@ require __DIR__.'/../../../../vendor/autoload.php';
 Application::create(options: ['extra' => ['providers' => [Provider::class]]]);
 
 try {
-    Asset::query()->findOrFail($asset)->move(Placement::first()->in(Section::query()->findOrFail($destination)), (int) $expected);
+    Asset::query()->findOrFail($asset)->move(Placement::first()->in(Section::query()->findOrFail($destination)), $expected);
 
     echo 'moved';
 } catch (StaleConcurrencyRevision) {

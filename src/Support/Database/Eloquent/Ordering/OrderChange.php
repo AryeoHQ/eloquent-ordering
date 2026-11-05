@@ -14,7 +14,7 @@ final readonly class OrderChange
         public OrderedRelation $relation,
         public array $order,
         public array $changed,
-        public int $revision,
+        public string $revision,
         public null|OrderChange $source = null,
     ) {}
 }

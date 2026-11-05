@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Support\Database\Eloquent\Ordering\Provides;
 
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Query\Expression;
 use Support\Database\Eloquent\Concurrency\Concerns\WritesInTransactions;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
@@ -36,14 +35,6 @@ trait HasOrderedRelations
 
             $parent->refilteredOrders = OrderedRelation::membersBeforeRefilter($parent);
             OrderedRelation::preparedParent($parent);
-        });
-
-        static::updating(static function (self $parent): void {
-            foreach ($parent->refilteredOrders as [$revision]) {
-                $column = $parent->concurrencyRevisionColumn($revision);
-
-                $parent->setAttribute($column, new Expression(sprintf('%s + 1', $parent->getConnection()->getQueryGrammar()->wrap($column))));
-            }
         });
 
         static::saved(static function (self $parent): void {

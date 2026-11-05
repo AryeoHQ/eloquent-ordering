@@ -5,9 +5,6 @@ declare(strict_types=1);
 use Illuminate\Database\Migrations\Migration;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
-use Support\Database\Eloquent\Concurrency\Schema\ConcurrencyRevisions;
-use Support\Database\Eloquent\Ordering\Schema\OrderedRelations;
-use Tests\Fixtures\Support\Agencies\AgencyRevision;
 
 return new class extends Migration
 {
@@ -15,12 +12,8 @@ return new class extends Migration
     {
         Schema::create('agencies', function (Blueprint $table): void {
             $table->id();
-            $table->concurrencyRevision();
-            $table->namedConcurrencyRevision(AgencyRevision::CustomersOrder->value);
             $table->timestamps();
         });
-
-        ConcurrencyRevisions::createTrigger('agencies');
 
         Schema::create('agency_customer', function (Blueprint $table): void {
             $table->uuid('id')->primary();
@@ -37,8 +30,6 @@ return new class extends Migration
         Schema::getConnection()->statement(
             'create unique index agency_customer_agency_id_rank_key_unique on agency_customer (agency_id, rank_key) where deleted_at is null',
         );
-
-        OrderedRelations::createTrigger('agency_customer', 'agencies', 'agency_id', AgencyRevision::CustomersOrder->value, relatedKey: 'customer_id');
     }
 
     public function down(): void

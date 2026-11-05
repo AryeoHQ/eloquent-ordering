@@ -9,6 +9,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
+use Support\Database\Eloquent\Ordering\Attributes\OrderedThrough;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
@@ -24,6 +25,7 @@ use Tests\Fixtures\Support\Panels\Panel;
  * @property-read int|null $position
  */
 #[OrderedIn(Panel::class)]
+#[OrderedThrough(Conference::class)]
 class Speaker extends Model implements Ordered
 {
     use IsOrdered;

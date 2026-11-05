@@ -18,10 +18,8 @@ use Tests\Fixtures\Support\Slides\Slide;
 /**
  * @property string $id
  * @property string|null $title
- * @property int $concurrency_revision
- * @property int $slides_order_concurrency_revision
+ * @property string $concurrency_revision
  */
-#[OrdersRelation(GalleryRevision::SlidesOrder, relation: 'slides')]
 class Gallery extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
@@ -37,6 +35,7 @@ class Gallery extends Model implements OrdersRelations, Revisioned
     /**
      * @return MorphMany<Slide, $this>
      */
+    #[OrdersRelation(GalleryRevision::SlidesOrder)]
     public function slides(): MorphMany
     {
         return $this->morphMany(Slide::class, 'slideable');

@@ -8,7 +8,6 @@ use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\DB;
-use Support\Database\Eloquent\Concurrency\ConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
@@ -180,14 +179,13 @@ abstract class Shape
         return $positions;
     }
 
-    public function storedRevision(Model $parent, null|NamesConcurrencyRevision $revision = null): int
+    public function digest(Model $parent, null|NamesConcurrencyRevision $revision = null): string
     {
-        return (int) DB::table($this->parentTable())->where('id', $parent->getKey())->value($this->column($revision));
-    }
+        $stored = $parent->fresh();
 
-    public function setStoredRevision(Model $parent, int $revision): void
-    {
-        DB::table($this->parentTable())->where('id', $parent->getKey())->update([$this->column() => $revision]);
+        assert($stored instanceof Revisioned);
+
+        return $stored->concurrencyRevision($revision ?? $this->revision());
     }
 
     /**
@@ -210,11 +208,6 @@ abstract class Shape
     public function longestRankKey(Model $parent): int
     {
         return (int) $this->rows($parent)->max(DB::raw('length(rank_key)'));
-    }
-
-    public function column(null|NamesConcurrencyRevision $revision = null): string
-    {
-        return ConcurrencyRevision::namedColumn((string) ($revision ?? $this->revision())->value);
     }
 
     private function rows(Model $parent): Builder
