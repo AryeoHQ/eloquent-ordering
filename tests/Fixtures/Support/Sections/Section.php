@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Tests\Fixtures\Support\Sections;
 
+use Illuminate\Database\Eloquent\Attributes\UseFactory;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
@@ -20,9 +22,14 @@ use Tests\Fixtures\Support\Videos\Video;
  * @property string|null $name
  * @property string $concurrency_revision
  */
+#[UseFactory(SectionFactory::class)]
 class Section extends Model implements OrdersRelations, Revisioned
 {
     use HasConcurrencyRevisions;
+
+    /** @use HasFactory<SectionFactory> */
+    use HasFactory;
+
     use HasOrderedRelations;
 
     protected $guarded = [];
