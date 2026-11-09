@@ -9,13 +9,13 @@ use RuntimeException;
 
 final class ContendedOrder extends RuntimeException
 {
-    public function __construct(Model $item, int $attempts)
+    public function __construct(Model $model, int $attempts)
     {
         parent::__construct(sprintf(
-            '[%s:%s] changed parent during each of %d attempts to lock its order.',
-            $item::class,
-            $item->getKey(),
+            'A membership changed during each of %d attempts to lock the order of [%s:%s].',
             $attempts,
+            $model::class,
+            $model->getKey(),
         ));
     }
 }

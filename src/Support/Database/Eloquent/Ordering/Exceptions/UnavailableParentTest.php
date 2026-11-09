@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Ordering\Exceptions;
 
 use Closure;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use PHPUnit\Framework\Attributes\CoversClass;
@@ -41,6 +42,21 @@ class UnavailableParentTest extends TestCase
 
         $this->assertSame($before, $this->stored($drawer));
         $this->assertTrue($this->lockedBeforeRefusal($drawer));
+    }
+
+    #[Test]
+    public function it_names_a_parent_that_the_required_morph_map_omits_by_its_class(): void
+    {
+        Relation::requireMorphMap();
+        $drawer = Drawer::create();
+        $drawer->delete();
+
+        try {
+            $this->addNote($drawer);
+            $this->fail('A write placed a member in an unavailable parent.');
+        } catch (UnavailableParent $exception) {
+            $this->assertSame(sprintf('[%s:%s] is trashed, so no write can place a member in its order.', Drawer::class, $drawer->getKey()), $exception->getMessage());
+        }
     }
 
     #[Test]

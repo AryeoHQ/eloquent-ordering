@@ -54,7 +54,7 @@ class ContendedOrderTest extends TestCase
             $moved->move(Placement::first(), expected: null);
             $this->fail('A member that changed parent before each lock was moved.');
         } catch (ContendedOrder $exception) {
-            $this->assertStringContainsString(sprintf('[%s:%s]', $moved::class, $moved->getKey()), $exception->getMessage());
+            $this->assertSame(sprintf('A membership changed during each of 5 attempts to lock the order of [%s:%s].', $moved::class, $moved->getKey()), $exception->getMessage());
         }
 
         $this->assertSame(10, $reads);
@@ -91,7 +91,7 @@ class ContendedOrderTest extends TestCase
             $shape->relation($destination)->moveIn([$moved], expected: null);
             $this->fail('An item that changed parent before each lock was moved in.');
         } catch (ContendedOrder $exception) {
-            $this->assertStringContainsString(sprintf('[%s:%s]', $destination::class, $destination->getKey()), $exception->getMessage());
+            $this->assertSame(sprintf('A membership changed during each of 5 attempts to lock the order of [%s:%s].', $destination::class, $destination->getKey()), $exception->getMessage());
         }
 
         $this->assertSame(10, $reads);

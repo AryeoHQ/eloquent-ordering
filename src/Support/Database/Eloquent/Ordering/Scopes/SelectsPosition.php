@@ -124,8 +124,10 @@ final class SelectsPosition implements Scope
     {
         $positions = [];
 
-        foreach (self::pivotPositions($pivots, $query, $connection) as $pivot => $position) {
-            if (self::selectsThePivot($columns, $pivot)) {
+        foreach (self::joinedPivots($pivots, $query) as $qualifier => $pivot) {
+            $position = self::selectsThePivot($columns, $qualifier) ? OrderedRelation::positionColumn($pivot, $qualifier, $connection) : null;
+
+            if ($position !== null) {
                 $positions[] = new Expression(sprintf('%s as %s', $position, $query->getGrammar()->wrap(self::PIVOT_ATTRIBUTE)));
             }
         }
@@ -190,25 +192,22 @@ final class SelectsPosition implements Scope
 
     /**
      * @param  array<string, Model&Ordered>  $ordered
-     * @return array<string, string>
+     * @return array<string, Model&Ordered>
      */
-    private static function pivotPositions(array $ordered, QueryBuilder $query, Connection $connection): array
+    private static function joinedPivots(array $ordered, QueryBuilder $query): array
     {
-        $positions = [];
+        $pivots = [];
         $joined = array_filter(array_map(static fn (mixed $join): mixed => $join instanceof JoinClause ? $join->table : null, $query->joins ?? []), is_string(...));
 
         foreach ($joined as $join) {
-            $table = preg_replace('/\s+as\s+\S+$/i', '', $join) ?? $join;
-            $pivot = $ordered[$table] ?? null;
-            $qualifier = self::qualifier($join);
-            $position = $pivot === null ? null : OrderedRelation::positionColumn($pivot, $qualifier, $connection);
+            $pivot = $ordered[preg_replace('/\s+as\s+\S+$/i', '', $join) ?? $join] ?? null;
 
-            if ($position !== null) {
-                $positions[$qualifier] = $position;
+            if ($pivot !== null) {
+                $pivots[self::qualifier($join)] = $pivot;
             }
         }
 
-        return $positions;
+        return $pivots;
     }
 
     private static function qualifier(string $from): string

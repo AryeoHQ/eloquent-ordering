@@ -9,10 +9,12 @@ use Illuminate\Database\QueryException;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Tests\TestCase;
+use Throwable;
 
 #[CoversClass(Macros::class)]
 class MacrosTest extends TestCase
@@ -31,6 +33,24 @@ class MacrosTest extends TestCase
         $this->assertSame('character varying(64)', $column['type']);
         $this->assertSame('C', $column['collation']);
         $this->assertTrue($column['nullable']);
+    }
+
+    #[Test]
+    public function it_refuses_a_rank_key_index_that_names_no_membership_column(): void
+    {
+        try {
+            Schema::create('ranked', function (Blueprint $table): void {
+                $table->id();
+                $table->rankKey();
+                $table->rankKeyIndex();
+            });
+            $this->fail('A rank key index without a membership column was added.');
+        } catch (Throwable $exception) {
+            $this->assertInstanceOf(InvalidArgumentException::class, $exception);
+            $this->assertSame("rankKeyIndex() on [ranked] needs the parent columns of the membership, such as rankKeyIndex('section_id'), because a rank key is unique only within one order.", $exception->getMessage());
+        }
+
+        $this->assertFalse(Schema::hasTable('ranked'));
     }
 
     /**

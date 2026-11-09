@@ -4,10 +4,12 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Ordering\Exceptions;
 
+use Illuminate\Database\Eloquent\Relations\Relation;
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
+use Tests\Fixtures\Support\Shapes\HasManyShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\TestCase;
 
@@ -39,6 +41,28 @@ class MembershipMismatchTest extends TestCase
                 'The ids must list each current member of the [%s] order of [%s:%s] exactly once.',
                 $shape->revision()->value,
                 $parent->getMorphClass(),
+                $parent->getKey(),
+            ), $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function it_names_a_parent_that_the_required_morph_map_omits_by_its_class(): void
+    {
+        Relation::requireMorphMap();
+        $shape = new HasManyShape;
+        [$parent, [$first]] = $shape->with(2);
+        $key = $first->getKey();
+        $this->assertTrue(is_int($key) || is_string($key));
+
+        try {
+            $shape->arrange($parent, [$key], expected: null);
+            $this->fail('A reorder that omits a member succeeded.');
+        } catch (MembershipMismatch $exception) {
+            $this->assertSame(sprintf(
+                'The ids must list each current member of the [%s] order of [%s:%s] exactly once.',
+                $shape->revision()->value,
+                $parent::class,
                 $parent->getKey(),
             ), $exception->getMessage());
         }
