@@ -15,6 +15,14 @@ use Tests\Fixtures\Support\Playlists\Playlist;
  * @property int $id
  * @property int $playlist_id
  * @property string|null $kind
+ * @property int $disc
+ * @property string $code
+ * @property string $mood
+ * @property bool $explicit
+ * @property string $format
+ * @property string $source
+ * @property string $released_at
+ * @property string $label_id
  * @property string|null $rank_key
  * @property-read int|null $position
  */

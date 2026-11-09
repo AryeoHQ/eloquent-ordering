@@ -787,6 +787,36 @@ class SelectsPositionTest extends TestCase
         $this->assertSame([1, null, 2], $positions);
     }
 
+    /**
+     * @return iterable<string, array{string, list<mixed>}>
+     */
+    public static function boundFilters(): iterable
+    {
+        yield 'an integer' => ['disc', [Playlist::DISC, 2, Playlist::DISC, Playlist::DISC]];
+        yield 'an integer against a string column' => ['code', [(string) Playlist::CODE, '2', (string) Playlist::CODE, (string) Playlist::CODE]];
+        yield 'a string that holds a quote' => ['mood', [Playlist::MOOD, "o''clock", Playlist::MOOD, Playlist::MOOD]];
+        yield 'a boolean' => ['explicit', [false, true, false, false]];
+        yield 'a null in a list' => ['source', [Playlist::SOURCE, '', Playlist::SOURCE, Playlist::SOURCE]];
+        yield 'a list' => ['format', [Playlist::FORMATS[0], 'wav', Playlist::FORMATS[1], Playlist::FORMATS[0]]];
+        yield 'a timestamp' => ['released_at', ['2025-06-01 00:00:00', '2026-06-01 00:00:00', Playlist::RELEASED_BY, '2025-12-01 00:00:00']];
+        yield 'a uuid' => ['label_id', [Playlist::LABEL, '0f1e2d3c-4b5a-4968-8776-655443322111', Playlist::LABEL, Playlist::LABEL]];
+    }
+
+    /**
+     * @param  list<mixed>  $values
+     */
+    #[DataProvider('boundFilters')]
+    #[Test]
+    public function it_numbers_the_members_that_a_declared_filter_keeps_whatever_the_type_of_its_bound_value(string $column, array $values): void
+    {
+        $playlist = Playlist::create();
+        $ids = array_map(fn (mixed $value): int => Track::query()->create(['playlist_id' => $playlist->id, $column => $value])->id, $values);
+        $read = fn (Builder $query): array => $query->whereKey($ids)->orderBy('id')->get()->map(fn (Model $track): mixed => $track->getAttribute(OrderedRelation::POSITION))->all();
+
+        $this->assertSame([1, null, 2, 3], $read(Track::query()));
+        $this->assertSame([1, null, 2, 3], DB::transaction(fn (): array => $read(Track::query()->lockForUpdate())));
+    }
+
     #[Test]
     public function it_selects_the_position_under_the_alias_that_a_later_scope_gives_the_table(): void
     {

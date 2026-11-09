@@ -228,6 +228,7 @@ class OrderedRelationTest extends TestCase
             return self::filtered(FiledFolder::query()->create(), 'documents', FiledDocument::class, 'folder_id', 'home_folder_id', [$archive->id, $other->id, $archive->id, $archive->id]);
         }];
         yield 'an enum cast' => [static fn (): array => self::filtered(KindedFolder::query()->create(['kind' => DocumentKind::Notes]), 'documents', KindedDocument::class, 'folder_id', 'kind', ['notes', 'drafts', 'notes', 'notes'])];
+        yield 'an integer against a string column' => [static fn (): array => self::filtered(Playlist::create(), 'tracks', Track::class, 'playlist_id', 'code', [(string) Playlist::CODE, '2', (string) Playlist::CODE, (string) Playlist::CODE])];
     }
 
     #[DataProvider('shapes')]

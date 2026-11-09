@@ -30,6 +30,7 @@ use ReflectionClass;
 use ReflectionMethod;
 use ReflectionNamedType;
 use RuntimeException;
+use Stringable;
 use Support\Database\Eloquent\Concurrency\Attributes\NamedConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
@@ -1037,9 +1038,24 @@ final class OrderedRelation
             ))
             ->selectRaw(sprintf('case when bool_or(%s = %s) then count(*) end', $grammar->wrap($member($key)), $grammar->wrap($outer($key))));
 
-        $bindings = $members->getBindings();
+        $literals = array_map(self::untypedLiteral(...), $connection->prepareBindings($members->getBindings()));
 
-        return $grammar->substituteBindingsIntoRawSql($members->toSql(), array_replace($connection->prepareBindings($bindings), array_filter($bindings, is_bool(...))));
+        return preg_replace_callback(
+            '/\'(?:[^\']|\'\')*\'|"(?:[^"]|"")*"|\?\??/',
+            static function (array $match) use (&$literals): string {
+                return $match[0] === '?' ? array_shift($literals) ?? throw new LogicException('A position count holds more placeholders than bindings.') : $match[0];
+            },
+            $members->toSql(),
+        ) ?? throw new LogicException('A position count could not render its bindings.');
+    }
+
+    private static function untypedLiteral(mixed $value): string
+    {
+        return match (true) {
+            $value === null => 'null',
+            is_scalar($value) || $value instanceof Stringable => "'".str_replace("'", "''", (string) $value)."'",
+            default => throw new LogicException(sprintf('A position count cannot render a [%s] binding as a literal.', get_debug_type($value))),
+        };
     }
 
     /**
