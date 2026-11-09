@@ -494,7 +494,7 @@ trait IsOrdered
      */
     private function storedOrderedAttributes(array $columns): null|array
     {
-        $stored = $this->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($this->getKey())->toBase()->useWritePdo()->first($columns);
+        $stored = $this->newModelQuery()->whereKey($this->getKey())->toBase()->useWritePdo()->first($columns);
 
         return $stored === null ? null : (array) $stored;
     }
