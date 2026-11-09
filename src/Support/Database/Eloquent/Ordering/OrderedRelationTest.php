@@ -48,6 +48,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
 use Support\Database\Eloquent\Ordering\Exceptions\ParentUnavailability;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
+use Support\Database\Eloquent\Ordering\Exceptions\WriteHalted;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
@@ -57,6 +58,7 @@ use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Composed\ComposedItem;
+use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Customers\CountedCustomer;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\PlainCustomer;
@@ -68,6 +70,7 @@ use Tests\Fixtures\Support\Documents\FiledDocument;
 use Tests\Fixtures\Support\Documents\KindedDocument;
 use Tests\Fixtures\Support\Documents\LocalizedDocument;
 use Tests\Fixtures\Support\Drawers\Drawer;
+use Tests\Fixtures\Support\Drawers\DrawerRevision;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Folders\CountedFolder;
 use Tests\Fixtures\Support\Folders\DatedFolder;
@@ -87,6 +90,7 @@ use Tests\Fixtures\Support\Listings\TitledListing;
 use Tests\Fixtures\Support\Listings\TwoPivotListing;
 use Tests\Fixtures\Support\Notes\Note;
 use Tests\Fixtures\Support\Pages\Page;
+use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Scenes\Scene;
@@ -96,6 +100,7 @@ use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Shelves\Shelf;
+use Tests\Fixtures\Support\Speakers\Speaker;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tracks\Track;
 use Tests\Fixtures\Support\Videos\Video;
@@ -132,6 +137,15 @@ class OrderedRelationTest extends TestCase
     public static function pivots(): iterable
     {
         return PivotShape::pivots();
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function haltingRecordListeners(): iterable
+    {
+        yield 'a saving listener' => ['saving'];
+        yield 'a creating listener' => ['creating'];
     }
 
     /**
@@ -1602,6 +1616,64 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([$first->id, $single->id], $this->noteIds($drawer));
         $this->assertSame(2, $single->position);
         $this->assertSame([[$drawer->id, [[$single->id, 2, null]]]], $this->reorders);
+    }
+
+    #[DataProvider('haltingRecordListeners')]
+    #[Test]
+    public function it_refuses_a_create_in_order_whose_listener_halts_the_second_record(string $event): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $digest = Drawer::query()->findOrFail($drawer->id)->concurrencyRevision(DrawerRevision::NotesOrder);
+        $records = 0;
+        Event::listen(sprintf('eloquent.%s: %s', $event, Note::class), function () use (&$records): null|bool {
+            return ++$records === 2 ? false : null;
+        });
+        $rebalances = 0;
+        Event::listen(Rebalanced::class, function () use (&$rebalances): void {
+            $rebalances++;
+        });
+        $this->recordReorders();
+        $thrown = null;
+
+        try {
+            $drawer->notes()->createInOrder([[], [], []]);
+        } catch (Throwable $thrown) {
+        }
+
+        $this->assertInstanceOf(WriteHalted::class, $thrown);
+        $this->assertSame(2, $records);
+        $this->assertSame([$first->id], DB::table('notes')->pluck('id')->map(fn (mixed $id): int => (int) $id)->all());
+        $this->assertSame($digest, Drawer::query()->findOrFail($drawer->id)->concurrencyRevision(DrawerRevision::NotesOrder));
+        $this->assertSame([], $this->reorders);
+        $this->assertSame(0, $rebalances);
+    }
+
+    #[Test]
+    public function it_locks_the_parents_first_again_when_it_retries_a_save_that_a_listener_halted(): void
+    {
+        $panel = Panel::create();
+        $speaker = $panel->speakers()->create();
+        $conference = Conference::create();
+        $conference->speakers()->attach($speaker);
+        $speaker->delete();
+        $halt = true;
+        Speaker::saving(function () use (&$halt): null|bool {
+            if (! $halt) {
+                return null;
+            }
+
+            $halt = false;
+
+            return false;
+        });
+
+        $this->assertFalse(self::restore($speaker));
+        DB::enableQueryLog();
+
+        $this->assertTrue(self::restore($speaker));
+        $this->assertSame(['conferences', 'panels'], array_values(array_unique(array_column($this->parentLocks(DB::getQueryLog(), 'panels|conferences'), 0))));
+        $this->assertSame(1, $speaker->refresh()->position);
     }
 
     #[DataProvider('shapes')]
@@ -3095,6 +3167,13 @@ class OrderedRelationTest extends TestCase
         $asset->save();
 
         return $asset;
+    }
+
+    private static function restore(Model $model): mixed
+    {
+        assert(method_exists($model, 'restore'));
+
+        return $model->restore();
     }
 
     private function key(Model $member): int|string

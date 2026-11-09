@@ -16,6 +16,7 @@ use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
 use Support\Database\Eloquent\Ordering\Exceptions\UnselectedPosition;
+use Support\Database\Eloquent\Ordering\Exceptions\WriteHalted;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\OrderWrite;
@@ -54,6 +55,11 @@ trait IsOrdered
     /** @var null|array{mixed} */
     private null|array $assignedRankKey = null;
 
+    /** @var null|array{OrderedRelation, null|int} */
+    private null|array $trashedPosition = null;
+
+    private bool $awaitsRankKey = false;
+
     public static function bootIsOrdered(): void
     {
         static::addGlobalScope(new SelectsPosition);
@@ -75,6 +81,7 @@ trait IsOrdered
             $relation = array_find($item->lockedOrderedRelations, static fn (OrderedRelation $locked): bool => $locked->is($relation)) ?? $relation;
 
             $item->assignRankKey($relation->keyForCreate($item, $item->placement ?? Placement::last()));
+            $item->awaitsRankKey = false;
             OrderedRelation::prepared($item);
         });
 
@@ -124,10 +131,12 @@ trait IsOrdered
             $restored = $item->restoredInto;
             $reparented = $item->reparented;
             $refiltered = $item->refilteredPosition;
+            $trashed = $item->trashedPosition;
             $relations = $item->lockedOrderedRelations;
             $item->restoredInto = null;
             $item->reparented = null;
             $item->refilteredPosition = null;
+            $item->trashedPosition = null;
             $item->lockedOrderedRelations = [];
             $item->assignedRankKey = null;
 
@@ -136,6 +145,10 @@ trait IsOrdered
             }
 
             $restored?->placed($item);
+
+            if ($trashed !== null && $trashed[1] !== null) {
+                $trashed[0]->removed($item, $trashed[1]);
+            }
 
             if ($reparented !== null) {
                 $item->announceReparent(...$reparented);
@@ -206,8 +219,6 @@ trait IsOrdered
                 throw new NotAMember(static::class, [OrderedRelation::keyOf($this)]);
             }
 
-            $source->requireMember($this);
-
             $target = $destination ?? $source;
             $change = $target->move($this, $placement, $source);
 
@@ -229,6 +240,39 @@ trait IsOrdered
     public function newQueryWithoutScopes()
     {
         return $this->selectPositionOnKeyQuery(parent::newQueryWithoutScopes()); // @phpstan-ignore return.type
+    }
+
+    /**
+     * @param  string  $event
+     * @param  bool  $halt
+     * @return mixed
+     */
+    protected function fireModelEvent($event, $halt = true)
+    {
+        $result = parent::fireModelEvent($event, $halt);
+
+        if ($event === 'creating' && $result !== false) {
+            OrderedRelation::requirePrepared($this);
+
+            $awaited = $this->awaitsRankKey;
+            $this->awaitsRankKey = false;
+
+            throw_if($awaited, WriteHalted::class, $this);
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param  Builder<static>  $query
+     * @return Builder<static>
+     */
+    protected function setKeysForSaveQuery($query)
+    {
+        OrderedRelation::requirePrepared($this);
+        parent::setKeysForSaveQuery($query);
+
+        return $query;
     }
 
     /**
@@ -286,7 +330,9 @@ trait IsOrdered
         $item->restoredInto = null;
         $item->reparented = null;
         $item->refilteredPosition = null;
+        $item->trashedPosition = null;
         $item->lockedOrderedRelations = [];
+        $item->awaitsRankKey = ! $item->exists;
 
         if ($item->exists && Provider::locksPivotParentsOf($item, deleting: false)) {
             OrderedRelation::lockParentsFirst($item);
@@ -334,6 +380,13 @@ trait IsOrdered
                 }
 
                 $kept = $stored[OrderedRelation::RANK_KEY];
+            }
+
+            if ($softDeletes && $stored !== null && $stored[OrderedRelations::DELETED_AT] === null && $item->getAttribute(OrderedRelations::DELETED_AT) !== null) {
+                $item->trashedPosition = $current === null ? null : [$current, $current->memberPosition($item)];
+                $item->assignRankKey(null);
+
+                return;
             }
 
             if (! $softDeletes || $item->getAttribute(OrderedRelations::DELETED_AT) === null) {

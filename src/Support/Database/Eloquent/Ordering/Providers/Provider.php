@@ -137,7 +137,7 @@ class Provider extends ServiceProvider
     {
         $model = $payload[0] ?? null;
 
-        if ($model instanceof Model) {
+        if ($model instanceof Model && ! $model instanceof Ordered) {
             OrderedRelation::requirePrepared($model);
         }
     }

@@ -25,6 +25,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
 use Support\Database\Eloquent\Ordering\Exceptions\UnselectedPosition;
+use Support\Database\Eloquent\Ordering\Exceptions\WriteHalted;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\OrderChange;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
@@ -33,6 +34,7 @@ use Support\Database\Eloquent\Ordering\PositionChange;
 use Tests\Fixtures\Support\Albums\Album;
 use Tests\Fixtures\Support\Albums\AlbumRevision;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Assets\TouchingAsset;
 use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Boards\Board;
 use Tests\Fixtures\Support\Customers\Customer;
@@ -49,6 +51,7 @@ use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
+use Tests\Fixtures\Support\Sections\TouchedSection;
 use Tests\Fixtures\Support\Shapes\HasManyShape;
 use Tests\Fixtures\Support\Shapes\MorphManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
@@ -247,6 +250,15 @@ class IsOrderedTest extends TestCase
     {
         yield 'an updating listener' => ['updating'];
         yield 'a saving listener registered after boot' => ['saving'];
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function stoppingListeners(): iterable
+    {
+        yield 'an updating listener' => ['updating'];
+        yield 'a creating listener' => ['creating'];
     }
 
     /**
@@ -623,6 +635,21 @@ class IsOrderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
+    public function it_takes_a_member_that_a_save_soft_deletes_out_of_the_relation(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $second->setAttribute('deleted_at', now());
+
+        $this->assertTrue($second->save());
+
+        $this->assertNull($second->getAttribute('rank_key'));
+        $this->assertNull($second->getAttribute('position'));
+        $this->assertNull(DB::table($shape->memberTable())->where('id', $second->getKey())->value('rank_key'));
+        $this->assertOrder($shape, [$first->getKey(), $third->getKey()], $parent);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
     public function it_places_a_member_restored_after_a_soft_delete_last(Shape $shape): void
     {
         [$parent, [$first, $second, $third]] = $shape->with(3);
@@ -990,6 +1017,34 @@ class IsOrderedTest extends TestCase
         $this->assertFalse($member->save());
         $this->assertTrue($member->save());
         $this->assertOrder($shape, [$member->getKey(), $first->getKey(), $second->getKey()], $parent);
+    }
+
+    #[Test]
+    public function it_refuses_a_create_whose_creating_listeners_an_earlier_listener_stops_before_the_rank_key_is_assigned(): void
+    {
+        Event::listen('eloquent.creating: '.Asset::class, fn (): bool => true);
+        $shape = new HasManyShape;
+        $section = Section::create();
+        $digest = $shape->digest($section);
+        $asset = new Asset;
+        $asset->section()->associate($section);
+
+        $this->assertRejected($shape, WriteHalted::class, fn (): bool => $asset->save(), $section);
+        $this->assertSame($digest, $shape->digest($section));
+        $this->assertSame(0, DB::table('assets')->count());
+    }
+
+    #[Test]
+    public function it_cancels_a_create_whose_earlier_creating_listener_returns_false(): void
+    {
+        Event::listen('eloquent.creating: '.Asset::class, fn (): bool => false);
+        $section = Section::create();
+        $asset = new Asset;
+        $asset->section()->associate($section);
+
+        $this->assertFalse($asset->save());
+        $this->assertFalse($asset->exists);
+        $this->assertSame(0, DB::table('assets')->count());
     }
 
     #[DataProvider('shapes')]
@@ -1470,6 +1525,57 @@ class IsOrderedTest extends TestCase
         $this->assertSame('Renamed', DB::table('assets')->where('id', $moving->getKey())->value('title'));
         $this->assertOrder($shape, [$staying->getKey()], $source);
         $this->assertOrder($shape, [$holder->getKey(), $moving->getKey()], $destination);
+    }
+
+    #[DataProvider('stoppingListeners')]
+    #[Test]
+    public function it_refuses_a_listener_that_changes_the_parent_after_it_prepared_the_order_and_stops_the_listeners_after_it(string $event): void
+    {
+        $shape = new HasManyShape;
+        $source = Section::create();
+        $destination = Section::create();
+        $moving = $shape->add($source);
+        $shape->add($destination);
+
+        Event::listen(sprintf('eloquent.%s: %s', $event, Asset::class), function (Asset $asset) use ($destination): bool {
+            $asset->section_id = $destination->id;
+
+            return true;
+        });
+
+        $item = $event === 'creating' ? new Asset(['section_id' => $source->id]) : Asset::query()->findOrFail($moving->getKey());
+        $item->title = 'Renamed';
+
+        $this->assertRejected($shape, LogicException::class, fn (): bool => $item->save(), $source, $destination);
+        $this->assertSame(['section_id' => $source->id, 'title' => null], (array) DB::table('assets')->where('id', $moving->getKey())->first(['section_id', 'title']));
+        $this->assertSame(2, DB::table('assets')->count());
+    }
+
+    #[Test]
+    public function it_touches_no_parent_for_an_order_write_of_an_item_that_touches_its_parent(): void
+    {
+        $section = TouchedSection::create();
+        $assets = array_map(function () use ($section): TouchingAsset {
+            $asset = new TouchingAsset;
+            $asset->section()->associate($section);
+            $asset->save();
+
+            return $asset;
+        }, range(1, 3));
+        $stamp = fn (): mixed => DB::table('sections')->where('id', $section->id)->value('updated_at');
+        $before = $stamp();
+        $saved = 0;
+        Event::listen('eloquent.saved: '.TouchedSection::class, function () use (&$saved): void {
+            $saved++;
+        });
+        $this->travel(1)->days();
+
+        $assets[2]->move(Placement::first(), expected: null);
+        $section->assets()->arrange([$assets[1]->id, $assets[0]->id, $assets[2]->id], expected: null);
+
+        $this->assertSame([$assets[1]->id, $assets[0]->id, $assets[2]->id], TouchingAsset::query()->orderBy('rank_key')->pluck('id')->all());
+        $this->assertSame($before, $stamp());
+        $this->assertSame(0, $saved);
     }
 
     /**

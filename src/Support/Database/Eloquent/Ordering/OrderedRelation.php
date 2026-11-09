@@ -49,6 +49,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
 use Support\Database\Eloquent\Ordering\Exceptions\ParentUnavailability;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
+use Support\Database\Eloquent\Ordering\Exceptions\WriteHalted;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Providers\Provider;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
@@ -313,6 +314,9 @@ final class OrderedRelation
 
         self::lockInOrder($model->parentsToLockFirst());
         $locked[$model] = true;
+        $model->getConnection()->afterRollBack(static function () use ($model): void {
+            self::forgetParentsLockedFirst($model);
+        });
     }
 
     /**
@@ -3124,13 +3128,13 @@ final class OrderedRelation
         try {
             if (! $relation instanceof BelongsToMany) {
                 $model = $this->claimed = $relation->make($record);
-                $model->save();
+                throw_unless($model->save(), WriteHalted::class, $model);
 
                 return $model;
             }
 
             $model = $relation->getRelated()->newInstance(array_merge($relation->getQuery()->pendingAttributes, $record));
-            $model->save(['touch' => false]);
+            throw_unless($model->save(['touch' => false]), WriteHalted::class, $model);
             $related = $model->getAttribute($relation->getRelatedKeyName());
             $this->claimed = is_int($related) || is_string($related) ? $related : throw new LogicException(sprintf('[%s] has no key.', $model::class));
             $relation->attach($model);

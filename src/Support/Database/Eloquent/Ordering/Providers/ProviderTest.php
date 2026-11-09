@@ -22,9 +22,12 @@ use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\OrdersThroughPivots;
 use Support\Database\Eloquent\Ordering\Scopes\SelectsPosition;
+use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
+use Tests\Fixtures\Support\Sections\Section;
+use Tests\Fixtures\Support\Shapes\HasManyShape;
 use Tests\TestCase;
 
 #[CoversClass(Provider::class)]
@@ -188,6 +191,36 @@ class ProviderTest extends TestCase
 
         $this->assertTrue(Event::hasListeners('eloquent.trashed: '.Customer::class));
         $this->assertFalse(Event::hasListeners('eloquent.trashed: '.$viewer::class));
+    }
+
+    #[Test]
+    public function it_refuses_a_change_to_the_order_by_a_wildcard_updating_listener_registered_after_the_provider(): void
+    {
+        $shape = new HasManyShape;
+        $source = Section::create();
+        $destination = Section::create();
+        $moving = $shape->add($source);
+        $shape->add($destination);
+        $digests = [$shape->digest($source), $shape->digest($destination)];
+
+        Event::listen('eloquent.updating: *', function (string $event, array $payload) use ($destination): void {
+            if (($payload[0] ?? null) instanceof Asset) {
+                $payload[0]->section_id = $destination->id;
+            }
+        });
+
+        $item = Asset::query()->findOrFail($moving->getKey());
+        $item->title = 'Renamed';
+
+        try {
+            $item->save();
+            $this->fail('The save wrote a change to the order that a listener made after the order was prepared.');
+        } catch (LogicException $exception) {
+            $this->assertStringContainsString('after its order write was prepared', $exception->getMessage());
+        }
+
+        $this->assertSame(['section_id' => $source->id, 'title' => null], (array) DB::table('assets')->where('id', $moving->getKey())->first(['section_id', 'title']));
+        $this->assertSame($digests, [$shape->digest($source), $shape->digest($destination)]);
     }
 
     private function assertRefused(string $message, Model&OrdersRelations&Revisioned $parent): void
