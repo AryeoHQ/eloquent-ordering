@@ -29,13 +29,17 @@ use Tests\Fixtures\Support\Boards\Board;
 use Tests\Fixtures\Support\Clips\Clip;
 use Tests\Fixtures\Support\Composed\ComposedItem;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Documents\BackslashDocument;
 use Tests\Fixtures\Support\Documents\DatedDocument;
 use Tests\Fixtures\Support\Documents\Document;
 use Tests\Fixtures\Support\Documents\DocumentKind;
+use Tests\Fixtures\Support\Documents\EscapeStringDocument;
 use Tests\Fixtures\Support\Documents\FiledDocument;
 use Tests\Fixtures\Support\Documents\KindedDocument;
 use Tests\Fixtures\Support\Documents\LocalizedDocument;
+use Tests\Fixtures\Support\Folders\BackslashFolder;
 use Tests\Fixtures\Support\Folders\DatedFolder;
+use Tests\Fixtures\Support\Folders\EscapeStringFolder;
 use Tests\Fixtures\Support\Folders\FiledFolder;
 use Tests\Fixtures\Support\Folders\Folder;
 use Tests\Fixtures\Support\Folders\KindedFolder;
@@ -44,6 +48,7 @@ use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Pages\Page;
 use Tests\Fixtures\Support\Photos\Photo;
 use Tests\Fixtures\Support\Playlists\Playlist;
+use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Shelves\Shelf;
 use Tests\Fixtures\Support\Tracks\Track;
@@ -787,6 +792,76 @@ class SelectsPositionTest extends TestCase
         $this->assertSame([1, null, 2], $positions);
     }
 
+    #[Test]
+    public function it_numbers_the_members_that_a_filter_on_a_subquery_with_an_escape_string_keeps(): void
+    {
+        [$archive, $other, $folder] = [
+            EscapeStringFolder::query()->create(['name' => EscapeStringFolder::ARCHIVE, 'kind' => EscapeStringFolder::KIND]),
+            EscapeStringFolder::query()->create(['name' => EscapeStringFolder::ARCHIVE, 'kind' => 'it']),
+            EscapeStringFolder::query()->create(),
+        ];
+
+        foreach ([$archive, $other, $archive] as $home) {
+            EscapeStringDocument::query()->create(['folder_id' => $folder->id, 'home_folder_id' => $home->id]);
+        }
+
+        $read = fn (Builder $query): array => $query->where('folder_id', $folder->id)->orderBy('id')->get()->map(fn (Model $document): mixed => $document->getAttribute(OrderedRelation::POSITION))->all();
+
+        $this->assertSame([1, null, 2], $read(EscapeStringDocument::query()));
+        $this->assertSame([1, null, 2], DB::transaction(fn (): array => $read(EscapeStringDocument::query()->lockForUpdate())));
+    }
+
+    /**
+     * @return iterable<string, array{string, string}>
+     */
+    public static function backslashedFilters(): iterable
+    {
+        foreach (['a backslash before a letter' => 'a\\nb', 'a backslash before a quote' => "a\\'b"] as $name => $value) {
+            foreach (['on', 'off'] as $setting) {
+                yield "{$name} with standard_conforming_strings {$setting}" => [$value, $setting];
+            }
+        }
+    }
+
+    #[DataProvider('backslashedFilters')]
+    #[Test]
+    public function it_numbers_the_members_that_a_filter_value_with_a_backslash_keeps_whatever_the_string_setting(string $value, string $setting): void
+    {
+        $connection = DB::connection();
+        $restored = $connection->scalar('show standard_conforming_strings');
+        BackslashFolder::$locale = $value;
+
+        try {
+            $connection->statement("set standard_conforming_strings = {$setting}");
+            $folder = BackslashFolder::query()->create();
+
+            foreach ([$value, 'other', $value] as $locale) {
+                BackslashDocument::query()->create(['folder_id' => $folder->id, 'locale' => $locale]);
+            }
+
+            $read = fn (Builder $query): array => $query->where('folder_id', $folder->id)->orderBy('id')->get()->map(fn (Model $document): mixed => $document->getAttribute(OrderedRelation::POSITION))->all();
+
+            $this->assertSame([1, null, 2], $read(BackslashDocument::query()));
+            $this->assertSame([1, null, 2], DB::transaction(fn (): array => $read(BackslashDocument::query()->lockForUpdate())));
+        } finally {
+            $connection->statement("set standard_conforming_strings = {$restored}");
+            BackslashFolder::$locale = '';
+        }
+    }
+
+    #[Test]
+    public function it_selects_the_position_of_a_morph_item_without_quoting_its_class_on_the_read_connection(): void
+    {
+        $racer = $this->racer();
+        $racer->setReadPdo(static fn (): never => throw new LogicException('The read connection is unreachable.'));
+
+        try {
+            $this->assertSame([], Scene::on('racer')->useWritePdo()->get()->all());
+        } finally {
+            DB::purge('racer');
+        }
+    }
+
     /**
      * @return iterable<string, array{string, list<mixed>}>
      */
@@ -796,7 +871,7 @@ class SelectsPositionTest extends TestCase
         yield 'an integer against a string column' => ['code', [(string) Playlist::CODE, '2', (string) Playlist::CODE, (string) Playlist::CODE]];
         yield 'a string that holds a quote' => ['mood', [Playlist::MOOD, "o''clock", Playlist::MOOD, Playlist::MOOD]];
         yield 'a boolean' => ['explicit', [false, true, false, false]];
-        yield 'a null in a list' => ['source', [Playlist::SOURCE, '', Playlist::SOURCE, Playlist::SOURCE]];
+        yield 'a null in a list' => ['source', [Playlist::SOURCE, 'null', Playlist::SOURCE, Playlist::SOURCE]];
         yield 'a list' => ['format', [Playlist::FORMATS[0], 'wav', Playlist::FORMATS[1], Playlist::FORMATS[0]]];
         yield 'a timestamp' => ['released_at', ['2025-06-01 00:00:00', '2026-06-01 00:00:00', Playlist::RELEASED_BY, '2025-12-01 00:00:00']];
         yield 'a uuid' => ['label_id', [Playlist::LABEL, '0f1e2d3c-4b5a-4968-8776-655443322111', Playlist::LABEL, Playlist::LABEL]];

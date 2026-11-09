@@ -1001,7 +1001,7 @@ final class OrderedRelation
 
         return $keys->morphType === null
             ? $named
-            : sprintf('%s and %s = %s', $named, $grammar->wrap($qualifier.'.'.$keys->morphType), $grammar->escape($keys->morphClass));
+            : sprintf('%s and %s = %s', $named, $grammar->wrap($qualifier.'.'.$keys->morphType), self::untypedLiteral($keys->morphClass));
     }
 
     /**
@@ -1040,7 +1040,7 @@ final class OrderedRelation
         $literals = array_map(self::untypedLiteral(...), $connection->prepareBindings($members->getBindings()));
 
         return preg_replace_callback(
-            '/\'(?:[^\']|\'\')*\'|"(?:[^"]|"")*"|\?\??/',
+            '/(?<![\w$])[Ee]\'(?:[^\'\\\\]|\\\\.|\'\')*\'|\'(?:[^\']|\'\')*\'|"(?:[^"]|"")*"|\?\??/s',
             static function (array $match) use (&$literals): string {
                 return $match[0] === '?' ? array_shift($literals) ?? throw new LogicException('A position count holds more placeholders than bindings.') : $match[0];
             },
@@ -1050,11 +1050,19 @@ final class OrderedRelation
 
     private static function untypedLiteral(mixed $value): string
     {
-        return match (true) {
-            $value === null => 'null',
-            is_scalar($value) || $value instanceof Stringable => "'".str_replace("'", "''", (string) $value)."'",
-            default => throw new LogicException(sprintf('A position count cannot render a [%s] binding as a literal.', get_debug_type($value))),
-        };
+        if ($value === null) {
+            return 'null';
+        }
+
+        if (! is_scalar($value) && ! $value instanceof Stringable) {
+            throw new LogicException(sprintf('A position count cannot render a [%s] binding as a literal.', get_debug_type($value)));
+        }
+
+        $string = (string) $value;
+
+        return str_contains($string, '\\')
+            ? "E'".str_replace(['\\', "'"], ['\\\\', "''"], $string)."'"
+            : "'".str_replace("'", "''", $string)."'";
     }
 
     /**
@@ -1460,7 +1468,7 @@ final class OrderedRelation
      */
     private static function storedParent(array $membership, array $attributes): null|(Model&OrdersRelations&Revisioned)
     {
-        return self::asParent($membership['parent']->newModelQuery()->where($membership['keys']->ownerKey, $attributes[$membership['keys']->foreignKey])->first());
+        return self::asParent($membership['parent']->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->where($membership['keys']->ownerKey, $attributes[$membership['keys']->foreignKey])->first());
     }
 
     /**

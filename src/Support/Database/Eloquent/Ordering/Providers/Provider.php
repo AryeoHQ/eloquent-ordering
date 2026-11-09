@@ -284,7 +284,7 @@ class Provider extends ServiceProvider
         $reached = [];
         $ownerKey = $relation->getParentKeyName();
 
-        foreach ($template->newModelQuery()->useWritePdo()->whereIn($ownerKey, array_keys($pivots))->orderBy($ownerKey)->get() as $model) {
+        foreach ($template->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->useWritePdo()->whereIn($ownerKey, array_keys($pivots))->orderBy($ownerKey)->get() as $model) {
             if ($model instanceof OrdersRelations && $model instanceof Revisioned) {
                 $reached[] = [new OrderedRelation($model, $declaration->revision), array_values(array_filter($pivots[self::keyOf($model->getAttribute($ownerKey))] ?? []))];
             }

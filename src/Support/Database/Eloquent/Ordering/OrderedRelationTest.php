@@ -57,8 +57,10 @@ use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Composed\ComposedItem;
+use Tests\Fixtures\Support\Customers\CountedCustomer;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Customers\PlainCustomer;
+use Tests\Fixtures\Support\Documents\CountedDocument;
 use Tests\Fixtures\Support\Documents\DatedDocument;
 use Tests\Fixtures\Support\Documents\Document;
 use Tests\Fixtures\Support\Documents\DocumentKind;
@@ -67,12 +69,15 @@ use Tests\Fixtures\Support\Documents\KindedDocument;
 use Tests\Fixtures\Support\Documents\LocalizedDocument;
 use Tests\Fixtures\Support\Drawers\Drawer;
 use Tests\Fixtures\Support\Events\ModelEvents;
+use Tests\Fixtures\Support\Folders\CountedFolder;
 use Tests\Fixtures\Support\Folders\DatedFolder;
 use Tests\Fixtures\Support\Folders\FiledFolder;
 use Tests\Fixtures\Support\Folders\Folder;
 use Tests\Fixtures\Support\Folders\FolderRevision;
 use Tests\Fixtures\Support\Folders\KindedFolder;
 use Tests\Fixtures\Support\Folders\LocalizedFolder;
+use Tests\Fixtures\Support\Listings\CountingListing;
+use Tests\Fixtures\Support\Listings\CountingListingCustomer;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
@@ -1880,6 +1885,56 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([$first->getKey(), $third->getKey(), $second->getKey()], $shape->members($listing));
         $this->assertSame(2, $moved->getAttribute('position'));
         $this->assertSame(['title' => 'unsaved'], $moved->getDirty());
+    }
+
+    #[Test]
+    public function it_moves_and_arranges_an_item_whose_model_counts_a_relation_by_default(): void
+    {
+        $folder = CountedFolder::query()->create();
+        [$first, $second, $third] = array_map(fn (): CountedDocument => CountedDocument::query()->create(['folder_id' => $folder->id]), range(1, 3));
+
+        $moved = $third->move(Placement::after($first->id), expected: null);
+        $arranged = $folder->documents()->arrange([$second->id, $first->id, $third->id], expected: null);
+
+        $this->assertSame([$first->id, $third->id, $second->id], $moved->order);
+        $this->assertSame([$second->id, $first->id, $third->id], $arranged->order);
+        $this->assertSame([$second->id, $first->id, $third->id], $folder->documents()->reorder('rank_key')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_moves_and_arranges_a_pivot_whose_related_model_counts_a_relation_by_default(): void
+    {
+        $listing = CountingListing::query()->create();
+        $listing->customers()->attach(array_map(fn (): int => CountedCustomer::query()->create()->id, range(1, 3)));
+        [$first, $second, $third] = CountingListingCustomer::query()->where('listing_id', $listing->id)->orderBy('rank_key')->get()->all();
+
+        $moved = $listing->customers()->moveIn([$third], expected: null, placement: Placement::after($first->id));
+        $arranged = $listing->customers()->arrange([$second->id, $first->id, $third->id], expected: null);
+
+        $this->assertSame([$first->id, $third->id, $second->id], $moved->order);
+        $this->assertSame([$second->id, $first->id, $third->id], $arranged->order);
+        $this->assertSame([$second->id, $first->id, $third->id], CountingListingCustomer::query()->where('listing_id', $listing->id)->orderBy('rank_key')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_hands_the_observer_of_an_arranged_item_the_counts_its_model_loads_by_default(): void
+    {
+        $folder = CountedFolder::query()->create();
+        [$first, $second, $third] = array_map(fn (): CountedDocument => CountedDocument::query()->create(['folder_id' => $folder->id]), range(1, 3));
+        $counts = [];
+        CountedDocument::updated(function (CountedDocument $document) use (&$counts): void {
+            $counts[$document->id] = $document->folder_count;
+        });
+        Model::shouldBeStrict();
+
+        try {
+            $folder->documents()->arrange([$third->id, $first->id, $second->id], expected: null);
+        } finally {
+            Model::shouldBeStrict(false);
+        }
+
+        $this->assertNotSame([], $counts);
+        $this->assertSame(array_fill_keys(array_keys($counts), 1), $counts);
     }
 
     #[DataProvider('pivots')]
