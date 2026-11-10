@@ -18,6 +18,8 @@ return new class extends Migration
             $table->string('title')->nullable();
             $table->timestamps();
             $table->softDeletes();
+
+            $table->index(['customer_id', 'customerable_type']);
         });
 
         Schema::getConnection()->statement(

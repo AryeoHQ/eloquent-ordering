@@ -27,6 +27,17 @@ if (Schema::hasColumn('sections', 'concurrency_revision')) {
 }
 ```
 
+### Deploy order
+
+A fleet that deploys in stages runs 0.0.1 and 0.1.0 side by side for a while. A 0.0.1 process reads the revision columns, so ship the schema change in two deploys:
+
+1. Deploy 0.1.0 with the eloquent-concurrency migrations, which drop the trigger functions. Keep the revision columns.
+2. Once no 0.0.1 process serves, drop the revision columns in a later deploy.
+
+No 0.1.0 write raises a revision column, so a 0.0.1 process compares against a stale value until it stops. Keep that window short.
+
+`2026_11_02_000001_drop_the_revision_trigger_functions` has an empty `down()`, so a rollback does not restore the trigger functions. A revert to 0.0.1 after that migration runs must reinstall the 0.0.1 trigger migrations. A revert after step 2 must also add the revision columns again.
+
 ### API
 
 | 0.0.1 | Now |

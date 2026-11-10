@@ -28,6 +28,7 @@ use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Boards\Board;
 use Tests\Fixtures\Support\Clips\Clip;
 use Tests\Fixtures\Support\Composed\ComposedItem;
+use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Documents\BackslashDocument;
 use Tests\Fixtures\Support\Documents\DatedDocument;
@@ -46,11 +47,13 @@ use Tests\Fixtures\Support\Folders\KindedFolder;
 use Tests\Fixtures\Support\Folders\LocalizedFolder;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Pages\Page;
+use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Photos\Photo;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Shelves\Shelf;
+use Tests\Fixtures\Support\Speakers\Speaker;
 use Tests\Fixtures\Support\Tracks\Track;
 use Tests\Fixtures\Support\Videos\Video;
 use Tests\TestCase;
@@ -714,6 +717,53 @@ class SelectsPositionTest extends TestCase
             ->get());
 
         $this->assertSame([[$assets[0]->id, 1], [$assets[1]->id, 2]], $read->map(fn (Asset $asset): array => [$asset->id, $asset->position])->all());
+    }
+
+    /**
+     * @return iterable<string, array{int}>
+     */
+    public static function lockedCursorSizes(): iterable
+    {
+        yield 'one row' => [1];
+        yield 'four rows' => [4];
+    }
+
+    #[DataProvider('lockedCursorSizes')]
+    #[Test]
+    public function it_runs_one_position_query_for_each_row_of_a_locking_cursor(int $rows): void
+    {
+        $section = Section::create();
+        array_map(fn (): Asset => $this->asset($section), range(1, $rows));
+
+        $positions = DB::transaction(function () use ($section): array {
+            DB::enableQueryLog();
+
+            return Asset::query()->where('section_id', $section->id)->orderBy('id')->lockForUpdate()->cursor()->map(fn (Asset $asset): null|int => $asset->position)->all();
+        });
+
+        $this->assertSame(range(1, $rows), $positions);
+        $this->assertCount($rows + 1, DB::getQueryLog());
+    }
+
+    #[Test]
+    public function it_selects_no_position_for_a_cursor_page_of_a_belongs_to_many_relation_to_an_ordered_model(): void
+    {
+        $conference = Conference::create();
+        $conference->speakers()->attach(array_map(fn (): int => Speaker::query()->create(['panel_id' => Panel::create()->id])->id, range(1, 3)));
+
+        $page = $conference->speakers()->cursorPaginate(2);
+
+        $this->assertCount(2, $page->items());
+
+        foreach ($page->items() as $speaker) {
+            try {
+                $speaker->getAttribute(OrderedRelation::POSITION);
+                $this->fail('A cursor page of a BelongsToMany relation read a position it never selected.');
+            } catch (UnselectedPosition $exception) {
+                $this->assertSame($speaker, $exception->item);
+                $this->assertStringContainsString('cursorPaginate()', $exception->getMessage());
+            }
+        }
     }
 
     #[Test]
