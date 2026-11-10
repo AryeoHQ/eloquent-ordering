@@ -17,6 +17,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
+use Support\Database\Eloquent\Concurrency\Exceptions\UnselectedConcurrencyRevision;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Events\Reordered;
@@ -41,6 +42,7 @@ use Tests\Fixtures\Support\Customers\Customer;
 use Tests\Fixtures\Support\Drawers\Drawer;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Events\ModelUpdated;
+use Tests\Fixtures\Support\Frames\Frame;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingRevision;
 use Tests\Fixtures\Support\Notes\Note;
@@ -48,6 +50,7 @@ use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Photos\Photo;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Playlists\PlaylistRevision;
+use Tests\Fixtures\Support\Reels\Reel;
 use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
@@ -929,6 +932,44 @@ class IsOrderedTest extends TestCase
         $this->assertNotSame($own, $this->videoRevision($video));
         $this->assertSame($this->videoRevision($video), $video->concurrencyRevision());
         $this->assertSame(['title' => 'Dusk'], $video->getDirty());
+    }
+
+    /**
+     * @return iterable<string, array{bool}>
+     */
+    public static function moveTargets(): iterable
+    {
+        yield 'a move in its parent' => [false];
+        yield 'a move to another parent' => [true];
+    }
+
+    #[DataProvider('moveTargets')]
+    #[Test]
+    public function it_holds_the_stored_own_digest_of_a_revisioned_member_that_a_move_without_timestamps_writes(bool $reparents): void
+    {
+        $reel = Reel::create();
+        $this->addFrame($reel);
+        $frame = $this->addFrame($reel);
+        $placement = $reparents ? Placement::first()->in(Reel::create()) : Placement::first();
+
+        Model::withoutTimestamps(fn (): OrderChange => $frame->move($placement, expected: null));
+
+        $this->assertSame(Frame::query()->findOrFail($frame->id)->concurrencyRevision(), $frame->concurrencyRevision());
+    }
+
+    #[Test]
+    public function it_drops_the_own_digest_of_a_revisioned_member_whose_row_a_move_finds_gone(): void
+    {
+        $section = Section::create();
+        $this->addVideo($section);
+        $video = $this->addVideo($section);
+        Video::updating(static fn (Video $copy): int => DB::table('videos')->where('id', $copy->id)->delete());
+
+        $video->move(Placement::first(), expected: null);
+
+        $this->expectException(UnselectedConcurrencyRevision::class);
+
+        $video->concurrencyRevision();
     }
 
     #[Test]
@@ -2952,6 +2993,15 @@ class IsOrderedTest extends TestCase
         $video->save();
 
         return $video;
+    }
+
+    private function addFrame(Reel $reel): Frame
+    {
+        $frame = new Frame;
+        $frame->reel()->associate($reel);
+        $frame->save();
+
+        return $frame;
     }
 
     private function videoRevision(Video $video): string

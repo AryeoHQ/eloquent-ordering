@@ -36,7 +36,10 @@ A fleet that deploys in stages runs 0.0.1 and 0.1.0 side by side for a while. A 
 
 No 0.1.0 write raises a revision column, so a 0.0.1 process compares against a stale value until it stops. Keep that window short.
 
-`2026_11_02_000001_drop_the_revision_trigger_functions` has an empty `down()`, so a rollback does not restore the trigger functions. A revert to 0.0.1 after that migration runs must reinstall the 0.0.1 trigger migrations. A revert after step 2 must also add the revision columns again.
+A revert to 0.0.1 follows eloquent-concurrency's [downgrading steps](https://github.com/AryeoHQ/eloquent-concurrency#downgrading). They forbid a `migrate:rollback` of the upgrade batch, recreate the 0.0.4 functions, and drop both digest functions last. eloquent-ordering 0.0.1 installs no function of its own, and its triggers call the 0.0.4 functions. Once those functions exist again, add two steps:
+
+1. Add the revision columns again, if the second deploy dropped them.
+2. Recreate the order triggers through the 0.0.1 `OrderedRelations` helpers.
 
 ### API
 

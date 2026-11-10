@@ -2,7 +2,7 @@
 
 Manually ordered Eloquent collections stored as fractional rank keys.
 
-An item holds a `rank_key` string. The items of one parent sort by that string, so a move rewrites one row and never renumbers its siblings. Each order is a **named concurrency revision** of the parent: a digest of the member keys in order, which PostgreSQL computes on demand. A caller reads that revision, and a later move or reorder proves that nobody changed the order in between.
+An item holds a `rank_key` string. The items of one parent sort by that string, so a move rewrites one row and never renumbers its siblings. Each order is a **named concurrency revision** of the parent: a digest of the member keys in order, which PostgreSQL computes on demand. A caller reads that revision. A compare before a later move or reorder proves that the current order equals the order the caller read. An order that changes and changes back passes that compare, as [ABA](https://github.com/AryeoHQ/eloquent-concurrency#limits) describes.
 
 The package writes every order through Eloquent saves with native model events. No trigger and no revision column take part. A write through the query builder or raw SQL still changes the digest, but nothing refuses it.
 
@@ -21,7 +21,7 @@ composer require aryeo/eloquent-ordering
 php artisan migrate
 ```
 
-`aryeo/eloquent-concurrency` installs with it. Run its migrations too, because they install the `concurrency_digest()` function.
+`aryeo/eloquent-concurrency` installs with it. Run its migrations too, because they install the digest functions. Their installation requires [trusted schemas](https://github.com/AryeoHQ/eloquent-concurrency#trusted-schemas).
 
 Laravel discovers `Support\Database\Eloquent\Ordering\Providers\Provider`. The provider registers the `rankKey()` and `rankKeyIndex()` Blueprint macros, the `withoutPositions()` builder macro, and the `arrange()`, `moveIn()`, `createInOrder()`, and `lockedMembers()` relation macros. It also registers the listeners that refuse a late change to an order write. The related model of an ordered pivot registers its own listeners when it boots. The package ships no migration of its own.
 

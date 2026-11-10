@@ -2595,6 +2595,10 @@ final class OrderedRelation
             ...array_intersect_key($copy->getAttributes(), [SelectsConcurrencyRevision::ATTRIBUTE => true]),
         ];
         $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
+
+        if ($item instanceof Revisioned && $copy->wasChanged() && ! array_key_exists(SelectsConcurrencyRevision::ATTRIBUTE, $written)) {
+            $item->forceFill([SelectsConcurrencyRevision::ATTRIBUTE => null])->syncOriginalAttribute(SelectsConcurrencyRevision::ATTRIBUTE)->offsetUnset(SelectsConcurrencyRevision::ATTRIBUTE);
+        }
     }
 
     /**
@@ -3023,7 +3027,7 @@ final class OrderedRelation
             $copy = $copies[$ids[$index]] ?? null;
 
             if ($copy !== null) {
-                $copy->timestamps = self::timestamps($item, $this->keys->item);
+                OrderWrite::timestamps($copy, self::timestamps($item, $this->keys->item));
             }
 
             self::saveCopy($item, $copy, $from[$index] === $this
