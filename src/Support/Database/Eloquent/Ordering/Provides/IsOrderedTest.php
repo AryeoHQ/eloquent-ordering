@@ -1004,6 +1004,76 @@ class IsOrderedTest extends TestCase
     }
 
     #[Test]
+    public function it_reads_the_stored_own_digest_again_for_only_the_member_of_a_move_in_that_stamps_against_the_class_default(): void
+    {
+        [$source, $destination] = [Reel::create(), Reel::create()];
+        $stills = [Still::query()->findOrFail($this->addStill($source)->id), Still::query()->findOrFail($this->addStill($source)->id)];
+        $stills[1]->timestamps = true;
+        DB::enableQueryLog();
+
+        $destination->stills()->moveIn($stills, expected: null);
+
+        $this->assertSame([[$stills[1]->id]], $this->ownDigestReads(DB::getQueryLog(), 'stills'));
+        $this->assertSame(
+            array_map(fn (Still $still): string => Still::query()->findOrFail($still->id)->concurrencyRevision(), $stills),
+            array_map(fn (Still $still): string => $still->concurrencyRevision(), $stills),
+        );
+    }
+
+    #[Test]
+    public function it_drops_the_own_digest_of_a_move_in_member_whose_row_a_later_member_listener_writes_against_the_class_default(): void
+    {
+        [$source, $destination] = [Reel::create(), Reel::create()];
+        [$first, $second] = [Still::query()->findOrFail($this->addStill($source)->id), Still::query()->findOrFail($this->addStill($source)->id)];
+        $first->timestamps = true;
+        $second->timestamps = true;
+        Still::updated(static function (Still $copy) use ($first, $second): void {
+            if ($copy->id === $second->id) {
+                DB::table('stills')->where('id', $first->id)->update(['caption' => 'written']);
+            }
+        });
+
+        $destination->stills()->moveIn([$first, $second], expected: null);
+
+        $this->assertNull($first->caption);
+        $this->assertThrows(fn (): string => $first->concurrencyRevision(), UnselectedConcurrencyRevision::class);
+        $this->assertSame(Still::query()->findOrFail($second->id)->concurrencyRevision(), $second->concurrencyRevision());
+    }
+
+    #[Test]
+    public function it_drops_the_own_digest_of_a_moved_member_whose_row_a_saved_listener_writes_against_the_class_default(): void
+    {
+        $reel = Reel::create();
+        $this->addStill($reel);
+        $still = Still::query()->findOrFail($this->addStill($reel)->id);
+        $still->timestamps = true;
+        Still::saved(static fn (Still $copy): int => DB::table('stills')->where('id', $copy->id)->update(['caption' => 'written']));
+
+        $still->move(Placement::first(), expected: null);
+
+        $this->assertNull($still->caption);
+        $this->expectException(UnselectedConcurrencyRevision::class);
+
+        $still->concurrencyRevision();
+    }
+
+    #[Test]
+    public function it_drops_the_own_digest_of_a_moved_member_whose_row_a_saved_listener_deletes_against_the_class_default(): void
+    {
+        $reel = Reel::create();
+        $this->addStill($reel);
+        $still = Still::query()->findOrFail($this->addStill($reel)->id);
+        $still->timestamps = true;
+        Still::saved(static fn (Still $copy): int => DB::table('stills')->where('id', $copy->id)->delete());
+
+        $still->move(Placement::first(), expected: null);
+
+        $this->expectException(UnselectedConcurrencyRevision::class);
+
+        $still->concurrencyRevision();
+    }
+
+    #[Test]
     public function it_drops_the_own_digest_of_a_revisioned_member_whose_row_a_move_finds_gone(): void
     {
         $section = Section::create();
@@ -3060,15 +3130,15 @@ class IsOrderedTest extends TestCase
     }
 
     /**
-     * @param  array<int, array{query: string}>  $statements
-     * @return list<string>
+     * @param  array<int, array{query: string, bindings: array<int, mixed>}>  $statements
+     * @return list<array<int, mixed>>
      */
     private function ownDigestReads(array $statements, string $table): array
     {
-        return array_values(array_filter(
-            array_column($statements, 'query'),
-            fn (string $query): bool => str_contains($query, 'concurrency_digest(') && str_contains($query, sprintf('"%s"."id" in (', $table)),
-        ));
+        return array_column(array_values(array_filter(
+            $statements,
+            fn (array $statement): bool => str_contains($statement['query'], 'concurrency_digest(') && str_contains($statement['query'], sprintf('"%s"."id" in (', $table)),
+        )), 'bindings');
     }
 
     private function videoRevision(Video $video): string

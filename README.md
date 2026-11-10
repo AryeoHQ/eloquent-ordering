@@ -367,7 +367,7 @@ class Video extends Model implements Ordered, OrdersRelations, Revisioned
 }
 ```
 
-**A `Revisioned` item leaves `rank_key` out of its own revision.** `IsOrdered` merges `rank_key` into the model's unobserved columns, so a move within a parent, a reorder, and a rebalance keep the item's own digest. A move between parents changes it, because it changes the foreign key. After `move()`, the item holds the own digest of the row that the move saved.
+**A `Revisioned` item leaves `rank_key` out of its own revision.** `IsOrdered` merges `rank_key` into the model's unobserved columns, so a move within a parent, a reorder, and a rebalance keep the item's own digest, except that a move stamps the updated-at column of an instance that turns timestamps on against its class default, and the own digest then changes unless that column is named `updated_at`. A move between parents changes it, because it changes the foreign key. After `move()`, the item holds the own digest of the row that the move saved. An instance whose timestamps setting differs from its class default holds no digest instead, when another write changed its row before the move returned.
 
 **An item's own digest does not cover its position.** A move within the parent, an `arrange()`, and a write to another member can each change the position and keep the digest. An API that tags an item with its own digest adds the position to that ETag (ORD-39).
 

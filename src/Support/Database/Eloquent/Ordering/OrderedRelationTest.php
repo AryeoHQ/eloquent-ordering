@@ -2025,6 +2025,26 @@ class OrderedRelationTest extends TestCase
     }
 
     #[Test]
+    public function it_holds_the_stored_own_digest_of_a_revisioned_pivot_whose_relation_omits_its_observed_timestamp(): void
+    {
+        $shape = new BelongsToManyShape;
+        [$listing, [$first, $second, $third]] = $shape->with(3);
+        $pivot = $this->revisionedPivot();
+        $parent = $this->parentOfPivot($listing, $pivot);
+        $moved = $pivot::query()->findOrFail($third->getKey());
+        assert($moved instanceof Revisioned);
+        DB::enableQueryLog();
+
+        Shape::relationOf($parent, ListingRevision::CustomersOrder)->moveIn([$moved], expected: null, placement: Placement::after($this->key($first)));
+
+        $this->assertSame([$first->getKey(), $third->getKey(), $second->getKey()], $shape->members($listing));
+        $this->assertNotNull(array_find(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => str_contains($query, 'concurrency_digest(') && str_contains($query, '"listing_customer"."id" in (')));
+        $fresh = $pivot::query()->findOrFail($moved->getKey());
+        assert($fresh instanceof Revisioned);
+        $this->assertSame($fresh->concurrencyRevision(), $moved->concurrencyRevision());
+    }
+
+    #[Test]
     public function it_moves_and_arranges_an_item_whose_model_counts_a_relation_by_default(): void
     {
         $folder = CountedFolder::query()->create();
@@ -3313,6 +3333,24 @@ class OrderedRelationTest extends TestCase
             {
                 return $this->belongsTo(PlainCustomer::class);
             }
+        })::class;
+    }
+
+    /**
+     * @return class-string<Pivot&Ordered>
+     */
+    private function revisionedPivot(): string
+    {
+        return (new #[OrderedIn(PivotedListing::class)] class extends Pivot implements Ordered, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasUuids;
+            use IsOrdered;
+            use SoftDeletes;
+
+            public const UPDATED_AT = 'created_at';
+
+            protected $table = 'listing_customer';
         })::class;
     }
 

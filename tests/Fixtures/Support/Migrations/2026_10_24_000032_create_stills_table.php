@@ -14,6 +14,7 @@ return new class extends Migration
             $table->id();
             $table->foreignId('reel_id')->constrained();
             $table->rankKey();
+            $table->string('caption')->nullable();
             $table->timestamp('created_at')->nullable();
             $table->timestamp('modified_at')->nullable();
             $table->rankKeyIndex('reel_id');

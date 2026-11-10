@@ -2581,13 +2581,17 @@ final class OrderedRelation
      */
     private function write(Model $item, array $attributes): void
     {
-        if (self::saveCopy($item, OrderWrite::copy($item, self::timestamps($item, $this->keys->item)), $attributes)) {
-            $this->holdStoredDigests([self::keyOf($item) => $item]);
+        $copy = OrderWrite::copy($item, self::timestamps($item, $this->keys->item));
+
+        if (self::saveCopy($item, $copy, $attributes)) {
+            $this->holdStoredDigests([self::keyOf($item) => [$item, $copy]]);
         }
     }
 
     /**
      * @param  array<string, mixed>  $attributes
+     *
+     * @phpstan-assert-if-true Model $copy
      */
     private static function saveCopy(Model $item, null|Model $copy, array $attributes): bool
     {
@@ -2612,12 +2616,12 @@ final class OrderedRelation
     }
 
     /**
-     * @param  array<int|string, Model>  $items
+     * @param  array<int|string, array{Model, Model}>  $items
      */
     private function holdStoredDigests(array $items): void
     {
         $fresh = $this->keys->item->newInstance();
-        $digests = [];
+        $rows = [];
 
         foreach (array_chunk(array_keys($items), self::$idsPerStatement) as $chunk) {
             foreach ($fresh->newModelQuery()->withGlobalScope(SelectsConcurrencyRevision::class, new SelectsConcurrencyRevision)->toBase()->useWritePdo()->whereIn($fresh->getQualifiedKeyName(), $chunk)->get() as $row) {
@@ -2625,20 +2629,34 @@ final class OrderedRelation
                 $key = $row[$fresh->getKeyName()] ?? null;
 
                 if (is_int($key) || is_string($key)) {
-                    $digests[$key] = $row[SelectsConcurrencyRevision::ATTRIBUTE] ?? null;
+                    $rows[$key] = $row;
                 }
             }
         }
 
-        foreach ($items as $id => $item) {
-            $digest = $digests[$id] ?? null;
+        foreach ($items as $id => [$item, $copy]) {
+            $row = $rows[$id] ?? [];
+            $digest = $row[SelectsConcurrencyRevision::ATTRIBUTE] ?? null;
 
-            if (is_string($digest)) {
+            if (is_string($digest) && self::holdsRow($copy, $row)) {
                 $item->forceFill([SelectsConcurrencyRevision::ATTRIBUTE => $digest])->syncOriginalAttribute(SelectsConcurrencyRevision::ATTRIBUTE);
             } else {
                 self::forgetDigest($item);
             }
         }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $row
+     */
+    private static function holdsRow(Model $copy, array $row): bool
+    {
+        $attributes = $copy->getAttributes();
+
+        return ! array_any(
+            array_diff_key(array_intersect_key($row, $attributes), [SelectsConcurrencyRevision::ATTRIBUTE => true]),
+            static fn (mixed $value, int|string $column): bool => $attributes[$column] !== $value,
+        );
     }
 
     private static function forgetDigest(Model $item): void
@@ -3079,7 +3097,7 @@ final class OrderedRelation
             if (self::saveCopy($item, $copy, $from[$index] === $this
                 ? [self::RANK_KEY => $keys[$index]]
                 : [...$from[$index]->keys->detached(), ...$this->keys->pointingAt($this->parent), self::RANK_KEY => $keys[$index]])) {
-                $stale[$ids[$index]] = $item;
+                $stale[$ids[$index]] = [$item, $copy];
             }
         }
 

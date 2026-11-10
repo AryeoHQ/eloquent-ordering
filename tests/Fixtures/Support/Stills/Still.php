@@ -17,6 +17,7 @@ use Tests\Fixtures\Support\Reels\Reel;
  * @property int $id
  * @property int $reel_id
  * @property string|null $rank_key
+ * @property string|null $caption
  * @property string $concurrency_revision
  * @property-read int|null $position
  */
