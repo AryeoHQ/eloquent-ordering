@@ -1660,6 +1660,40 @@ class OrderedRelationTest extends TestCase
         $this->assertSame(0, $rebalances);
     }
 
+    #[DataProvider('haltingRecordListeners')]
+    #[Test]
+    public function it_refuses_a_create_in_order_whose_listener_halts_the_pivot_of_the_second_record(string $event): void
+    {
+        $listing = Listing::create();
+        $listing->customers()->attach(Customer::create());
+        $customers = DB::table('customers')->orderBy('id')->pluck('id')->all();
+        $pivots = DB::table('listing_customer')->orderBy('id')->pluck('id')->all();
+        $digest = Listing::query()->findOrFail($listing->id)->concurrencyRevision(ListingRevision::CustomersOrder);
+        $records = 0;
+        Event::listen(sprintf('eloquent.%s: %s', $event, ListingCustomer::class), function () use (&$records): null|bool {
+            return ++$records === 2 ? false : null;
+        });
+        $rebalances = 0;
+        Event::listen(Rebalanced::class, function () use (&$rebalances): void {
+            $rebalances++;
+        });
+        $this->recordReorders();
+        $thrown = null;
+
+        try {
+            $listing->customers()->createInOrder([[], [], []]);
+        } catch (Throwable $thrown) {
+        }
+
+        $this->assertInstanceOf(WriteHalted::class, $thrown);
+        $this->assertSame(2, $records);
+        $this->assertSame($customers, DB::table('customers')->orderBy('id')->pluck('id')->all());
+        $this->assertSame($pivots, DB::table('listing_customer')->orderBy('id')->pluck('id')->all());
+        $this->assertSame($digest, Listing::query()->findOrFail($listing->id)->concurrencyRevision(ListingRevision::CustomersOrder));
+        $this->assertSame([], $this->reorders);
+        $this->assertSame(0, $rebalances);
+    }
+
     #[Test]
     public function it_locks_the_parents_first_again_when_it_retries_a_save_that_a_listener_halted(): void
     {

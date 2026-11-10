@@ -133,6 +133,17 @@ class IsOrderedTest extends TestCase
     /**
      * @return iterable<string, list<mixed>>
      */
+    public static function haltedSaves(): iterable
+    {
+        return Shape::crossed([
+            'a saving listener' => ['saving'],
+            'an updating listener' => ['updating'],
+        ]);
+    }
+
+    /**
+     * @return iterable<string, list<mixed>>
+     */
     public static function listenerWrites(): iterable
     {
         return Shape::crossed([
@@ -646,6 +657,29 @@ class IsOrderedTest extends TestCase
         $this->assertNull($second->getAttribute('position'));
         $this->assertNull(DB::table($shape->memberTable())->where('id', $second->getKey())->value('rank_key'));
         $this->assertOrder($shape, [$first->getKey(), $third->getKey()], $parent);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_keeps_the_rank_key_of_a_member_that_a_stale_trashed_copy_reparents_after_another_query_restored_it(Shape $shape): void
+    {
+        [$parent, [$first, $member]] = $shape->with(2);
+        [$other] = $shape->with(0);
+        $member->delete();
+        $stale = $shape->find($this->key($member));
+        $restored = $shape->find($this->key($member));
+        assert(method_exists($restored, 'restore'));
+        $this->assertTrue($restored->restore());
+        $this->recordReorders();
+
+        $shape->associate($stale, $other);
+
+        $this->assertTrue($stale->save());
+        $this->assertNull(DB::table($shape->memberTable())->where('id', $member->getKey())->value('deleted_at'));
+        $this->storedRankKey($shape, $member);
+        $this->assertOrder($shape, [$member->getKey()], $other);
+        $this->assertOrder($shape, [$first->getKey()], $parent);
+        $this->assertSame([], array_values(array_filter($this->reorders, fn (array $reorder): bool => $reorder[0] === $parent->getKey())));
     }
 
     #[DataProvider('shapes')]
@@ -1549,6 +1583,68 @@ class IsOrderedTest extends TestCase
         $this->assertRejected($shape, LogicException::class, fn (): bool => $item->save(), $source, $destination);
         $this->assertSame(['section_id' => $source->id, 'title' => null], (array) DB::table('assets')->where('id', $moving->getKey())->first(['section_id', 'title']));
         $this->assertSame(2, DB::table('assets')->count());
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_soft_deletes_a_member_that_moved_after_a_save_without_changes(Shape $shape): void
+    {
+        [$parent, [$first, $second]] = $shape->with(2);
+        $this->assertTrue($second->save());
+        $second->move(Placement::first(), expected: null);
+        $this->recordReorders();
+
+        $second->delete();
+
+        $this->assertNotNull(DB::table($shape->memberTable())->where('id', $second->getKey())->value('deleted_at'));
+        $this->assertOrder($shape, [$first->getKey()], $parent);
+        $this->assertSame([[$parent->getKey(), [$first->getKey()], [[$this->key($second), null, 1]], $shape->digest($parent)]], $this->reorders);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
+    public function it_soft_deletes_a_member_whose_parent_changed_after_a_save_without_changes(Shape $shape): void
+    {
+        [$parent, [$first, $second]] = $shape->with(2);
+        [$other, [$held]] = $shape->with(1);
+        $this->assertTrue($second->save());
+        $shape->associate($second, $other);
+        $this->recordReorders();
+
+        $second->delete();
+
+        $this->assertNotNull(DB::table($shape->memberTable())->where('id', $second->getKey())->value('deleted_at'));
+        $this->assertOrder($shape, [$first->getKey()], $parent);
+        $this->assertOrder($shape, [$held->getKey()], $other);
+        $this->assertSame([[$parent->getKey(), [$first->getKey()], [[$this->key($second), null, 2]], $shape->digest($parent)]], $this->reorders);
+    }
+
+    #[DataProvider('haltedSaves')]
+    #[Test]
+    public function it_soft_deletes_a_member_whose_parent_changed_after_a_listener_halted_its_save(Shape $shape, string $event): void
+    {
+        [$parent, [$first, $second]] = $shape->with(2);
+        [$other] = $shape->with(0);
+        $halt = true;
+        Event::listen(sprintf('eloquent.%s: %s', $event, $shape->memberClass()), function () use (&$halt): null|bool {
+            if (! $halt) {
+                return null;
+            }
+
+            $halt = false;
+
+            return false;
+        });
+        $shape->associate($second, $other);
+        $this->assertFalse($second->save());
+        $shape->associate($second, $parent);
+        $this->recordReorders();
+
+        $second->delete();
+
+        $this->assertNotNull(DB::table($shape->memberTable())->where('id', $second->getKey())->value('deleted_at'));
+        $this->assertOrder($shape, [$first->getKey()], $parent);
+        $this->assertSame([[$parent->getKey(), [$first->getKey()], [[$this->key($second), null, 2]], $shape->digest($parent)]], $this->reorders);
     }
 
     #[Test]

@@ -103,6 +103,8 @@ trait IsOrdered
         });
 
         static::deleting(static function (self $item): void {
+            OrderedRelation::forgetPrepared($item);
+
             if (Provider::locksPivotParentsOf($item, deleting: true)) {
                 OrderedRelation::lockParentsFirst($item);
             }
@@ -123,6 +125,7 @@ trait IsOrdered
 
         static::saved(static function (self $item): void {
             OrderedRelation::forgetParentsLockedFirst($item);
+            OrderedRelation::forgetPrepared($item);
 
             if (OrderWrite::saves($item)) {
                 return;
@@ -258,9 +261,37 @@ trait IsOrdered
             $this->awaitsRankKey = false;
 
             throw_if($awaited, WriteHalted::class, $this);
+        } elseif ($result === false && in_array($event, ['saving', 'creating', 'updating'], true)) {
+            OrderedRelation::forgetPrepared($this);
         }
 
         return $result;
+    }
+
+    /**
+     * @param  string  $column
+     * @param  float|int  $amount
+     * @param  array<array-key, mixed>  $extra
+     * @param  string  $method
+     * @return int|false
+     */
+    protected function incrementOrDecrement($column, $amount, $extra, $method)
+    {
+        OrderedRelation::forgetPrepared($this);
+
+        return parent::incrementOrDecrement($column, $amount, $extra, $method);
+    }
+
+    /**
+     * @param  array<string, float|int>  $columns
+     * @param  array<string, mixed>  $extra
+     * @return int|false
+     */
+    protected function incrementOrDecrementEach(array $columns, array $extra, string $method)
+    {
+        OrderedRelation::forgetPrepared($this);
+
+        return parent::incrementOrDecrementEach($columns, $extra, $method);
     }
 
     /**
@@ -382,7 +413,7 @@ trait IsOrdered
                 $kept = $stored[OrderedRelation::RANK_KEY];
             }
 
-            if ($softDeletes && $stored !== null && $stored[OrderedRelations::DELETED_AT] === null && $item->getAttribute(OrderedRelations::DELETED_AT) !== null) {
+            if ($softDeletes && $stored !== null && $stored[OrderedRelations::DELETED_AT] === null && $item->isDirty(OrderedRelations::DELETED_AT) && $item->getAttribute(OrderedRelations::DELETED_AT) !== null) {
                 $item->trashedPosition = $current === null ? null : [$current, $current->memberPosition($item)];
                 $item->assignRankKey(null);
 

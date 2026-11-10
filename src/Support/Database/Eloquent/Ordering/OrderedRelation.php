@@ -489,6 +489,15 @@ final class OrderedRelation
     /**
      * @internal
      */
+    public static function forgetPrepared(Model $model): void
+    {
+        self::$prepared?->offsetUnset($model);
+        self::$preparedRelated?->offsetUnset($model);
+    }
+
+    /**
+     * @internal
+     */
     public static function requirePrepared(Model $model): void
     {
         self::requireUnchanged(self::$prepared, $model);
@@ -3201,7 +3210,11 @@ final class OrderedRelation
             throw_unless($model->save(['touch' => false]), WriteHalted::class, $model);
             $related = $model->getAttribute($relation->getRelatedKeyName());
             $this->claimed = is_int($related) || is_string($related) ? $related : throw new LogicException(sprintf('[%s] has no key.', $model::class));
-            $relation->attach($model);
+            /** @var list<array<string, mixed>> $records */
+            $records = (new ReflectionMethod($relation, 'formatAttachRecords'))->invoke($relation, [$related], []);
+            $pivot = $relation->newPivot($records[0], false);
+            throw_unless($pivot->save(), WriteHalted::class, $pivot);
+            $relation->touchIfTouching();
 
             return $model;
         } finally {
