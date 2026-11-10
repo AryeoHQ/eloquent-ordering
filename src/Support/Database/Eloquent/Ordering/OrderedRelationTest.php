@@ -1497,6 +1497,26 @@ class OrderedRelationTest extends TestCase
     }
 
     #[Test]
+    public function it_stamps_a_member_that_a_listener_appends_while_a_member_without_timestamps_saves(): void
+    {
+        [$source, $destination] = [Drawer::create(), Drawer::create()];
+        [$one, $two] = [$this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql')];
+        $one->timestamps = false;
+        $appended = null;
+        Note::updated(function (Note $note) use ($destination, $one, &$appended): void {
+            if ($appended === null && $note->id === $one->id) {
+                $appended = $this->addNote($destination, 'pgsql');
+            }
+        });
+
+        $destination->notes()->moveIn([$one, $two], expected: null);
+
+        $this->assertInstanceOf(Note::class, $appended);
+        $this->assertNotNull($appended->getAttribute('created_at'));
+        $this->assertNotNull($appended->getAttribute('updated_at'));
+    }
+
+    #[Test]
     public function it_rearranges_members_after_a_listener_appends_a_member_while_the_first_member_saves(): void
     {
         $drawer = Drawer::create();

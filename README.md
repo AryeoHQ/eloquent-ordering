@@ -21,7 +21,7 @@ composer require aryeo/eloquent-ordering
 php artisan migrate
 ```
 
-`aryeo/eloquent-concurrency` installs with it. Run its migrations too, because they install the digest functions. Their installation requires [trusted schemas](https://github.com/AryeoHQ/eloquent-concurrency#trusted-schemas).
+`aryeo/eloquent-concurrency` installs with it. Run its migrations too, because they install the digest functions. The functions require [trusted schemas](https://github.com/AryeoHQ/eloquent-concurrency#trusted-schemas).
 
 Laravel discovers `Support\Database\Eloquent\Ordering\Providers\Provider`. The provider registers the `rankKey()` and `rankKeyIndex()` Blueprint macros, the `withoutPositions()` builder macro, and the `arrange()`, `moveIn()`, `createInOrder()`, and `lockedMembers()` relation macros. It also registers the listeners that refuse a late change to an order write. The related model of an ordered pivot registers its own listeners when it boots. The package ships no migration of its own.
 

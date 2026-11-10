@@ -9,4 +9,5 @@ use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 enum ReelRevision: string implements NamesConcurrencyRevision
 {
     case FramesOrder = 'frames_order';
+    case StillsOrder = 'stills_order';
 }

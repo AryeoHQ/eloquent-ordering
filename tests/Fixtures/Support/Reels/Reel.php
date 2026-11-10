@@ -12,6 +12,7 @@ use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Tests\Fixtures\Support\Frames\Frame;
+use Tests\Fixtures\Support\Stills\Still;
 
 /**
  * @property int $id
@@ -31,5 +32,14 @@ class Reel extends Model implements OrdersRelations, Revisioned
     public function frames(): HasMany
     {
         return $this->hasMany(Frame::class);
+    }
+
+    /**
+     * @return HasMany<Still, $this>
+     */
+    #[OrdersRelation(ReelRevision::StillsOrder)]
+    public function stills(): HasMany
+    {
+        return $this->hasMany(Still::class);
     }
 }

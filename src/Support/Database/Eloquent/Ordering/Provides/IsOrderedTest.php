@@ -62,6 +62,7 @@ use Tests\Fixtures\Support\Shapes\Reparenting;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Shelves\Shelf;
 use Tests\Fixtures\Support\Speakers\ReversedSpeaker;
+use Tests\Fixtures\Support\Stills\Still;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tours\TourRevision;
 use Tests\Fixtures\Support\Tracks\Track;
@@ -955,6 +956,51 @@ class IsOrderedTest extends TestCase
         Model::withoutTimestamps(fn (): OrderChange => $frame->move($placement, expected: null));
 
         $this->assertSame(Frame::query()->findOrFail($frame->id)->concurrencyRevision(), $frame->concurrencyRevision());
+    }
+
+    #[DataProvider('moveTargets')]
+    #[Test]
+    public function it_holds_the_stored_own_digest_of_a_revisioned_member_that_a_move_stamps_against_its_class_default(bool $reparents): void
+    {
+        $reel = Reel::create();
+        $this->addStill($reel);
+        $still = Still::query()->findOrFail($this->addStill($reel)->id);
+        $still->timestamps = true;
+        $placement = $reparents ? Placement::first()->in(Reel::create()) : Placement::first();
+
+        $still->move($placement, expected: null);
+
+        $this->assertSame(Still::query()->findOrFail($still->id)->concurrencyRevision(), $still->concurrencyRevision());
+    }
+
+    #[Test]
+    public function it_reads_the_stored_own_digests_of_a_move_in_that_stamps_against_the_class_default_in_one_statement(): void
+    {
+        [$source, $destination] = [Reel::create(), Reel::create()];
+        $stills = [Still::query()->findOrFail($this->addStill($source)->id), Still::query()->findOrFail($this->addStill($source)->id)];
+        $stills[0]->timestamps = true;
+        $stills[1]->timestamps = true;
+        DB::enableQueryLog();
+
+        $destination->stills()->moveIn($stills, expected: null);
+
+        $this->assertCount(1, $this->ownDigestReads(DB::getQueryLog(), 'stills'));
+        $this->assertSame(
+            array_map(fn (Still $still): string => Still::query()->findOrFail($still->id)->concurrencyRevision(), $stills),
+            array_map(fn (Still $still): string => $still->concurrencyRevision(), $stills),
+        );
+    }
+
+    #[Test]
+    public function it_reads_no_stored_own_digest_again_for_a_move_in_by_the_class_default_timestamps(): void
+    {
+        [$source, $destination] = [Reel::create(), Reel::create()];
+        $frames = [$this->addFrame($source), $this->addFrame($source)];
+        DB::enableQueryLog();
+
+        $destination->frames()->moveIn($frames, expected: null);
+
+        $this->assertSame([], $this->ownDigestReads(DB::getQueryLog(), 'frames'));
     }
 
     #[Test]
@@ -3002,6 +3048,27 @@ class IsOrderedTest extends TestCase
         $frame->save();
 
         return $frame;
+    }
+
+    private function addStill(Reel $reel): Still
+    {
+        $still = new Still;
+        $still->reel()->associate($reel);
+        $still->save();
+
+        return $still;
+    }
+
+    /**
+     * @param  array<int, array{query: string}>  $statements
+     * @return list<string>
+     */
+    private function ownDigestReads(array $statements, string $table): array
+    {
+        return array_values(array_filter(
+            array_column($statements, 'query'),
+            fn (string $query): bool => str_contains($query, 'concurrency_digest(') && str_contains($query, sprintf('"%s"."id" in (', $table)),
+        ));
     }
 
     private function videoRevision(Video $video): string

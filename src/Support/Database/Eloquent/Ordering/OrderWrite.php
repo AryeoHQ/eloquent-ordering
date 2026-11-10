@@ -19,9 +19,6 @@ final class OrderWrite
     /** @var null|WeakMap<Model, true> */
     private static null|WeakMap $saving = null;
 
-    /** @var null|WeakMap<Model, true> */
-    private static null|WeakMap $untimed = null;
-
     public static function saves(Model $model): bool
     {
         return self::saving()->offsetExists($model);
@@ -31,7 +28,11 @@ final class OrderWrite
     {
         $copy = $model->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->useWritePdo()->whereKey($model->getKey())->first();
 
-        return $copy === null ? null : self::timestamps($copy, $timestamps);
+        if ($copy !== null) {
+            $copy->timestamps = $timestamps;
+        }
+
+        return $copy;
     }
 
     /**
@@ -46,23 +47,12 @@ final class OrderWrite
             $key = $copy->getKey();
 
             if (is_int($key) || is_string($key)) {
-                $copies[$key] = self::timestamps($copy, $timestamps);
+                $copy->timestamps = $timestamps;
+                $copies[$key] = $copy;
             }
         }
 
         return $copies;
-    }
-
-    public static function timestamps(Model $copy, bool $timestamps): Model
-    {
-        if ($timestamps) {
-            $copy->timestamps = true;
-            unset(self::untimed()[$copy]);
-        } else {
-            self::untimed()[$copy] = true;
-        }
-
-        return $copy;
     }
 
     /**
@@ -81,16 +71,13 @@ final class OrderWrite
                 OrderedRelation::prepared($copy);
             }
 
-            $timed = ! self::untimed()->offsetExists($copy);
-            $save = static fn (): mixed => (new ReflectionMethod(Model::class, 'save'))->invoke($copy, ['touch' => false]);
-
             try {
-                throw_unless(($timed ? $save() : Model::withoutTimestampsOn([$copy::class], $save)) === true, WriteHalted::class, $copy);
+                throw_unless((new ReflectionMethod(Model::class, 'save'))->invoke($copy, ['touch' => false]) === true, WriteHalted::class, $copy);
             } finally {
                 unset($saving[$copy]);
             }
 
-            $updatedAt = $timed && $copy->usesTimestamps() ? $copy->getUpdatedAtColumn() : null;
+            $updatedAt = $copy->usesTimestamps() ? $copy->getUpdatedAtColumn() : null;
             $columns = $updatedAt === null ? $columns : [...$columns, $updatedAt];
         }
 
@@ -103,13 +90,5 @@ final class OrderWrite
     private static function saving(): WeakMap
     {
         return self::$saving ??= new WeakMap;
-    }
-
-    /**
-     * @return WeakMap<Model, true>
-     */
-    private static function untimed(): WeakMap
-    {
-        return self::$untimed ??= new WeakMap;
     }
 }
