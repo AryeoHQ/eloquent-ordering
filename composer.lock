@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "73052170f2ff1d96d72e3fad8e6f4ecc",
+    "content-hash": "dbb6371629c0c38ef1955d44c333cf44",
     "packages": [
         {
             "name": "aryeo/eloquent-concurrency",
@@ -12,12 +12,12 @@
             "source": {
                 "type": "git",
                 "url": "git@github.com:AryeoHQ/eloquent-concurrency.git",
-                "reference": "4ec656b7b31c977960153a79844a078e7b34cafa"
+                "reference": "8e3e9a39c1a9f8c1815b6820a481f46d6cc5f04e"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/AryeoHQ/eloquent-concurrency/zipball/4ec656b7b31c977960153a79844a078e7b34cafa",
-                "reference": "4ec656b7b31c977960153a79844a078e7b34cafa",
+                "url": "https://api.github.com/repos/AryeoHQ/eloquent-concurrency/zipball/8e3e9a39c1a9f8c1815b6820a481f46d6cc5f04e",
+                "reference": "8e3e9a39c1a9f8c1815b6820a481f46d6cc5f04e",
                 "shasum": ""
             },
             "require": {
@@ -98,7 +98,7 @@
                 "source": "https://github.com/AryeoHQ/eloquent-concurrency/tree/fix/2026-11-09t1451-critique-remedies-m1",
                 "issues": "https://github.com/AryeoHQ/eloquent-concurrency/issues"
             },
-            "time": "2026-11-09T21:19:35+00:00"
+            "time": "2026-11-10T17:21:51+00:00"
         },
         {
             "name": "aryeo/tooling-laravel",
