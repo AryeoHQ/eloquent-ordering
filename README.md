@@ -119,13 +119,13 @@ $assets->first()->position;                                                 // n
 
 The scope covers `get()`, `find()`, the paginators, `chunk()`, route binding, eager and lazy loads, `refresh()`, `fresh()`, `refreshForUpdate()`, `Collection::fresh()`, and a queued job's restored model. A query that joins an ordered pivot table, such as `$listing->customers` or `$customer->listings`, also selects `pivot_position`, so each pivot carries `position`. The scope runs on PostgreSQL only.
 
-Each Eloquent read, `chunk()` included, selects the position in every statement that it runs. A base builder from `toBase()` selects it in its first statement only, because Laravel runs a `beforeQuery` callback once. Call `toBase()` again for each read that needs positions.
+Each Eloquent read, `chunk()` included, selects the position in every statement that it runs. An unlocked base builder from `toBase()` selects it in its first `get()` only, because Laravel runs a `beforeQuery` callback once and `get()` puts the original columns back. Call `toBase()` again for each read that needs positions.
 
 **A locking read selects the position in a second query.** A row that `lockForUpdate()`, `sharedLock()`, or `refreshForUpdate()` waited on can carry a count from before the wait. So the locking statement selects no `position`. After it returns, one unlocked select by key reads the position of every row it locked. Outside a transaction, the row locks end with the locking statement, and another write can commit before the second select. Such a read therefore selects no position, and reading `position` throws `UnselectedPosition`. The second select also needs a lock that blocks every update of the row: `lockForUpdate()`, `sharedLock()`, or a `lock()` clause of `for update`, `for no key update`, or `for share`, each with at most `nowait` or `skip locked`. A `for key share` lock blocks only a delete and an update of a column in a unique index without a `where` clause. A soft delete, or a move of an item whose rank-key index is partial, can therefore commit before the second select. That read, and a read under any other lock clause, selects no position either.
 
 **A locking `cursor()` runs the second select once per row.** Laravel runs a query's `afterQuery` callbacks for each row that a cursor yields. A transactional `lockForUpdate()->cursor()` of `n` rows therefore runs `n + 1` queries. Use `lockForUpdate()->get()` when the query count must stay bounded. See [Limits](#limits).
 
-**A query without a select list selects the item's own columns only.** The scope turns `select *` into `select <table>.*`, so a join adds no columns of the joined table. Name the joined columns in a select list. A select list other than `*` or `<table>.*` carries no `position`.
+**A query without a select list selects the item's own columns only.** The scope turns `select *` into `select <table>.*`, so a join adds no columns of the joined table. Name the joined columns in a select list. A `select()` list other than `*` or `<table>.*` carries no `position`. A columns argument to `get()`, `find()` or a paginator arrives after the scope, so it carries `position` when it holds `<table>.*`, as `get(['assets.*', 'assets.title as label'])` does.
 
 **The position counts the item among the members of the parent that `#[OrderedIn]` names**, in the order that `OrderChange::$order` lists. `null` means the row is not a member:
 
@@ -683,7 +683,7 @@ Event::listen(Reordered::class, function (Reordered $event): void {
 | A stale move, a halted write, or a rollback | None. |
 | Any write that rebalances | Unchanged. `Rebalanced` dispatches first, and the rebalance adds no `PositionChange`. |
 
-**A listener that throws after the commit fails a committed write.** Laravel runs each after-commit event in turn, once the transaction commits. When a listener throws, the write stays committed, but the call that made it throws that exception. The listeners after it, and every later `Reordered` and `Rebalanced` of the write, never run. Make a listener that calls an external service a queued listener, with `ShouldQueue`, so its failure retries on the queue and the write returns.
+**A listener that throws after the commit fails a committed write.** Laravel runs each after-commit event in turn, once the transaction commits. When a listener throws, the write stays committed, but the call that made it throws that exception. The listeners after it, and every later `Reordered` and `Rebalanced` of the write, never run. A queued listener, with `ShouldQueue` on an asynchronous queue connection, moves that failure to the queue worker. It does not help on the `sync` connection, which runs the listener inline, or when pushing the job itself fails.
 
 ## The `Rebalanced` event
 
