@@ -939,7 +939,7 @@ final class OrderedRelation
             return null;
         }
 
-        $position = self::positionsOf([$this], [$item])[(string) self::keyOf($item)] ?? null;
+        $position = $this->positionsOf([$item])[(string) self::keyOf($item)] ?? null;
 
         return is_int($position) || is_string($position) ? (int) $position : null;
     }
@@ -984,16 +984,7 @@ final class OrderedRelation
      */
     public function keyAt(Placement $placement, null|int|string $exclude = null): string
     {
-        $excluded = $exclude === null ? [] : [$exclude];
-        $key = FractionalIndex::keyBetween(...$this->bounds($placement, $excluded, $this->indexedRows(...)));
-
-        if (strlen($key) <= self::MAX_KEY_LENGTH) {
-            return $key;
-        }
-
-        $this->rebalance();
-
-        return FractionalIndex::keyBetween(...$this->bounds($placement, $excluded, $this->indexedRows(...)));
+        return $this->keysAt($placement, $exclude === null ? [] : [$exclude], 1)[0];
     }
 
     /**
@@ -2668,26 +2659,19 @@ final class OrderedRelation
     }
 
     /**
-     * @param  non-empty-list<self>  $relations
      * @param  list<Model>  $items
      * @return array<string, mixed>
      */
-    private static function positionsOf(array $relations, array $items): array
+    private function positionsOf(array $items): array
     {
-        $keys = $relations[0]->keys;
-        $rows = array_map(static fn (self $relation): Builder => $relation->members()->select([
+        $keys = $this->keys;
+        $members = $this->members()->select([
             $keys->item->getQualifiedKeyName(),
             $keys->item->qualifyColumn($keys->foreignKey),
             $keys->item->qualifyColumn(self::RANK_KEY),
-        ]), $relations);
-        $members = array_shift($rows);
-
-        foreach ($rows as $row) {
-            $members->unionAll($row);
-        }
-
+        ]);
         $table = $keys->item->getTable();
-        $numbered = $relations[0]->numbered($members->newQuery()->fromSub($members, $table), [$keys->item->getQualifiedKeyName()]);
+        $numbered = $this->numbered($members->newQuery()->fromSub($members, $table), [$keys->item->getQualifiedKeyName()]);
 
         /** @var array<string, mixed> */
         return $numbered->newQuery()
@@ -2939,7 +2923,7 @@ final class OrderedRelation
         foreach ($groups as $indices) {
             $source = $sources[$indices[0]] ?? null;
             $members = array_map(static fn (int $index): Model => $items[$index], $indices);
-            $positions = $source === null || $source->unavailable === ParentUnavailability::Missing ? [] : self::positionsOf([$source], $members);
+            $positions = $source === null || $source->unavailable === ParentUnavailability::Missing ? [] : $source->positionsOf($members);
 
             foreach ($indices as $index) {
                 $position = $positions[(string) self::keyOf($items[$index])] ?? null;
