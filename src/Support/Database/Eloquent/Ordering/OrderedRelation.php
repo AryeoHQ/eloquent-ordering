@@ -18,7 +18,6 @@ use Illuminate\Database\Eloquent\Relations\MorphToMany;
 use Illuminate\Database\Eloquent\Relations\Pivot;
 use Illuminate\Database\Eloquent\Relations\Relation;
 use Illuminate\Database\Eloquent\SoftDeletes;
-use Illuminate\Database\Eloquent\SoftDeletingScope;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Grammars\Grammar;
 use Illuminate\Database\Query\JoinClause;
@@ -30,6 +29,7 @@ use ReflectionClass;
 use ReflectionMethod;
 use ReflectionNamedType;
 use RuntimeException;
+use Stringable;
 use Support\Database\Eloquent\Concurrency\Attributes\NamedConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\LocksParentsFirst;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
@@ -375,10 +375,10 @@ final class OrderedRelation
         $relation = self::declaration($parent, $revision)['relation'];
         $item = self::describe($relation)->item;
         $rankKey = $item->qualifyColumn(self::RANK_KEY);
-        $scopes = array_keys($relation->getRelated()->getGlobalScopes());
+        $members = $relation->getQuery()->clone();
+        self::liveMembersOf($relation, $members);
 
-        return $relation->getQuery()->clone()
-            ->withoutGlobalScopes(array_values(array_diff($scopes, [SoftDeletingScope::class])))
+        return $members
             ->reorder()
             ->whereNotNull($rankKey)
             ->orderBy($rankKey)
@@ -890,7 +890,7 @@ final class OrderedRelation
             return;
         }
 
-        $related->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)
+        $related->newModelQuery()
             ->where($related->qualifyColumn($relation->getRelatedKeyName()), self::relatedKeyOf($relation, $item))
             ->toBase()
             ->lock('for share')
@@ -1001,7 +1001,7 @@ final class OrderedRelation
 
         return $keys->morphType === null
             ? $named
-            : sprintf('%s and %s = %s', $named, $grammar->wrap($qualifier.'.'.$keys->morphType), $grammar->escape($keys->morphClass));
+            : sprintf('%s and %s = %s', $named, $grammar->wrap($qualifier.'.'.$keys->morphType), self::untypedLiteral($keys->morphClass));
     }
 
     /**
@@ -1037,9 +1037,32 @@ final class OrderedRelation
             ))
             ->selectRaw(sprintf('case when bool_or(%s = %s) then count(*) end', $grammar->wrap($member($key)), $grammar->wrap($outer($key))));
 
-        $bindings = $members->getBindings();
+        $literals = array_map(self::untypedLiteral(...), $connection->prepareBindings($members->getBindings()));
 
-        return $grammar->substituteBindingsIntoRawSql($members->toSql(), array_replace($connection->prepareBindings($bindings), array_filter($bindings, is_bool(...))));
+        return preg_replace_callback(
+            '/(?<![\w$])[Ee]\'(?:[^\'\\\\]|\\\\.|\'\')*\'|\'(?:[^\']|\'\')*\'|"(?:[^"]|"")*"|\?\??/s',
+            static function (array $match) use (&$literals): string {
+                return $match[0] === '?' ? array_shift($literals) ?? throw new LogicException('A position count holds more placeholders than bindings.') : $match[0];
+            },
+            $members->toSql(),
+        ) ?? throw new LogicException('A position count could not render its bindings.');
+    }
+
+    private static function untypedLiteral(mixed $value): string
+    {
+        if ($value === null) {
+            return 'null';
+        }
+
+        if (! is_scalar($value) && ! $value instanceof Stringable) {
+            throw new LogicException(sprintf('A position count cannot render a [%s] binding as a literal.', get_debug_type($value)));
+        }
+
+        $string = (string) $value;
+
+        return str_contains($string, '\\')
+            ? "E'".str_replace(['\\', "'"], ['\\\\', "''"], $string)."'"
+            : "'".str_replace("'", "''", $string)."'";
     }
 
     /**
@@ -1091,6 +1114,23 @@ final class OrderedRelation
         $aliases = [self::MEMBER, self::MEMBER_PARENT, self::MEMBER_RELATED];
 
         return in_array($qualifier, $aliases, true) ? array_map(static fn (string $alias): string => $alias.'_inner', $aliases) : $aliases;
+    }
+
+    /**
+     * @param  HasMany<Model, Model>|MorphMany<Model, Model>|BelongsToMany<Model, Model>  $relation
+     * @param  EloquentBuilder<*>  $members
+     * @param  list<string>  $kept
+     */
+    private static function liveMembersOf(HasMany|MorphMany|BelongsToMany $relation, EloquentBuilder $members, array $kept = []): void
+    {
+        $related = $relation->getRelated();
+        $item = self::describe($relation)->item;
+        $members->withoutGlobalScopes(array_values(array_diff(array_keys($related->getGlobalScopes()), $kept)));
+        self::whereLive($members->getQuery(), $item, $item->getTable());
+
+        if ($relation instanceof BelongsToMany) {
+            self::whereLive($members->getQuery(), $related, $related->getTable());
+        }
     }
 
     private static function whereLive(Builder $query, Model $model, string $alias): void
@@ -2065,7 +2105,7 @@ final class OrderedRelation
 
         $pivot = self::describe($relation)->item;
 
-        return $pivot->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)
+        return $pivot->newModelQuery()
             ->toBase()
             ->useWritePdo()
             ->where($pivot->getQualifiedKeyName(), $item->getKey())
@@ -2158,7 +2198,7 @@ final class OrderedRelation
 
     private static function lockRow(Model $model): void
     {
-        $model->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($model->getKey())->toBase()->lock('for no key update')->first([$model->getKeyName()]);
+        $model->newModelQuery()->whereKey($model->getKey())->toBase()->lock('for no key update')->first([$model->getKeyName()]);
     }
 
     /**
@@ -2248,7 +2288,7 @@ final class OrderedRelation
             return null;
         }
 
-        $row = $model->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($model->getKey())->toBase()->useWritePdo()->first(self::membershipColumns($model));
+        $row = $model->newModelQuery()->whereKey($model->getKey())->toBase()->useWritePdo()->first(self::membershipColumns($model));
 
         return $row === null ? null : (array) $row;
     }
@@ -2553,14 +2593,17 @@ final class OrderedRelation
     {
         $relation = self::relation($this->parent, $this->relationName);
         $relation->getBaseQuery()->reorder();
-        $scopes = array_keys($relation->getRelated()->getGlobalScopes());
+        self::liveMembersOf($relation, $relation->getQuery());
 
-        return $relation->withoutGlobalScopes(array_values(array_diff($scopes, [SoftDeletingScope::class])));
+        return $relation;
     }
 
     private function members(): Builder
     {
-        return $this->scopedRelation()->toBase();
+        $members = $this->scopedRelation()->toBase();
+        $members->columns = null;
+
+        return $members->setBindings([], 'select');
     }
 
     /**
@@ -2612,7 +2655,7 @@ final class OrderedRelation
 
     private function indexedRows(): Builder
     {
-        $rows = $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase();
+        $rows = $this->keys->item->newModelQuery()->toBase();
 
         foreach ($this->keys->pointingAt($this->parent) as $column => $value) {
             $rows->where($this->keys->item->qualifyColumn($column), $value);
@@ -2639,8 +2682,7 @@ final class OrderedRelation
     private function currentMembers(): Collection
     {
         $relation = self::relation($this->parent, $this->relationName);
-        $related = $relation->getRelated();
-        $relation->withoutGlobalScopes(array_values(array_diff(array_keys($related->getGlobalScopes()), [SoftDeletingScope::class, SelectsPosition::class])));
+        self::liveMembersOf($relation, $relation->getQuery(), [SelectsPosition::class]);
         $rankKey = $this->keys->item->qualifyColumn(self::RANK_KEY);
 
         if ($relation instanceof BelongsToMany) {
@@ -2753,7 +2795,7 @@ final class OrderedRelation
         $keyName = $template->getKeyName();
         $rows = [];
 
-        foreach ($template->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase()->useWritePdo()
+        foreach ($template->newModelQuery()->toBase()->useWritePdo()
             ->whereIn($template->getQualifiedKeyName(), array_map(self::keyOf(...), $items))
             ->orderBy($template->getQualifiedKeyName())
             ->get([$keyName, ...self::membershipColumns($template)]) as $row) {
@@ -2971,7 +3013,7 @@ final class OrderedRelation
     private function clearRankKeys(array $ids): void
     {
         if ($ids !== []) {
-            $this->keys->item->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $ids)->update([self::RANK_KEY => null]);
+            $this->keys->item->newModelQuery()->toBase()->whereIn($this->keys->item->getQualifiedKeyName(), $ids)->update([self::RANK_KEY => null]);
         }
     }
 
@@ -3168,6 +3210,6 @@ final class OrderedRelation
 
     private function parentRow(): Builder
     {
-        return $this->parent->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->whereKey($this->parent->getKey())->toBase();
+        return $this->parent->newModelQuery()->whereKey($this->parent->getKey())->toBase();
     }
 }

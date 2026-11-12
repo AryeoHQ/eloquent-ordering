@@ -8,7 +8,9 @@ use Closure;
 use Illuminate\Database\Connection;
 use Illuminate\Database\Eloquent\Builder as EloquentBuilder;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Concerns\HasUuids;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
@@ -34,6 +36,7 @@ use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
 use Support\Database\Eloquent\Concurrency\Exceptions\StaleConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Provides\HasConcurrencyRevisions;
+use Support\Database\Eloquent\Ordering\Attributes\OrderedIn;
 use Support\Database\Eloquent\Ordering\Attributes\OrderedThrough;
 use Support\Database\Eloquent\Ordering\Attributes\OrdersRelation;
 use Support\Database\Eloquent\Ordering\Contracts\Ordered;
@@ -54,7 +57,10 @@ use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
 use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Composed\ComposedItem;
+use Tests\Fixtures\Support\Customers\CountedCustomer;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Customers\PlainCustomer;
+use Tests\Fixtures\Support\Documents\CountedDocument;
 use Tests\Fixtures\Support\Documents\DatedDocument;
 use Tests\Fixtures\Support\Documents\Document;
 use Tests\Fixtures\Support\Documents\DocumentKind;
@@ -63,12 +69,15 @@ use Tests\Fixtures\Support\Documents\KindedDocument;
 use Tests\Fixtures\Support\Documents\LocalizedDocument;
 use Tests\Fixtures\Support\Drawers\Drawer;
 use Tests\Fixtures\Support\Events\ModelEvents;
+use Tests\Fixtures\Support\Folders\CountedFolder;
 use Tests\Fixtures\Support\Folders\DatedFolder;
 use Tests\Fixtures\Support\Folders\FiledFolder;
 use Tests\Fixtures\Support\Folders\Folder;
 use Tests\Fixtures\Support\Folders\FolderRevision;
 use Tests\Fixtures\Support\Folders\KindedFolder;
 use Tests\Fixtures\Support\Folders\LocalizedFolder;
+use Tests\Fixtures\Support\Listings\CountingListing;
+use Tests\Fixtures\Support\Listings\CountingListingCustomer;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
@@ -228,6 +237,7 @@ class OrderedRelationTest extends TestCase
             return self::filtered(FiledFolder::query()->create(), 'documents', FiledDocument::class, 'folder_id', 'home_folder_id', [$archive->id, $other->id, $archive->id, $archive->id]);
         }];
         yield 'an enum cast' => [static fn (): array => self::filtered(KindedFolder::query()->create(['kind' => DocumentKind::Notes]), 'documents', KindedDocument::class, 'folder_id', 'kind', ['notes', 'drafts', 'notes', 'notes'])];
+        yield 'an integer against a string column' => [static fn (): array => self::filtered(Playlist::create(), 'tracks', Track::class, 'playlist_id', 'code', [(string) Playlist::CODE, '2', (string) Playlist::CODE, (string) Playlist::CODE])];
     }
 
     #[DataProvider('shapes')]
@@ -1818,11 +1828,12 @@ class OrderedRelationTest extends TestCase
     }
 
     #[Test]
-    public function it_reorders_a_trashed_row_that_its_relation_includes(): void
+    public function it_keeps_a_trashed_row_out_of_an_order_whose_relation_includes_trashed_rows(): void
     {
         $section = Section::create();
         $first = $this->addAsset($section, 'Shown');
         $trashed = $this->addAsset($section, 'Shown');
+        $last = $this->addAsset($section, 'Shown');
         Asset::query()->whereKey($trashed->id)->delete();
 
         $parent = (new class extends Model implements OrdersRelations, Revisioned
@@ -1841,10 +1852,89 @@ class OrderedRelationTest extends TestCase
                 return $this->hasMany(Asset::class, 'section_id')->withTrashed();
             }
         })->newQuery()->findOrFail($section->id);
+        $relation = Shape::relationOf($parent, SectionRevision::AssetsOrder);
+        $this->recordReorders();
 
-        $change = Shape::relationOf($parent, SectionRevision::AssetsOrder)->arrange([$trashed->id, $first->id], expected: null);
+        $this->assertSame(Section::query()->findOrFail($section->id)->concurrencyRevision(SectionRevision::AssetsOrder), $parent->concurrencyRevision(SectionRevision::AssetsOrder));
+        $this->assertSame([$first->id, $last->id], DB::transaction(fn (): array => array_map(fn (Model $asset): mixed => $asset->getKey(), $relation->lockedMembers()->all())));
 
-        $this->assertSame([$trashed->id, $first->id], $change->order);
+        $change = $relation->arrange([$last->id, $first->id], expected: null);
+
+        $this->assertSame([$last->id, $first->id], $change->order);
+        $this->assertSame([[$section->id, [[$last->id, 1, 2], [$first->id, 2, 1]]]], $this->reorders);
+        $this->assertSame(
+            [$first->id => 2, $trashed->id => null, $last->id => 1],
+            Asset::query()->withTrashed()->where('section_id', $section->id)->orderBy('id')->get()->mapWithKeys(fn (Asset $asset): array => [$asset->id => $asset->position])->all(),
+        );
+        $this->assertThrows(fn (): mixed => $relation->arrange([$last->id, $trashed->id, $first->id], expected: null), MembershipMismatch::class);
+    }
+
+    #[Test]
+    public function it_moves_a_pivot_whose_model_counts_a_relation_by_default(): void
+    {
+        $shape = new BelongsToManyShape;
+        [$listing, [$first, $second, $third]] = $shape->with(3);
+        $pivot = $this->countingPivot();
+        $parent = $this->parentOfPivot($listing, $pivot);
+        $moved = $pivot::query()->findOrFail($third->getKey());
+        $moved->setAttribute('title', 'unsaved');
+
+        $change = Shape::relationOf($parent, ListingRevision::CustomersOrder)->moveIn([$moved], expected: null, placement: Placement::after($this->key($first)));
+
+        $this->assertSame([$first->getKey(), $third->getKey(), $second->getKey()], $change->order);
+        $this->assertSame([$first->getKey(), $third->getKey(), $second->getKey()], $shape->members($listing));
+        $this->assertSame(2, $moved->getAttribute('position'));
+        $this->assertSame(['title' => 'unsaved'], $moved->getDirty());
+    }
+
+    #[Test]
+    public function it_moves_and_arranges_an_item_whose_model_counts_a_relation_by_default(): void
+    {
+        $folder = CountedFolder::query()->create();
+        [$first, $second, $third] = array_map(fn (): CountedDocument => CountedDocument::query()->create(['folder_id' => $folder->id]), range(1, 3));
+
+        $moved = $third->move(Placement::after($first->id), expected: null);
+        $arranged = $folder->documents()->arrange([$second->id, $first->id, $third->id], expected: null);
+
+        $this->assertSame([$first->id, $third->id, $second->id], $moved->order);
+        $this->assertSame([$second->id, $first->id, $third->id], $arranged->order);
+        $this->assertSame([$second->id, $first->id, $third->id], $folder->documents()->reorder('rank_key')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_moves_and_arranges_a_pivot_whose_related_model_counts_a_relation_by_default(): void
+    {
+        $listing = CountingListing::query()->create();
+        $listing->customers()->attach(array_map(fn (): int => CountedCustomer::query()->create()->id, range(1, 3)));
+        [$first, $second, $third] = CountingListingCustomer::query()->where('listing_id', $listing->id)->orderBy('rank_key')->get()->all();
+
+        $moved = $listing->customers()->moveIn([$third], expected: null, placement: Placement::after($first->id));
+        $arranged = $listing->customers()->arrange([$second->id, $first->id, $third->id], expected: null);
+
+        $this->assertSame([$first->id, $third->id, $second->id], $moved->order);
+        $this->assertSame([$second->id, $first->id, $third->id], $arranged->order);
+        $this->assertSame([$second->id, $first->id, $third->id], CountingListingCustomer::query()->where('listing_id', $listing->id)->orderBy('rank_key')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_hands_the_observer_of_an_arranged_item_the_counts_its_model_loads_by_default(): void
+    {
+        $folder = CountedFolder::query()->create();
+        [$first, $second, $third] = array_map(fn (): CountedDocument => CountedDocument::query()->create(['folder_id' => $folder->id]), range(1, 3));
+        $counts = [];
+        CountedDocument::updated(function (CountedDocument $document) use (&$counts): void {
+            $counts[$document->id] = $document->folder_count;
+        });
+        Model::shouldBeStrict();
+
+        try {
+            $folder->documents()->arrange([$third->id, $first->id, $second->id], expected: null);
+        } finally {
+            Model::shouldBeStrict(false);
+        }
+
+        $this->assertNotSame([], $counts);
+        $this->assertSame(array_fill_keys(array_keys($counts), 1), $counts);
     }
 
     #[DataProvider('pivots')]
@@ -2892,6 +2982,31 @@ class OrderedRelationTest extends TestCase
             protected $table = 'listing_customer';
 
             protected $keyType = 'string';
+        })::class;
+    }
+
+    /**
+     * @return class-string<Pivot&Ordered>
+     */
+    private function countingPivot(): string
+    {
+        return (new #[OrderedIn(PivotedListing::class)] class extends Pivot implements Ordered
+        {
+            use HasUuids;
+            use IsOrdered;
+            use SoftDeletes;
+
+            protected $table = 'listing_customer';
+
+            protected $withCount = ['customer'];
+
+            /**
+             * @return BelongsTo<PlainCustomer, $this>
+             */
+            public function customer(): BelongsTo
+            {
+                return $this->belongsTo(PlainCustomer::class);
+            }
         })::class;
     }
 

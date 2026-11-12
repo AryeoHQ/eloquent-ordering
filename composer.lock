@@ -4,20 +4,20 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "05fb3e03b39d14849e2f0b51f9634e57",
+    "content-hash": "9066ceffabc715a8bc294fa4738646e3",
     "packages": [
         {
             "name": "aryeo/eloquent-concurrency",
-            "version": "dev-feat/2026-11-01t1728-digest-migration-m1",
+            "version": "dev-fix/2026-11-09t1451-critique-remedies-m1",
             "source": {
                 "type": "git",
                 "url": "git@github.com:AryeoHQ/eloquent-concurrency.git",
-                "reference": "92e1f4d3f5c3a4f9f6fdbb12665e9a5f2f2d8dd7"
+                "reference": "58d2220bd940a3a3129388bf2937f7da97f99ee6"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/AryeoHQ/eloquent-concurrency/zipball/92e1f4d3f5c3a4f9f6fdbb12665e9a5f2f2d8dd7",
-                "reference": "92e1f4d3f5c3a4f9f6fdbb12665e9a5f2f2d8dd7",
+                "url": "https://api.github.com/repos/AryeoHQ/eloquent-concurrency/zipball/58d2220bd940a3a3129388bf2937f7da97f99ee6",
+                "reference": "58d2220bd940a3a3129388bf2937f7da97f99ee6",
                 "shasum": ""
             },
             "require": {
@@ -95,10 +95,10 @@
             ],
             "description": "Concurrency revisions for Eloquent models, as PostgreSQL digests of each row's observed content",
             "support": {
-                "source": "https://github.com/AryeoHQ/eloquent-concurrency/tree/feat/2026-11-01t1728-digest-migration-m1",
+                "source": "https://github.com/AryeoHQ/eloquent-concurrency/tree/fix/2026-11-09t1451-critique-remedies-m1",
                 "issues": "https://github.com/AryeoHQ/eloquent-concurrency/issues"
             },
-            "time": "2026-11-02T13:34:36+00:00"
+            "time": "2026-11-12T20:49:52+00:00"
         },
         {
             "name": "aryeo/tooling-laravel",
@@ -11219,7 +11219,7 @@
     "aliases": [
         {
             "package": "aryeo/eloquent-concurrency",
-            "version": "dev-feat/2026-11-01t1728-digest-migration-m1",
+            "version": "dev-fix/2026-11-09t1451-critique-remedies-m1",
             "alias": "0.1.0",
             "alias_normalized": "0.1.0.0"
         }

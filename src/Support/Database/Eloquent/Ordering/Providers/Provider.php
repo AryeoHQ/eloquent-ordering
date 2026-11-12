@@ -263,7 +263,7 @@ class Provider extends ServiceProvider
         assert($relation instanceof BelongsToMany);
 
         $pivotClass = $relation->getPivotClass();
-        $query = (new $pivotClass)->setTable($relation->getTable())->setConnection($related->getConnectionName())->newQueryWithoutScopes()->withoutGlobalScope(SelectsPosition::class)->useWritePdo()
+        $query = (new $pivotClass)->setTable($relation->getTable())->setConnection($related->getConnectionName())->newModelQuery()->useWritePdo()
             ->where($relation->getRelatedPivotKeyName(), $related->getAttribute($relation->getRelatedKeyName()));
 
         if ($relation instanceof MorphToMany) {
