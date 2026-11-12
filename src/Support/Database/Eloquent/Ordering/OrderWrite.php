@@ -72,7 +72,7 @@ final class OrderWrite
             }
 
             try {
-                throw_unless((new ReflectionMethod(Model::class, 'save'))->invoke($copy) === true, WriteHalted::class, $copy);
+                throw_unless((new ReflectionMethod(Model::class, 'save'))->invoke($copy, ['touch' => false]) === true, WriteHalted::class, $copy);
             } finally {
                 unset($saving[$copy]);
             }

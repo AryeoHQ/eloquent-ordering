@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace Support\Database\Eloquent\Ordering\Exceptions;
 
+use Illuminate\Database\Eloquent\Relations\Relation;
 use InvalidArgumentException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use Support\Database\Eloquent\Ordering\Placement;
+use Tests\Fixtures\Support\Shapes\HasManyShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\TestCase;
 
@@ -40,6 +42,28 @@ class InvalidAnchorTest extends TestCase
                 $anchor,
                 $shape->revision()->value,
                 $parent->getMorphClass(),
+                $parent->getKey(),
+            ), $exception->getMessage());
+        }
+    }
+
+    #[Test]
+    public function it_names_a_parent_that_the_required_morph_map_omits_by_its_class(): void
+    {
+        Relation::requireMorphMap();
+        $shape = new HasManyShape;
+        [$parent, [$member]] = $shape->with(1);
+        $anchor = '0190a5b2-0000-7000-8000-000000000000';
+
+        try {
+            $member->move(Placement::after($anchor), expected: null);
+            $this->fail('A move after an anchor outside the order succeeded.');
+        } catch (InvalidAnchor $exception) {
+            $this->assertSame(sprintf(
+                'The anchor [%s] is not a current member of the [%s] order of [%s:%s].',
+                $anchor,
+                $shape->revision()->value,
+                $parent::class,
                 $parent->getKey(),
             ), $exception->getMessage());
         }

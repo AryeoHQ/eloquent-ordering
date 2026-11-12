@@ -660,6 +660,28 @@ class ReorderedTest extends TestCase
 
     #[DataProvider('shapes')]
     #[Test]
+    public function it_dispatches_one_event_for_a_save_that_soft_deletes_a_member(Shape $shape): void
+    {
+        [$parent, [$first, $second, $third]] = $shape->with(3);
+        $this->forget();
+
+        $second->setAttribute('deleted_at', now());
+        $second->save();
+
+        $this->assertCount(1, $this->dispatched);
+
+        $change = $this->dispatched[0]->change;
+
+        $this->assertSame($parent, $change->parent);
+        $this->assertSame([$first->getKey(), $third->getKey()], $change->order);
+        $this->assertSame([['id' => $this->key($second), 'position' => null, 'previousPosition' => 2]], array_map(get_object_vars(...), $change->changed));
+        $this->assertSame($shape->digest($parent), $change->digest);
+        $this->assertNull($change->source);
+        $this->assertSame([$this->baseline], $this->levels);
+    }
+
+    #[DataProvider('shapes')]
+    #[Test]
     public function it_dispatches_one_event_for_a_force_delete(Shape $shape): void
     {
         [$parent, [$first, $second, $third]] = $shape->with(3);

@@ -6,6 +6,7 @@ namespace Support\Database\Eloquent\Ordering\Exceptions;
 
 use Illuminate\Database\Eloquent\Model;
 use RuntimeException;
+use Support\Database\Eloquent\Ordering\OrderedRelation;
 
 final class UnavailableParent extends RuntimeException
 {
@@ -13,7 +14,7 @@ final class UnavailableParent extends RuntimeException
     {
         parent::__construct(sprintf(
             '[%s:%s] is %s, so no write can place a member in its order.',
-            $parent->getMorphClass(),
+            OrderedRelation::typeOf($parent),
             $parent->getKey(),
             $reason->value,
         ));

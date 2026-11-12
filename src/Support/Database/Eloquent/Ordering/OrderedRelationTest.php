@@ -23,6 +23,7 @@ use Illuminate\Database\Migrations\Migrator;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\Query\Expression;
 use Illuminate\Database\Query\JoinClause;
+use Illuminate\Database\QueryException;
 use Illuminate\Process\InvokedProcess;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Event;
@@ -30,7 +31,9 @@ use Illuminate\Support\Str;
 use LogicException;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\Attributes\Test;
+use ReflectionProperty;
 use RuntimeException;
 use Support\Database\Eloquent\Concurrency\Contracts\NamesConcurrencyRevision;
 use Support\Database\Eloquent\Concurrency\Contracts\Revisioned;
@@ -48,6 +51,7 @@ use Support\Database\Eloquent\Ordering\Exceptions\MembershipMismatch;
 use Support\Database\Eloquent\Ordering\Exceptions\NotAMember;
 use Support\Database\Eloquent\Ordering\Exceptions\ParentUnavailability;
 use Support\Database\Eloquent\Ordering\Exceptions\UnavailableParent;
+use Support\Database\Eloquent\Ordering\Exceptions\WriteHalted;
 use Support\Database\Eloquent\Ordering\Keys\FractionalIndex;
 use Support\Database\Eloquent\Ordering\Provides\HasOrderedRelations;
 use Support\Database\Eloquent\Ordering\Provides\IsOrdered;
@@ -55,10 +59,13 @@ use Tests\Fixtures\Support\Agencies\Agency;
 use Tests\Fixtures\Support\Agencies\AgencyCustomer;
 use Tests\Fixtures\Support\Agencies\AgencyRevision;
 use Tests\Fixtures\Support\Assets\Asset;
+use Tests\Fixtures\Support\Assets\UppercasedAsset;
 use Tests\Fixtures\Support\Binders\Binder;
 use Tests\Fixtures\Support\Composed\ComposedItem;
+use Tests\Fixtures\Support\Conferences\Conference;
 use Tests\Fixtures\Support\Customers\CountedCustomer;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Customers\ListingCountedCustomer;
 use Tests\Fixtures\Support\Customers\PlainCustomer;
 use Tests\Fixtures\Support\Documents\CountedDocument;
 use Tests\Fixtures\Support\Documents\DatedDocument;
@@ -67,7 +74,9 @@ use Tests\Fixtures\Support\Documents\DocumentKind;
 use Tests\Fixtures\Support\Documents\FiledDocument;
 use Tests\Fixtures\Support\Documents\KindedDocument;
 use Tests\Fixtures\Support\Documents\LocalizedDocument;
+use Tests\Fixtures\Support\Drawers\CollectingDrawer;
 use Tests\Fixtures\Support\Drawers\Drawer;
+use Tests\Fixtures\Support\Drawers\DrawerRevision;
 use Tests\Fixtures\Support\Events\ModelEvents;
 use Tests\Fixtures\Support\Folders\CountedFolder;
 use Tests\Fixtures\Support\Folders\DatedFolder;
@@ -78,6 +87,7 @@ use Tests\Fixtures\Support\Folders\KindedFolder;
 use Tests\Fixtures\Support\Folders\LocalizedFolder;
 use Tests\Fixtures\Support\Listings\CountingListing;
 use Tests\Fixtures\Support\Listings\CountingListingCustomer;
+use Tests\Fixtures\Support\Listings\CustomerCountedListing;
 use Tests\Fixtures\Support\Listings\Listing;
 use Tests\Fixtures\Support\Listings\ListingCustomer;
 use Tests\Fixtures\Support\Listings\ListingRevision;
@@ -86,21 +96,27 @@ use Tests\Fixtures\Support\Listings\PivotedListing;
 use Tests\Fixtures\Support\Listings\TitledListing;
 use Tests\Fixtures\Support\Listings\TwoPivotListing;
 use Tests\Fixtures\Support\Notes\Note;
+use Tests\Fixtures\Support\Notes\NoteCollection;
 use Tests\Fixtures\Support\Pages\Page;
+use Tests\Fixtures\Support\Panels\Panel;
 use Tests\Fixtures\Support\Playlists\Playlist;
 use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Scenes\Scene;
 use Tests\Fixtures\Support\Sections\Section;
 use Tests\Fixtures\Support\Sections\SectionRevision;
+use Tests\Fixtures\Support\Sections\UppercasedSection;
 use Tests\Fixtures\Support\Shapes\BelongsToManyShape;
+use Tests\Fixtures\Support\Shapes\HasManyShape;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Shape;
 use Tests\Fixtures\Support\Shelves\Shelf;
+use Tests\Fixtures\Support\Speakers\Speaker;
 use Tests\Fixtures\Support\Tours\Tour;
 use Tests\Fixtures\Support\Tracks\Track;
 use Tests\Fixtures\Support\Videos\Video;
 use Tests\TestCase;
 use Throwable;
+use TypeError;
 
 #[CoversClass(MembershipMismatch::class)]
 #[CoversClass(OrderChange::class)]
@@ -132,6 +148,15 @@ class OrderedRelationTest extends TestCase
     public static function pivots(): iterable
     {
         return PivotShape::pivots();
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function haltingRecordListeners(): iterable
+    {
+        yield 'a saving listener' => ['saving'];
+        yield 'a creating listener' => ['creating'];
     }
 
     /**
@@ -1604,6 +1629,98 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([[$drawer->id, [[$single->id, 2, null]]]], $this->reorders);
     }
 
+    #[DataProvider('haltingRecordListeners')]
+    #[Test]
+    public function it_refuses_a_create_in_order_whose_listener_halts_the_second_record(string $event): void
+    {
+        $drawer = Drawer::create();
+        $first = $this->addNote($drawer, 'pgsql');
+        $digest = Drawer::query()->findOrFail($drawer->id)->concurrencyRevision(DrawerRevision::NotesOrder);
+        $records = 0;
+        Event::listen(sprintf('eloquent.%s: %s', $event, Note::class), function () use (&$records): null|bool {
+            return ++$records === 2 ? false : null;
+        });
+        $rebalances = 0;
+        Event::listen(Rebalanced::class, function () use (&$rebalances): void {
+            $rebalances++;
+        });
+        $this->recordReorders();
+        $thrown = null;
+
+        try {
+            $drawer->notes()->createInOrder([[], [], []]);
+        } catch (Throwable $thrown) {
+        }
+
+        $this->assertInstanceOf(WriteHalted::class, $thrown);
+        $this->assertSame(2, $records);
+        $this->assertSame([$first->id], DB::table('notes')->pluck('id')->map(fn (mixed $id): int => (int) $id)->all());
+        $this->assertSame($digest, Drawer::query()->findOrFail($drawer->id)->concurrencyRevision(DrawerRevision::NotesOrder));
+        $this->assertSame([], $this->reorders);
+        $this->assertSame(0, $rebalances);
+    }
+
+    #[DataProvider('haltingRecordListeners')]
+    #[Test]
+    public function it_refuses_a_create_in_order_whose_listener_halts_the_pivot_of_the_second_record(string $event): void
+    {
+        $listing = Listing::create();
+        $listing->customers()->attach(Customer::create());
+        $customers = DB::table('customers')->orderBy('id')->pluck('id')->all();
+        $pivots = DB::table('listing_customer')->orderBy('id')->pluck('id')->all();
+        $digest = Listing::query()->findOrFail($listing->id)->concurrencyRevision(ListingRevision::CustomersOrder);
+        $records = 0;
+        Event::listen(sprintf('eloquent.%s: %s', $event, ListingCustomer::class), function () use (&$records): null|bool {
+            return ++$records === 2 ? false : null;
+        });
+        $rebalances = 0;
+        Event::listen(Rebalanced::class, function () use (&$rebalances): void {
+            $rebalances++;
+        });
+        $this->recordReorders();
+        $thrown = null;
+
+        try {
+            $listing->customers()->createInOrder([[], [], []]);
+        } catch (Throwable $thrown) {
+        }
+
+        $this->assertInstanceOf(WriteHalted::class, $thrown);
+        $this->assertSame(2, $records);
+        $this->assertSame($customers, DB::table('customers')->orderBy('id')->pluck('id')->all());
+        $this->assertSame($pivots, DB::table('listing_customer')->orderBy('id')->pluck('id')->all());
+        $this->assertSame($digest, Listing::query()->findOrFail($listing->id)->concurrencyRevision(ListingRevision::CustomersOrder));
+        $this->assertSame([], $this->reorders);
+        $this->assertSame(0, $rebalances);
+    }
+
+    #[Test]
+    public function it_locks_the_parents_first_again_when_it_retries_a_save_that_a_listener_halted(): void
+    {
+        $panel = Panel::create();
+        $speaker = $panel->speakers()->create();
+        $conference = Conference::create();
+        $conference->speakers()->attach($speaker);
+        $speaker->delete();
+        $halt = true;
+        Speaker::saving(function () use (&$halt): null|bool {
+            if (! $halt) {
+                return null;
+            }
+
+            $halt = false;
+
+            return false;
+        });
+
+        $this->assertFalse(self::restore($speaker));
+        DB::enableQueryLog();
+
+        $this->assertTrue(self::restore($speaker));
+        $this->assertSame(['conferences', 'panels'], array_values(array_unique(array_column($this->parentLocks(DB::getQueryLog(), 'panels|conferences'), 0))));
+        $this->assertSame(1, $speaker->refresh()->position);
+    }
+
     #[DataProvider('shapes')]
     #[Test]
     public function it_moves_members_of_several_parents_in_against_the_destination_digest(Shape $shape): void
@@ -2149,6 +2266,175 @@ class OrderedRelationTest extends TestCase
         $moving->move(Placement::after($first->id)->in($video), expected: null);
 
         $this->assertSame([[$video->id, [$first->id, $second->id]]], $rebalanced);
+    }
+
+    #[Test]
+    public function it_creates_in_order_under_the_defaults_the_caller_sets_on_the_relation_and_lets_a_record_override_them(): void
+    {
+        $section = Section::create();
+        $listing = Listing::query()->create();
+
+        $assets = $section->assets()->withAttributes(['title' => 'Default'])->createInOrder([[], ['title' => 'Own']]);
+        $customers = $listing->customers()->withAttributes(['name' => 'Default'])->createInOrder([[], ['name' => 'Own']]);
+
+        $this->assertSame(['Default', 'Own'], $assets->pluck('title')->all());
+        $this->assertSame(['Default', 'Own'], Asset::query()->whereKey($assets->modelKeys())->orderBy('id')->pluck('title')->all());
+        $this->assertSame(['Default', 'Own'], $customers->pluck('name')->all());
+        $this->assertSame(['Default', 'Own'], Customer::query()->whereKey($customers->modelKeys())->orderBy('id')->pluck('name')->all());
+    }
+
+    #[Test]
+    public function it_returns_created_and_locked_members_in_the_collection_their_model_names(): void
+    {
+        $drawer = CollectingDrawer::query()->create();
+        $missing = CollectingDrawer::query()->create();
+        DB::table('drawers')->where('id', $missing->id)->delete();
+
+        $this->assertInstanceOf(NoteCollection::class, $drawer->notes()->createInOrder([[], []]));
+        $this->assertInstanceOf(NoteCollection::class, $drawer->notes()->createInOrder([]));
+
+        DB::transaction(function () use ($drawer, $missing): void {
+            $this->assertInstanceOf(NoteCollection::class, $drawer->notes()->lockedMembers());
+            $this->assertInstanceOf(NoteCollection::class, $missing->notes()->lockedMembers());
+        });
+    }
+
+    #[Test]
+    public function it_writes_and_locks_an_order_whose_parent_and_items_the_morph_map_omits_while_the_map_is_required(): void
+    {
+        Relation::requireMorphMap();
+        $shape = new HasManyShape;
+        [$source, [$first, $second]] = $shape->with(2);
+        $destination = $shape->createParent();
+
+        $second->move(Placement::first(), expected: null);
+        $shape->relation($destination)->moveIn([$first], expected: null);
+        $locked = DB::transaction(function () use ($shape, $source, $destination): array {
+            $members = $shape->relation($source)->lockedMembers($destination);
+
+            return $members->modelKeys();
+        });
+
+        $this->assertSame([$second->getKey()], $locked);
+        $this->assertSame([$second->getKey()], $shape->members($source));
+        $this->assertSame([$first->getKey()], $shape->members($destination));
+    }
+
+    #[RunInSeparateProcess]
+    #[Test]
+    public function it_reads_the_parent_columns_of_a_declaration_whose_first_read_runs_while_the_connection_pretends(): void
+    {
+        DB::pretend(fn (): mixed => Track::query()->get());
+        [, $tracks] = $this->playlist('audio', ['audio', 'video', 'audio']);
+
+        $this->assertSame([1, null, 2], Track::query()->whereKey(array_map(fn (Track $track): int => $track->id, $tracks))->orderBy('id')->get()->map(fn (Track $track): null|int => $track->position)->all());
+    }
+
+    #[Test]
+    public function it_attaches_a_customer_whose_model_counts_the_listings_that_order_it(): void
+    {
+        set_time_limit(30);
+
+        try {
+            $listing = CustomerCountedListing::query()->create();
+            $customers = array_map(fn (): int => ListingCountedCustomer::query()->create()->id, range(1, 2));
+            $listing->customers()->attach($customers);
+            $attached = $listing->customers()->get()->map(fn (ListingCountedCustomer $customer): array => [$customer->id, $customer->listings_count, $customer->getRelation('pivot')?->getAttribute(OrderedRelation::POSITION)])->all();
+        } finally {
+            set_time_limit(0);
+        }
+
+        $this->assertSame([[$customers[0], 1, 1], [$customers[1], 1, 2]], $attached);
+    }
+
+    #[Test]
+    public function it_rethrows_a_query_error_of_a_subquery_filter_other_than_a_table_outside_it(): void
+    {
+        $parent = new class extends Model implements OrdersRelations, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasOrderedRelations;
+
+            protected $table = 'folders';
+
+            /**
+             * @return HasMany<KindedDocument, $this>
+             */
+            #[OrdersRelation(FolderRevision::DocumentsOrder, membership: ['documents.home_folder_id'])]
+            public function documents(): HasMany
+            {
+                return $this->hasMany(KindedDocument::class, 'folder_id')->whereIn(
+                    'documents.home_folder_id',
+                    $this->getConnection()->table('folders')->select('folders.missing_column'),
+                );
+            }
+        };
+
+        try {
+            $parent->concurrencyRevision(FolderRevision::DocumentsOrder);
+            $this->fail('A relation whose subquery filter names a missing column was resolved.');
+        } catch (QueryException $exception) {
+            $this->assertSame('42703', $exception->getCode());
+        }
+    }
+
+    #[Test]
+    public function it_refuses_a_relation_that_throws_when_it_builds_on_a_blank_parent(): void
+    {
+        try {
+            UppercasedAsset::query()->get();
+            $this->fail('A relation that throws on a blank parent was resolved.');
+        } catch (LogicException $exception) {
+            $this->assertSame(sprintf(
+                '[%s::assets()] threw while it built its relation. The package builds an ordered relation on a blank [%s] to read its declaration, so the relation must build without a stored parent value.',
+                UppercasedSection::class,
+                UppercasedSection::class,
+            ), $exception->getMessage());
+            $this->assertInstanceOf(TypeError::class, $exception->getPrevious());
+        }
+    }
+
+    #[Test]
+    public function it_clears_and_reads_the_rows_an_arrange_rewrites_in_bounded_statements_before_it_saves_a_key(): void
+    {
+        $section = Section::create();
+        $ids = array_map(fn (int $index): int => $this->addAsset($section, "Asset {$index}")->id, range(1, 5));
+        $limit = new ReflectionProperty(OrderedRelation::class, 'idsPerStatement');
+        $before = $limit->getValue();
+        $limit->setValue(null, 2);
+        DB::enableQueryLog();
+
+        try {
+            $section->assets()->arrange(array_reverse($ids), expected: null);
+        } finally {
+            $limit->setValue(null, $before);
+        }
+
+        $statements = array_column(DB::getQueryLog(), 'query');
+        $listed = array_filter($statements, fn (string $statement): bool => str_contains($statement, '"assets"."id" in ('));
+        $clears = array_keys(array_filter($listed, fn (string $statement): bool => str_starts_with($statement, 'update "assets" set "rank_key" = ? where')));
+        $saves = array_keys(array_filter($statements, fn (string $statement): bool => str_starts_with($statement, 'update "assets" set "rank_key" = ?, "updated_at" = ? where "id" = ?')));
+
+        $this->assertGreaterThanOrEqual(2, count($clears));
+        $this->assertSame([], array_filter($listed, fn (string $statement): bool => preg_match('/"assets"\."id" in \((\?, ){2,}\?\)/', $statement) === 1));
+        $this->assertLessThan(min($saves), max($clears));
+        $this->assertSame(array_reverse($ids), Asset::query()->where('section_id', $section->id)->orderBy('rank_key')->pluck('id')->all());
+    }
+
+    #[Test]
+    public function it_reads_a_source_parent_once_for_every_item_that_a_move_in_takes_from_it(): void
+    {
+        $source = Section::create();
+        $destination = Section::create();
+        $ids = array_map(fn (int $index): int => $this->addAsset($source, "Asset {$index}")->id, range(1, 3));
+        $items = Asset::query()->whereKey($ids)->orderBy('id')->get();
+        DB::enableQueryLog();
+
+        $destination->assets()->moveIn($items, expected: null);
+
+        $reads = array_filter(DB::getQueryLog(), fn (array $statement): bool => $statement['query'] === 'select * from "sections" where "id" = ? limit 1' && $statement['bindings'] === [$source->id]);
+        $this->assertCount(1, $reads);
+        $this->assertSame($ids, Asset::query()->where('section_id', $destination->id)->orderBy('rank_key')->pluck('id')->all());
     }
 
     /**
@@ -3095,6 +3381,13 @@ class OrderedRelationTest extends TestCase
         $asset->save();
 
         return $asset;
+    }
+
+    private static function restore(Model $model): mixed
+    {
+        assert(method_exists($model, 'restore'));
+
+        return $model->restore();
     }
 
     private function key(Model $member): int|string

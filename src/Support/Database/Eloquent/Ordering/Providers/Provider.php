@@ -54,7 +54,7 @@ class Provider extends ServiceProvider
          * @param  list<array<string, mixed>>  $records
          * @return Collection<int, Model>
          */ function (array $records): Collection {
-            return OrderedRelation::ordering($this)->createInOrder($records);
+            return OrderedRelation::ordering($this)->createInOrder($records, $this->getQuery()->pendingAttributes);
         });
 
         Relation::macro('lockedMembers', /** @return Collection<int, Model> */ function (Model ...$alsoLock): Collection {
@@ -137,7 +137,7 @@ class Provider extends ServiceProvider
     {
         $model = $payload[0] ?? null;
 
-        if ($model instanceof Model) {
+        if ($model instanceof Model && ! $model instanceof Ordered) {
             OrderedRelation::requirePrepared($model);
         }
     }
