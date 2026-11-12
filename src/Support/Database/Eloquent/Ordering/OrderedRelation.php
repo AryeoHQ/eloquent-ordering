@@ -2581,19 +2581,13 @@ final class OrderedRelation
      */
     private function write(Model $item, array $attributes): void
     {
-        $copy = OrderWrite::copy($item, self::timestamps($item, $this->keys->item));
-
-        if (self::saveCopy($item, $copy, $attributes)) {
-            $this->holdStoredDigests([self::keyOf($item) => [$item, $copy]]);
-        }
+        self::saveCopy($item, OrderWrite::copy($item, self::timestamps($item, $this->keys->item)), $attributes);
     }
 
     /**
      * @param  array<string, mixed>  $attributes
-     *
-     * @phpstan-assert-if-true Model $copy
      */
-    private static function saveCopy(Model $item, null|Model $copy, array $attributes): bool
+    private static function saveCopy(Model $item, null|Model $copy, array $attributes): void
     {
         $copy ??= throw new LogicException(sprintf('[%s:%s] has no row to write.', $item::class, self::keyOf($item)));
         $written = [
@@ -2602,61 +2596,9 @@ final class OrderedRelation
         ];
         $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
 
-        if (! $item instanceof Revisioned || ! $copy->wasChanged()) {
-            return false;
-        }
-
-        if (! array_key_exists(SelectsConcurrencyRevision::ATTRIBUTE, $written)) {
+        if ($item instanceof Revisioned && $copy->wasChanged() && ! array_key_exists(SelectsConcurrencyRevision::ATTRIBUTE, $written)) {
             self::forgetDigest($item);
-
-            return false;
         }
-
-        return $copy->timestamps !== $copy->newInstance()->timestamps;
-    }
-
-    /**
-     * @param  array<int|string, array{Model, Model}>  $items
-     */
-    private function holdStoredDigests(array $items): void
-    {
-        $fresh = $this->keys->item->newInstance();
-        $rows = [];
-
-        foreach (array_chunk(array_keys($items), self::$idsPerStatement) as $chunk) {
-            foreach ($fresh->newModelQuery()->withGlobalScope(SelectsConcurrencyRevision::class, new SelectsConcurrencyRevision)->toBase()->useWritePdo()->whereIn($fresh->getQualifiedKeyName(), $chunk)->get() as $row) {
-                $row = (array) $row;
-                $key = $row[$fresh->getKeyName()] ?? null;
-
-                if (is_int($key) || is_string($key)) {
-                    $rows[$key] = $row;
-                }
-            }
-        }
-
-        foreach ($items as $id => [$item, $copy]) {
-            $row = $rows[$id] ?? [];
-            $digest = $row[SelectsConcurrencyRevision::ATTRIBUTE] ?? null;
-
-            if (is_string($digest) && self::holdsRow($copy, $row)) {
-                $item->forceFill([SelectsConcurrencyRevision::ATTRIBUTE => $digest])->syncOriginalAttribute(SelectsConcurrencyRevision::ATTRIBUTE);
-            } else {
-                self::forgetDigest($item);
-            }
-        }
-    }
-
-    /**
-     * @param  array<array-key, mixed>  $row
-     */
-    private static function holdsRow(Model $copy, array $row): bool
-    {
-        $attributes = $copy->getAttributes();
-
-        return ! array_any(
-            array_diff_key(array_intersect_key($row, $attributes), [SelectsConcurrencyRevision::ATTRIBUTE => true]),
-            static fn (mixed $value, int|string $column): bool => $attributes[$column] !== $value,
-        );
     }
 
     private static function forgetDigest(Model $item): void
@@ -3074,7 +3016,6 @@ final class OrderedRelation
     {
         $keys = $this->keysAt($placement, $ids, count($ids));
         $copies = $this->copies($ids);
-        $stale = [];
         $this->clearRankKeys(array_values(array_filter(
             $ids,
             fn (int|string $id, int $index): bool => $from[$index] === $this && ($copies[$id] ?? null)?->getAttribute(self::RANK_KEY) !== $keys[$index],
@@ -3094,14 +3035,10 @@ final class OrderedRelation
                 $copy->timestamps = self::timestamps($item, $this->keys->item);
             }
 
-            if (self::saveCopy($item, $copy, $from[$index] === $this
+            self::saveCopy($item, $copy, $from[$index] === $this
                 ? [self::RANK_KEY => $keys[$index]]
-                : [...$from[$index]->keys->detached(), ...$this->keys->pointingAt($this->parent), self::RANK_KEY => $keys[$index]])) {
-                $stale[$ids[$index]] = [$item, $copy];
-            }
+                : [...$from[$index]->keys->detached(), ...$this->keys->pointingAt($this->parent), self::RANK_KEY => $keys[$index]]);
         }
-
-        $this->holdStoredDigests($stale);
     }
 
     /**

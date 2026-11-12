@@ -974,7 +974,7 @@ class IsOrderedTest extends TestCase
     }
 
     #[Test]
-    public function it_reads_the_stored_own_digests_of_a_move_in_that_stamps_against_the_class_default_in_one_statement(): void
+    public function it_holds_the_stored_own_digests_of_a_move_in_that_stamps_against_the_class_default_without_reading_them_again(): void
     {
         [$source, $destination] = [Reel::create(), Reel::create()];
         $stills = [Still::query()->findOrFail($this->addStill($source)->id), Still::query()->findOrFail($this->addStill($source)->id)];
@@ -984,7 +984,7 @@ class IsOrderedTest extends TestCase
 
         $destination->stills()->moveIn($stills, expected: null);
 
-        $this->assertCount(1, $this->ownDigestReads(DB::getQueryLog(), 'stills'));
+        $this->assertSame([], $this->ownDigestReads(DB::getQueryLog(), 'stills'));
         $this->assertSame(
             array_map(fn (Still $still): string => Still::query()->findOrFail($still->id)->concurrencyRevision(), $stills),
             array_map(fn (Still $still): string => $still->concurrencyRevision(), $stills),
@@ -1004,7 +1004,7 @@ class IsOrderedTest extends TestCase
     }
 
     #[Test]
-    public function it_reads_the_stored_own_digest_again_for_only_the_member_of_a_move_in_that_stamps_against_the_class_default(): void
+    public function it_holds_the_stored_own_digests_of_a_move_in_whose_members_stamp_by_and_against_the_class_default_without_reading_them_again(): void
     {
         [$source, $destination] = [Reel::create(), Reel::create()];
         $stills = [Still::query()->findOrFail($this->addStill($source)->id), Still::query()->findOrFail($this->addStill($source)->id)];
@@ -1013,7 +1013,7 @@ class IsOrderedTest extends TestCase
 
         $destination->stills()->moveIn($stills, expected: null);
 
-        $this->assertSame([[$stills[1]->id]], $this->ownDigestReads(DB::getQueryLog(), 'stills'));
+        $this->assertSame([], $this->ownDigestReads(DB::getQueryLog(), 'stills'));
         $this->assertSame(
             array_map(fn (Still $still): string => Still::query()->findOrFail($still->id)->concurrencyRevision(), $stills),
             array_map(fn (Still $still): string => $still->concurrencyRevision(), $stills),
@@ -1021,7 +1021,7 @@ class IsOrderedTest extends TestCase
     }
 
     #[Test]
-    public function it_drops_the_own_digest_of_a_move_in_member_whose_row_a_later_member_listener_writes_against_the_class_default(): void
+    public function it_holds_a_stale_own_digest_for_a_move_in_member_whose_row_a_later_member_listener_writes_against_the_class_default(): void
     {
         [$source, $destination] = [Reel::create(), Reel::create()];
         [$first, $second] = [Still::query()->findOrFail($this->addStill($source)->id), Still::query()->findOrFail($this->addStill($source)->id)];
@@ -1036,12 +1036,12 @@ class IsOrderedTest extends TestCase
         $destination->stills()->moveIn([$first, $second], expected: null);
 
         $this->assertNull($first->caption);
-        $this->assertThrows(fn (): string => $first->concurrencyRevision(), UnselectedConcurrencyRevision::class);
+        $this->assertNotSame(Still::query()->findOrFail($first->id)->concurrencyRevision(), $first->concurrencyRevision());
         $this->assertSame(Still::query()->findOrFail($second->id)->concurrencyRevision(), $second->concurrencyRevision());
     }
 
     #[Test]
-    public function it_drops_the_own_digest_of_a_moved_member_whose_row_a_saved_listener_writes_against_the_class_default(): void
+    public function it_holds_a_stale_own_digest_for_a_moved_member_whose_row_a_saved_listener_writes_against_the_class_default(): void
     {
         $reel = Reel::create();
         $this->addStill($reel);
@@ -1052,13 +1052,11 @@ class IsOrderedTest extends TestCase
         $still->move(Placement::first(), expected: null);
 
         $this->assertNull($still->caption);
-        $this->expectException(UnselectedConcurrencyRevision::class);
-
-        $still->concurrencyRevision();
+        $this->assertNotSame(Still::query()->findOrFail($still->id)->concurrencyRevision(), $still->concurrencyRevision());
     }
 
     #[Test]
-    public function it_drops_the_own_digest_of_a_moved_member_whose_row_a_saved_listener_deletes_against_the_class_default(): void
+    public function it_holds_an_own_digest_of_no_stored_row_for_a_moved_member_whose_row_a_saved_listener_deletes_against_the_class_default(): void
     {
         $reel = Reel::create();
         $this->addStill($reel);
@@ -1068,9 +1066,8 @@ class IsOrderedTest extends TestCase
 
         $still->move(Placement::first(), expected: null);
 
-        $this->expectException(UnselectedConcurrencyRevision::class);
-
-        $still->concurrencyRevision();
+        $this->assertNull(Still::query()->find($still->id));
+        $this->assertIsString($still->concurrencyRevision());
     }
 
     #[Test]

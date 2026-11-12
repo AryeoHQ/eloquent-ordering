@@ -2025,7 +2025,7 @@ class OrderedRelationTest extends TestCase
     }
 
     #[Test]
-    public function it_holds_the_stored_own_digest_of_a_revisioned_pivot_whose_relation_omits_its_observed_timestamp(): void
+    public function it_holds_the_stored_own_digest_of_a_revisioned_pivot_whose_relation_omits_its_observed_timestamp_without_reading_it_again(): void
     {
         $shape = new BelongsToManyShape;
         [$listing, [$first, $second, $third]] = $shape->with(3);
@@ -2038,7 +2038,7 @@ class OrderedRelationTest extends TestCase
         Shape::relationOf($parent, ListingRevision::CustomersOrder)->moveIn([$moved], expected: null, placement: Placement::after($this->key($first)));
 
         $this->assertSame([$first->getKey(), $third->getKey(), $second->getKey()], $shape->members($listing));
-        $this->assertNotNull(array_find(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => str_contains($query, 'concurrency_digest(') && str_contains($query, '"listing_customer"."id" in (')));
+        $this->assertNull(array_find(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => str_contains($query, 'concurrency_digest(') && str_contains($query, '"listing_customer"."id" in (')));
         $fresh = $pivot::query()->findOrFail($moved->getKey());
         assert($fresh instanceof Revisioned);
         $this->assertSame($fresh->concurrencyRevision(), $moved->concurrencyRevision());
