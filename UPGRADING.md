@@ -2,7 +2,7 @@
 
 ## From 0.0.1
 
-This release runs on `aryeo/eloquent-concurrency` `0.1.0`, so upgrade both packages together. An order revision is now a digest that PostgreSQL computes on demand. No trigger and no revision column take part. A query of an item selects its `position` unless its shape cannot carry the column. The `UnselectedPosition` row of [Exceptions](README.md#exceptions) lists those shapes, such as an explicit select list, `distinct`, and a locking read outside a transaction. [Declaring an ordered relation](README.md#declaring-an-ordered-relation) explains each one.
+This release runs on `aryeo/eloquent-concurrency` `0.1.0`, so upgrade both packages together. An order revision is now a digest that PostgreSQL computes on demand. No trigger and no revision column take part. A query of an item selects its `position` unless its shape cannot carry the column. The `UnselectedPosition` row of [Exceptions](README.md#exceptions) lists those shapes, such as a select list other than `*` or `<table>.*`, `distinct`, and a locking read outside a transaction. [Declaring an ordered relation](README.md#declaring-an-ordered-relation) explains each one.
 
 Read the [README](README.md) for each replacement. [Adopting on an existing table](README.md#adopting-on-an-existing-table) covers the schema.
 
@@ -26,6 +26,20 @@ if (Schema::hasColumn('sections', 'concurrency_revision')) {
     });
 }
 ```
+
+### Deploy order
+
+A fleet that deploys in stages runs 0.0.1 and 0.1.0 side by side for a while. A 0.0.1 process reads the revision columns, so ship the schema change in two deploys:
+
+1. Run the eloquent-concurrency migrations before any 0.1.0 process serves a write, and keep the revision columns. Until those migrations drop the trigger functions, the 0.0.1 triggers refuse every 0.1.0 write with SQLSTATE `23514`, because no 0.1.0 write raises a revision column.
+2. Once no 0.0.1 process serves, drop the revision columns in a later deploy.
+
+No 0.1.0 write raises a revision column, so a 0.0.1 process compares against a stale value until it stops. Keep that window short.
+
+A revert to 0.0.1 follows eloquent-concurrency's [downgrading steps](https://github.com/AryeoHQ/eloquent-concurrency#downgrading). They forbid a `migrate:rollback` of the upgrade batch, recreate the 0.0.4 functions, and drop both digest functions last. eloquent-ordering 0.0.1 installs no function of its own, and its triggers call the 0.0.4 functions. Once those functions exist again, add two steps:
+
+1. Add the revision columns again, if the second deploy dropped them.
+2. Recreate the order triggers through the 0.0.1 `OrderedRelations` helpers.
 
 ### API
 

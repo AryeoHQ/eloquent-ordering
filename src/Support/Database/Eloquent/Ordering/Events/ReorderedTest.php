@@ -19,6 +19,8 @@ use Support\Database\Eloquent\Ordering\Contracts\OrdersRelations;
 use Support\Database\Eloquent\Ordering\OrderedRelation;
 use Support\Database\Eloquent\Ordering\Placement;
 use Tests\Fixtures\Support\Customers\Customer;
+use Tests\Fixtures\Support\Playlists\Playlist;
+use Tests\Fixtures\Support\Playlists\PlaylistRevision;
 use Tests\Fixtures\Support\Shapes\PivotShape;
 use Tests\Fixtures\Support\Shapes\Reparenting;
 use Tests\Fixtures\Support\Shapes\Shape;
@@ -571,6 +573,41 @@ class ReorderedTest extends TestCase
         $this->assertSame($shape->digest($parent), $change->digest);
         $this->assertNull($change->source);
         $this->assertSame([$this->baseline], $this->levels);
+    }
+
+    #[Test]
+    public function it_reports_only_the_members_that_a_create_in_order_adds_when_the_filter_excludes_some_records(): void
+    {
+        $playlist = Playlist::create(['kind' => 'audio']);
+        $this->forget();
+
+        $created = $playlist->tracks()->createInOrder([['kind' => 'audio'], ['kind' => 'video'], ['kind' => 'audio']])->all();
+
+        $this->assertSame([1, null, 2], array_map(fn (Model $track): mixed => $track->getAttribute(OrderedRelation::POSITION), $created));
+        $this->assertCount(1, $this->dispatched);
+
+        $change = $this->dispatched[0]->change;
+
+        $this->assertSame([$this->key($created[0]), $this->key($created[2])], $change->order);
+        $this->assertSame(
+            [['id' => $this->key($created[0]), 'position' => 1, 'previousPosition' => null], ['id' => $this->key($created[2]), 'position' => 2, 'previousPosition' => null]],
+            array_map(get_object_vars(...), $change->changed),
+        );
+        $this->assertSame($playlist->concurrencyRevision(PlaylistRevision::TracksOrder), $change->digest);
+        $this->assertSame([$this->baseline], $this->levels);
+    }
+
+    #[Test]
+    public function it_dispatches_no_event_for_a_create_in_order_whose_records_the_filter_all_excludes(): void
+    {
+        $playlist = Playlist::create(['kind' => 'audio']);
+        $this->forget();
+
+        $created = $playlist->tracks()->createInOrder([['kind' => 'video'], ['kind' => null]])->all();
+
+        $this->assertCount(2, $created);
+        $this->assertSame([null, null], array_map(fn (Model $track): mixed => $track->getAttribute(OrderedRelation::POSITION), $created));
+        $this->assertSame([], $this->dispatched);
     }
 
     #[DataProvider('shapes')]

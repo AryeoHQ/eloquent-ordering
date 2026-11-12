@@ -1497,6 +1497,26 @@ class OrderedRelationTest extends TestCase
     }
 
     #[Test]
+    public function it_stamps_a_member_that_a_listener_appends_while_a_member_without_timestamps_saves(): void
+    {
+        [$source, $destination] = [Drawer::create(), Drawer::create()];
+        [$one, $two] = [$this->addNote($source, 'pgsql'), $this->addNote($source, 'pgsql')];
+        $one->timestamps = false;
+        $appended = null;
+        Note::updated(function (Note $note) use ($destination, $one, &$appended): void {
+            if ($appended === null && $note->id === $one->id) {
+                $appended = $this->addNote($destination, 'pgsql');
+            }
+        });
+
+        $destination->notes()->moveIn([$one, $two], expected: null);
+
+        $this->assertInstanceOf(Note::class, $appended);
+        $this->assertNotNull($appended->getAttribute('created_at'));
+        $this->assertNotNull($appended->getAttribute('updated_at'));
+    }
+
+    #[Test]
     public function it_rearranges_members_after_a_listener_appends_a_member_while_the_first_member_saves(): void
     {
         $drawer = Drawer::create();
@@ -2002,6 +2022,26 @@ class OrderedRelationTest extends TestCase
         $this->assertSame([$first->getKey(), $third->getKey(), $second->getKey()], $shape->members($listing));
         $this->assertSame(2, $moved->getAttribute('position'));
         $this->assertSame(['title' => 'unsaved'], $moved->getDirty());
+    }
+
+    #[Test]
+    public function it_holds_the_stored_own_digest_of_a_revisioned_pivot_whose_relation_omits_its_observed_timestamp_without_reading_it_again(): void
+    {
+        $shape = new BelongsToManyShape;
+        [$listing, [$first, $second, $third]] = $shape->with(3);
+        $pivot = $this->revisionedPivot();
+        $parent = $this->parentOfPivot($listing, $pivot);
+        $moved = $pivot::query()->findOrFail($third->getKey());
+        assert($moved instanceof Revisioned);
+        DB::enableQueryLog();
+
+        Shape::relationOf($parent, ListingRevision::CustomersOrder)->moveIn([$moved], expected: null, placement: Placement::after($this->key($first)));
+
+        $this->assertSame([$first->getKey(), $third->getKey(), $second->getKey()], $shape->members($listing));
+        $this->assertNull(array_find(array_column(DB::getQueryLog(), 'query'), fn (string $query): bool => str_contains($query, 'concurrency_digest(') && str_contains($query, '"listing_customer"."id" in (')));
+        $fresh = $pivot::query()->findOrFail($moved->getKey());
+        assert($fresh instanceof Revisioned);
+        $this->assertSame($fresh->concurrencyRevision(), $moved->concurrencyRevision());
     }
 
     #[Test]
@@ -3293,6 +3333,24 @@ class OrderedRelationTest extends TestCase
             {
                 return $this->belongsTo(PlainCustomer::class);
             }
+        })::class;
+    }
+
+    /**
+     * @return class-string<Pivot&Ordered>
+     */
+    private function revisionedPivot(): string
+    {
+        return (new #[OrderedIn(PivotedListing::class)] class extends Pivot implements Ordered, Revisioned
+        {
+            use HasConcurrencyRevisions;
+            use HasUuids;
+            use IsOrdered;
+            use SoftDeletes;
+
+            public const UPDATED_AT = 'created_at';
+
+            protected $table = 'listing_customer';
         })::class;
     }
 

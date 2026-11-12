@@ -2,7 +2,7 @@
 
 Manually ordered Eloquent collections stored as fractional rank keys.
 
-An item holds a `rank_key` string. The items of one parent sort by that string, so a move rewrites one row and never renumbers its siblings. Each order is a **named concurrency revision** of the parent: a digest of the member keys in order, which PostgreSQL computes on demand. A caller reads that revision, and a later move or reorder proves that nobody changed the order in between.
+An item holds a `rank_key` string. The items of one parent sort by that string, so a move rewrites one row and never renumbers its siblings. Each order is a **named concurrency revision** of the parent: a digest of the member keys in order, which PostgreSQL computes on demand. A caller reads that revision. A compare before a later move or reorder proves that the current order equals the order the caller read. An order that changes and changes back passes that compare, as [ABA](https://github.com/AryeoHQ/eloquent-concurrency#limits) describes.
 
 The package writes every order through Eloquent saves with native model events. No trigger and no revision column take part. A write through the query builder or raw SQL still changes the digest, but nothing refuses it.
 
@@ -21,7 +21,7 @@ composer require aryeo/eloquent-ordering
 php artisan migrate
 ```
 
-`aryeo/eloquent-concurrency` installs with it. Run its migrations too, because they install the `concurrency_digest()` function.
+`aryeo/eloquent-concurrency` installs with it. Run its migrations too, because they install the digest functions. The functions require [trusted schemas](https://github.com/AryeoHQ/eloquent-concurrency#trusted-schemas).
 
 Laravel discovers `Support\Database\Eloquent\Ordering\Providers\Provider`. The provider registers the `rankKey()` and `rankKeyIndex()` Blueprint macros, the `withoutPositions()` builder macro, and the `arrange()`, `moveIn()`, `createInOrder()`, and `lockedMembers()` relation macros. It also registers the listeners that refuse a late change to an order write. The related model of an ordered pivot registers its own listeners when it boots. The package ships no migration of its own.
 
@@ -119,9 +119,13 @@ $assets->first()->position;                                                 // n
 
 The scope covers `get()`, `find()`, the paginators, `chunk()`, route binding, eager and lazy loads, `refresh()`, `fresh()`, `refreshForUpdate()`, `Collection::fresh()`, and a queued job's restored model. A query that joins an ordered pivot table, such as `$listing->customers` or `$customer->listings`, also selects `pivot_position`, so each pivot carries `position`. The scope runs on PostgreSQL only.
 
+Each Eloquent read, `chunk()` included, selects the position in every statement that it runs. An unlocked base builder from `toBase()` selects it in its first `get()` only, because Laravel runs a `beforeQuery` callback once and `get()` puts the original columns back. Call `toBase()` again for each read that needs positions.
+
 **A locking read selects the position in a second query.** A row that `lockForUpdate()`, `sharedLock()`, or `refreshForUpdate()` waited on can carry a count from before the wait. So the locking statement selects no `position`. After it returns, one unlocked select by key reads the position of every row it locked. Outside a transaction, the row locks end with the locking statement, and another write can commit before the second select. Such a read therefore selects no position, and reading `position` throws `UnselectedPosition`. The second select also needs a lock that blocks every update of the row: `lockForUpdate()`, `sharedLock()`, or a `lock()` clause of `for update`, `for no key update`, or `for share`, each with at most `nowait` or `skip locked`. A `for key share` lock blocks only a delete and an update of a column in a unique index without a `where` clause. A soft delete, or a move of an item whose rank-key index is partial, can therefore commit before the second select. That read, and a read under any other lock clause, selects no position either.
 
-**A query without a select list selects the item's own columns only.** The scope turns `select *` into `select <table>.*`, so a join adds no columns of the joined table. Name the joined columns in an explicit select list. That query then carries no `position`.
+**A locking `cursor()` runs the second select once per row.** Laravel runs a query's `afterQuery` callbacks for each row that a cursor yields. A transactional `lockForUpdate()->cursor()` of `n` rows therefore runs `n + 1` queries. Use `lockForUpdate()->get()` when the query count must stay bounded. See [Limits](#limits).
+
+**A query without a select list selects the item's own columns only.** The scope turns `select *` into `select <table>.*`, so a join adds no columns of the joined table. Name the joined columns in a select list. A `select()` list other than `*` or `<table>.*` carries no `position`. A columns argument to `get()`, `find()` or a paginator arrives after the scope, so it carries `position` when it holds `<table>.*`, as `get(['assets.*', 'assets.title as label'])` does.
 
 **The position counts the item among the members of the parent that `#[OrderedIn]` names**, in the order that `OrderChange::$order` lists. `null` means the row is not a member:
 
@@ -130,11 +134,11 @@ The scope covers `get()`, `find()`, the paginators, `chunk()`, route binding, ea
 - a declared relation filter excludes it;
 - for a pivot, its related row is trashed, or a declared related column excludes it.
 
-**A query that cannot carry the column selects no position.** A query with an explicit select list, a group, a having, `distinct`, or a union selects none, because the column would break `withCount()`, `whereIn()` subqueries, and grouped reads. Reading `position` on such a row throws `UnselectedPosition`, and so does reading it after `withoutPositions()`. Call `withoutPositions()` on a query that never reads `position`, to skip the count. These common shapes select none too:
+**A query that cannot carry the column selects no position.** A query with a select list other than `*` or `<table>.*`, a group, a having, `distinct`, or a union selects none, because the column would break `withCount()`, `whereIn()` subqueries, and grouped reads. Reading `position` on such a row throws `UnselectedPosition`, and so does reading it after `withoutPositions()`. Call `withoutPositions()` on a query that never reads `position`, to skip the count. These common shapes select none too:
 
 - every query of a model with `$withCount`, because `withCount()` sets the select list;
 - a query after `withoutGlobalScopes()`, because that call removes the scope;
-- `paginate()`, `simplePaginate()`, and `chunk()` on a `BelongsToMany` relation to an ordered model, because the relation sets its select list before the scopes apply.
+- on a `BelongsToMany` relation to an ordered model, `paginate()`, `simplePaginate()`, `cursorPaginate()`, and the iteration methods `chunk()`, `chunkById()`, `each()`, `eachById()`, `lazy()`, `lazyById()`, `cursor()`, and their `Desc` variants, because the relation sets its select list before the scopes apply. The relation's `get()` selects the position.
 
 `isset($item->position)` and `$item->position ?? 0` call the accessor, so they throw on such a row too.
 
@@ -232,6 +236,8 @@ Schema::table('assets', function (Blueprint $table): void {
     $table->rankKeyIndex('section_id');
 });
 ```
+
+**The migration is blocking maintenance.** `rankKey()` alters the table, so PostgreSQL holds an `ACCESS EXCLUSIVE` lock on it. Laravel runs a PostgreSQL migration in one transaction, so that lock lasts through the backfill and the index build. Every read and every write of the table waits until the migration commits. `rankKeyIndex()` ignores `->online()`, so it never builds the index concurrently. The follow-up migration below, and `rankKey()->change()`, block readers the same way, because `dropIndex()` and a column change also take `ACCESS EXCLUSIVE`. Run each one in a maintenance window.
 
 **The backfill is a deliberate exception to Mutation Exclusivity.** That php-archetype rule sends every write through a model. A model cannot write this backfill, because the package refuses a save that sets `rank_key` itself with `LogicException`. See [Exceptions](#exceptions). So the backfill runs as SQL, once, before any package write, with the legacy writers stopped.
 
@@ -336,6 +342,8 @@ class Listing extends Model implements OrdersRelations, Revisioned
 create unique index listing_customer_listing_id_customer_id_unique on listing_customer (listing_id, customer_id) where deleted_at is null
 ```
 
+**Index the related key too.** A soft delete, a restore, or a declared-column save of a related model finds its pivot rows by the related key. That index leads with the parent key, so it cannot serve that read. Add an index led by the related key, as the fixture migrations do: `listing_customer (customer_id)`, and `customerables (customer_id, customerable_type)` for a `MorphToMany`.
+
 **A saved pivot keeps its related model.** A save that changes the related key of a saved pivot, such as `customer_id`, throws `LogicException` and writes nothing. Detach the pivot, then attach the new related model.
 
 **An item can order in several parents.** A `Scene` carries `#[OrderedIn(Tour::class)]` and `#[OrderedIn(Listing::class)]`. Each row resolves to the one parent whose foreign key, and morph type, it names.
@@ -359,7 +367,7 @@ class Video extends Model implements Ordered, OrdersRelations, Revisioned
 }
 ```
 
-**A `Revisioned` item leaves `rank_key` out of its own revision.** `IsOrdered` merges `rank_key` into the model's unobserved columns, so a move within a parent, a reorder, and a rebalance keep the item's own digest. A move between parents changes it, because it changes the foreign key. After `move()`, the item holds the own digest of the row that the move saved.
+**A `Revisioned` item leaves `rank_key` out of its own revision.** `IsOrdered` merges `rank_key` into the model's unobserved columns, so a move within a parent, a reorder, and a rebalance keep the item's own digest, except that a move stamps the updated-at column of an instance that turns timestamps on against its class default, and the own digest then changes unless that column is named `updated_at`. A move between parents changes it, because it changes the foreign key. After `move()` or `moveIn()` saves an item's row, the item holds the own digest of that row. The move also refreshes the item's other attributes from that row, and keeps each attribute that the caller left dirty.
 
 **An item's own digest does not cover its position.** A move within the parent, an `arrange()`, and a write to another member can each change the position and keep the digest. An API that tags an item with its own digest adds the position to that ETag (ORD-39).
 
@@ -675,6 +683,8 @@ Event::listen(Reordered::class, function (Reordered $event): void {
 | A stale move, a halted write, or a rollback | None. |
 | Any write that rebalances | Unchanged. `Rebalanced` dispatches first, and the rebalance adds no `PositionChange`. |
 
+**A listener that throws after the commit fails a committed write.** Laravel runs each after-commit event in turn, once the transaction commits. When a listener throws, the write stays committed, but the call that made it throws that exception. The listeners after it, and every later `Reordered` and `Rebalanced` of the write, never run. A queued listener, with `ShouldQueue` on an asynchronous queue connection, moves that failure to the queue worker. It does not help on the `sync` connection, which runs the listener inline, or when pushing the job itself fails.
+
 ## The `Rebalanced` event
 
 A key longer than 64 characters makes the write rebalance the relation first. The rebalance rewrites the rank key of every row in that parent's order. `Rebalanced` announces it.
@@ -749,6 +759,7 @@ $this->moveOnFirstRead($asset->section(), $other);    // points the foreign key 
 - **The parent key, the owner key, and the item key must be named `id`.** Any other name throws `LogicException`.
 - **One parent orders an item class in one relation only.** Declaring two relations for one class, or two relations under one revision, throws `LogicException`.
 - **A key longer than 64 characters triggers a rebalance.** The rebalance rewrites every member of the parent, and keeps the digest.
+- **A transactional `lockForUpdate()->cursor()` runs one position query per row.** Laravel runs a query's `afterQuery` callbacks for each row that a cursor yields, so the select after the lock runs once per row. This is an approved exception to the fixed query count of every other read. Use `lockForUpdate()->get()` when the query count must stay bounded.
 - **Every item query runs a correlated count for each row.** The count reads the `rankKeyIndex()` index, so its cost grows with the row's position. Call `withoutPositions()` on a query that never reads `position`.
 - **An ordered table cannot have a `position` column.** The scope selects a computed `position`, and a `pivot_position` beside a pivot join, so a stored column of either name conflicts. Drop or rename such a column.
 - **The package reserves the scope name `withoutPositions`.** It registers a global `withoutPositions` macro on the Eloquent builder, and a macro runs before a named scope. A model's own `scopeWithoutPositions()` never runs.
@@ -761,7 +772,7 @@ $this->moveOnFirstRead($asset->section(), $other);    // points the foreign key 
 - **The membership check inspects the relation's own clauses only.** It does not refuse a `limit()`. The check runs once per `Class::relation()`, so a relation that branches on instance properties is checked in one branch only.
 - **The parent-column probe can miss a read.** A relation that maps the probe value to the same query, such as through an `array` cast that decodes it to `null`, hides that read. A binding that each call builds fresh, such as `now()`, makes every parent column count as read.
 - **The parent-column probe lists a parent table's columns once per connection name and process.** Tenants that share a connection name must share one schema. Otherwise the first tenant's columns decide the check for every tenant.
-- **The tests save a declared item or parent column on a `HasMany` relation only.** For a `MorphMany` or a pivot relation, only the resolution check is tested.
+- **The tests save a declared item or parent column on a `HasMany` relation, and a declared related column on a `BelongsToMany` relation.** For a `MorphMany` relation, a declared pivot column, and a `MorphToMany` relation, only the resolution check is tested.
 - **A related model reads each parent that `#[OrderedThrough]` names on its first watched write.** It instantiates each parent, reads its method attributes, and builds each declared relation. A name that orders no pivot of the model is skipped without an error.
 - **A concurrent attach can escape a related model's soft delete.** Suppose another transaction attaches the related model to a new parent between the pivot read and the write. The soft delete does not lock that parent, and reports nothing to it. An attach that reaches the related row after the write waits for the related commit, so it reports what the related write left.
 - **A related model's soft delete without the package's `deleting` listener locks no parent and reports nothing.** A `deleting` listener that runs first and returns a value other than `null` stops the package's listener.
@@ -780,6 +791,6 @@ $this->moveOnFirstRead($asset->section(), $other);    // points the foreign key 
 | `ContendedOrder` (`RuntimeException`) | A membership changed during each of 5 attempts to lock an order: an item, a model to also lock, or an ordering parent above them changed parent before the lock. The message names the item for `move()`, and the relation's parent for `lockedMembers()` and `moveIn()`. |
 | `NotAMember` (`InvalidArgumentException`) | `move()` or `moveIn()` names an item that its order no longer holds, because another transaction trashed or deleted it or deleted its parent row. `class` and `ids` name the items, every one for `moveIn()`. The move changed nothing. |
 | `UnavailableParent` (`RuntimeException`) | A create, a `createInOrder()`, a move into another parent, a save that changes the parent, or a restore targets a parent whose locked row is trashed or gone. `parent` names the parent, and `reason` is `ParentUnavailability::Trashed` or `ParentUnavailability::Missing`. The write changed nothing. |
-| `UnselectedPosition` (`LogicException`) | Code reads `position` on an item whose query selected none: an explicit select list, a group, a having, `distinct`, a union, `withoutPositions()`, a model's `$withCount`, `withoutGlobalScopes()`, a `BelongsToMany` paginator or chunk, a locking read outside a transaction, or a locking read whose lock lets another transaction update the row. `isset()` and `??` throw too. The exception names the item. |
+| `UnselectedPosition` (`LogicException`) | Code reads `position` on an item whose query selected none: a select list other than `*` or `<table>.*`, a group, a having, `distinct`, a union, `withoutPositions()`, a model's `$withCount`, `withoutGlobalScopes()`, a paginator, a cursor page, or an iteration method such as `chunk()`, `lazy()`, or `cursor()` on a `BelongsToMany` relation to an ordered model, a locking read outside a transaction, or a locking read whose lock lets another transaction update the row. `isset()` and `??` throw too. The exception names the item. |
 | `WriteHalted` (`RuntimeException`) | A `saving` or `updating` listener returned `false` for a copy that an order write saved, or a `saving` or `creating` listener returned `false` for a record of `createInOrder()`. Also, a `creating` listener that ran before the package's stopped the package's listener, so a new item had no `rank_key`. The message names the model and its key. The write rolled back. |
 | `LogicException` | A relation is misdeclared, a relation filters by a column that its membership does not declare or through a clause that the check cannot verify, a membership declares a timestamp that Eloquent sets, a model is unsaved, an item has no parent, an item and its parent use different connections, a caller set `rank_key`, a save changed the related key of a saved pivot, a listener changed the order or a declared parent column after the package prepared the write, a watched related column changed without a prepared order write, a relation reads a parent column in a form other than `<item column> = <parent column>`, a relation filters through a subquery that reads a table outside it, a relation joins a table other than its pivot table, a relation compares a column to an expression in a `where()`, a relation throws when it builds on a blank parent, `lockedMembers()` runs outside a transaction or receives a model that is unsaved or on another connection, or `moveIn()` receives an item that is unsaved, of another class or connection, or named twice, or a placement that names a parent. On a parent's first declaration read: an ordered pivot relation reaches a related model that does not use `OrdersThroughPivots`, or that omits the parent from `#[OrderedThrough]`. |
