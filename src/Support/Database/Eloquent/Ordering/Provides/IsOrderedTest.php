@@ -1085,6 +1085,130 @@ class IsOrderedTest extends TestCase
         $video->concurrencyRevision();
     }
 
+    #[DataProvider('moveTargets')]
+    #[Test]
+    public function it_brings_a_stale_moved_member_to_the_stored_row_that_its_own_digest_describes(bool $reparents): void
+    {
+        $reel = Reel::create();
+        $this->addStill($reel);
+        $still = Still::query()->findOrFail($this->addStill($reel)->id);
+        DB::table('stills')->where('id', $still->id)->update(['caption' => 'written']);
+        $placement = $reparents ? Placement::first()->in(Reel::create()) : Placement::first();
+
+        $still->move($placement, expected: null);
+
+        $this->assertSame('written', $still->caption);
+        $this->assertSame([], $still->getDirty());
+        $this->assertSame(Still::query()->findOrFail($still->id)->concurrencyRevision(), $still->concurrencyRevision());
+    }
+
+    #[Test]
+    public function it_brings_stale_move_in_members_to_the_stored_rows_that_their_own_digests_describe(): void
+    {
+        [$source, $destination] = [Reel::create(), Reel::create()];
+        $stills = [Still::query()->findOrFail($this->addStill($source)->id), Still::query()->findOrFail($this->addStill($source)->id)];
+        DB::table('stills')->whereIn('id', [$stills[0]->id, $stills[1]->id])->update(['caption' => 'written']);
+
+        $destination->stills()->moveIn($stills, expected: null);
+
+        $this->assertSame(['written', 'written'], array_map(fn (Still $still): null|string => $still->caption, $stills));
+        $this->assertSame(
+            array_map(fn (Still $still): string => Still::query()->findOrFail($still->id)->concurrencyRevision(), $stills),
+            array_map(fn (Still $still): string => $still->concurrencyRevision(), $stills),
+        );
+    }
+
+    #[Test]
+    public function it_brings_a_moved_member_to_the_column_that_a_saving_listener_sets_on_its_copy(): void
+    {
+        $reel = Reel::create();
+        $this->addStill($reel);
+        $still = Still::query()->findOrFail($this->addStill($reel)->id);
+        Still::saving(static function (Still $copy): void {
+            $copy->caption = 'derived';
+        });
+
+        $still->move(Placement::first(), expected: null);
+
+        $this->assertSame('derived', $still->caption);
+        $this->assertSame([], $still->getDirty());
+        $this->assertSame(Still::query()->findOrFail($still->id)->concurrencyRevision(), $still->concurrencyRevision());
+    }
+
+    #[Test]
+    public function it_brings_a_moved_member_to_the_column_that_a_saved_listener_saves_on_its_copy_again(): void
+    {
+        $reel = Reel::create();
+        $this->addStill($reel);
+        $still = Still::query()->findOrFail($this->addStill($reel)->id);
+        Still::saved(static function (Still $copy): void {
+            if ($copy->caption !== 'derived') {
+                $copy->caption = 'derived';
+                $copy->save();
+            }
+        });
+
+        $still->move(Placement::first(), expected: null);
+
+        $this->assertSame('derived', $still->caption);
+        $this->assertSame([], $still->getDirty());
+        $this->assertSame(Still::query()->findOrFail($still->id)->concurrencyRevision(), $still->concurrencyRevision());
+    }
+
+    #[Test]
+    public function it_brings_a_move_in_member_to_the_row_that_an_earlier_member_listener_writes_before_its_copy_saves(): void
+    {
+        [$source, $destination] = [Reel::create(), Reel::create()];
+        [$first, $second] = [Still::query()->findOrFail($this->addStill($source)->id), Still::query()->findOrFail($this->addStill($source)->id)];
+        Still::updated(static function (Still $copy) use ($first, $second): void {
+            if ($copy->id === $first->id) {
+                DB::table('stills')->where('id', $second->id)->update(['caption' => 'written']);
+            }
+        });
+
+        $destination->stills()->moveIn([$first, $second], expected: null);
+
+        $this->assertNull($first->caption);
+        $this->assertSame('written', $second->caption);
+        $this->assertSame([], $second->getDirty());
+        $this->assertSame(Still::query()->findOrFail($first->id)->concurrencyRevision(), $first->concurrencyRevision());
+        $this->assertSame(Still::query()->findOrFail($second->id)->concurrencyRevision(), $second->concurrencyRevision());
+    }
+
+    #[Test]
+    public function it_keeps_the_unsaved_attributes_of_a_moved_member_while_it_brings_its_clean_ones_to_the_stored_row(): void
+    {
+        $reel = Reel::create();
+        $this->addStill($reel);
+        $still = Still::query()->findOrFail($this->addStill($reel)->id);
+        DB::table('stills')->where('id', $still->id)->update(['modified_at' => '2026-01-02 03:04:05']);
+        $still->caption = 'unsaved';
+
+        $still->move(Placement::first(), expected: null);
+
+        $this->assertSame(['caption' => 'unsaved'], $still->getDirty());
+        $this->assertSame(DB::table('stills')->where('id', $still->id)->value('modified_at'), $still->getAttributes()['modified_at']);
+        $this->assertNull(DB::table('stills')->where('id', $still->id)->value('caption'));
+        $this->assertSame(Still::query()->findOrFail($still->id)->concurrencyRevision(), $still->concurrencyRevision());
+    }
+
+    #[Test]
+    public function it_drops_only_the_own_digest_of_a_move_in_member_whose_row_the_move_in_finds_gone(): void
+    {
+        [$source, $destination] = [Reel::create(), Reel::create()];
+        [$first, $second] = [Still::query()->findOrFail($this->addStill($source)->id), Still::query()->findOrFail($this->addStill($source)->id)];
+        Still::updating(static function (Still $copy) use ($second): void {
+            if ($copy->id === $second->id) {
+                DB::table('stills')->where('id', $second->id)->delete();
+            }
+        });
+
+        $destination->stills()->moveIn([$first, $second], expected: null);
+
+        $this->assertSame(Still::query()->findOrFail($first->id)->concurrencyRevision(), $first->concurrencyRevision());
+        $this->assertThrows(fn (): string => $second->concurrencyRevision(), UnselectedConcurrencyRevision::class);
+    }
+
     #[Test]
     public function it_reads_the_own_digest_of_a_binder_that_a_move_takes_to_another_shelf(): void
     {

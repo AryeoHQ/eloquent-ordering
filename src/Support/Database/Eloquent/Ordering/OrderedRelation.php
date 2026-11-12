@@ -2590,11 +2590,13 @@ final class OrderedRelation
     private static function saveCopy(Model $item, null|Model $copy, array $attributes): void
     {
         $copy ??= throw new LogicException(sprintf('[%s:%s] has no row to write.', $item::class, self::keyOf($item)));
-        $written = [
-            ...OrderWrite::save($copy, $attributes),
-            ...array_intersect_key($copy->getAttributes(), [SelectsConcurrencyRevision::ATTRIBUTE => true]),
-        ];
-        $item->forceFill($written)->syncOriginalAttributes(array_keys($written));
+        $written = OrderWrite::save($copy, $attributes);
+
+        if ($copy->wasChanged()) {
+            $written = array_diff_key($copy->getAttributes(), array_diff_key($item->getDirty(), $written, [SelectsConcurrencyRevision::ATTRIBUTE => true]));
+        }
+
+        $item->setRawAttributes(array_replace($item->getAttributes(), $written))->syncOriginalAttributes(array_keys($written));
 
         if ($item instanceof Revisioned && $copy->wasChanged() && ! array_key_exists(SelectsConcurrencyRevision::ATTRIBUTE, $written)) {
             self::forgetDigest($item);
