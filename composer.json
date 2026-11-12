@@ -20,7 +20,7 @@
     "require": {
         "php": "^8.5",
         "laravel/framework": "^12.37 || ^13",
-        "aryeo/eloquent-concurrency": "dev-fix/2026-11-09t1451-critique-remedies-m1#b7a10ef49a147428566622ef5fa4ae1a0ee73907 as 0.1.0",
+        "aryeo/eloquent-concurrency": "dev-fix/2026-11-09t1451-critique-remedies-m1#58d2220bd940a3a3129388bf2937f7da97f99ee6 as 0.1.0",
         "aryeo/tooling-laravel": "0.0.43"
     },
     "require-dev": {
